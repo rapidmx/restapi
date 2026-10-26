@@ -51,6 +51,11 @@ const MAX_ERROR_LENGTH = 1000;
  * readable one the provider may still hold, so such a message is never simply given up on: when its retries run out its document is
  * removed, and while that removal fails it is retried at the longest backoff.
  *
+ * A soft-deleted message is otherwise never selected (its document stays as it was, and search leaves deleted mail out). A sealed one is:
+ * its document may still be the readable one from before it was sealed - the backfill sealed it already deleted and couldn't remove that
+ * document, or it was deleted before this job rebuilt it - so it is indexed as metadata the same way, in what is left of each batch
+ * after live mail. A restored one then already has its metadata document.
+ *
  * @author Jean-Philippe Steinmetz
  */
 export abstract class SearchIndexJob<M extends Message, A extends Attachment> extends BackgroundService {
@@ -140,21 +145,30 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
         // Candidates are a message that has never failed, or one that has failed fewer than `maxAttempts` times
         // and whose backoff has elapsed - a message at `maxAttempts` is excluded outright. Sorted oldest-first
         // (with `uid` as a tiebreaker) so batches are drawn in a stable order.
-        const pending: M[] = await this.messageRepo.find(
-            {
-                searchIndexedAt: null,
-                $or: [
-                    { searchIndexAttempts: "null" },
-                    {
-                        searchIndexAttempts: `lt(${this.maxAttempts})`,
-                        searchIndexNextAttemptAt: `lte(${now.toISOString()})`,
-                    },
-                ],
-                sort: { dateCreated: "ASC", uid: "ASC" },
-                limit: this.batchSize,
-            } as any,
-            { ignoreACL: true, limit: this.batchSize },
-        );
+        //
+        // `find()` returns a soft-deleted row only for an explicit `deleted: true`: sealed ones (whose document may still be readable) are a
+        // second query, in what is left of the batch.
+        const query = (limit: number, deleted?: Record<string, any>): Promise<M[]> =>
+            this.messageRepo!.find(
+                {
+                    searchIndexedAt: null,
+                    $or: [
+                        { searchIndexAttempts: "null" },
+                        {
+                            searchIndexAttempts: `lt(${this.maxAttempts})`,
+                            searchIndexNextAttemptAt: `lte(${now.toISOString()})`,
+                        },
+                    ],
+                    ...deleted,
+                    sort: { dateCreated: "ASC", uid: "ASC" },
+                    limit,
+                } as any,
+                { ignoreACL: true, limit },
+            );
+        const pending: M[] = await query(this.batchSize);
+        if (pending.length < this.batchSize) {
+            pending.push(...(await query(this.batchSize - pending.length, { deleted: true, zeroAccess: "ne(null)" })));
+        }
 
         const docs: SearchDocument[] = [];
         // Only messages the provider actually reports as indexed get stamped `searchIndexedAt` below - a message
@@ -236,7 +250,7 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
                 // `asEntity()`: Mongo `find()` returns plain documents, for which `update()` skips its optimistic
                 // lock entirely - a concurrent edit (e.g. a flag change) could otherwise be clobbered, or a stale
                 // stamp could land over a newer content change that cleared `searchIndexedAt`.
-                stamped = await this.messageRepo.update(update, asEntity(this.messageRepo, message), { ignoreACL: true, skipPush: true });
+                stamped = await this.messageRepo.update(update, asEntity(this.messageRepo, message), { ignoreACL: true, skipPush: true, includeDeleted: true } as any);
             } catch (err: any) {
                 // e.g. a concurrent edit bumped the version - the message is simply re-indexed on a later run.
                 this.logger?.warn(`SearchIndexJob: failed to stamp searchIndexedAt on message ${message.uid}: ${err?.message}`);
@@ -372,7 +386,7 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
                     searchIndexError: reason.slice(0, MAX_ERROR_LENGTH),
                 } as any,
                 asEntity(this.messageRepo!, message),
-                { ignoreACL: true, skipPush: true },
+                { ignoreACL: true, skipPush: true, includeDeleted: true } as any,
             );
         } catch (err: any) {
             this.logger?.warn(`SearchIndexJob: failed to record indexing failure on message ${message.uid}: ${err?.message}`);

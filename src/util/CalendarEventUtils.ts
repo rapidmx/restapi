@@ -61,7 +61,8 @@ export function hidesDetailsFromReaders(event: { visibility?: unknown } | undefi
 /**
  * A copy of `event` as a reader who may not see its details is shown it - a busy block: same time, recurrence, status and busy status
  * (so the block lands where it should and a series still expands), but the title is `BUSY_TITLE` and the location, description,
- * attendees, organizer, video meeting, reminder, automatic reply and scheduling bookkeeping are removed; `redacted` is `true`.
+ * attendees, organizer, video meeting, reminder, automatic reply, scheduling bookkeeping and the zero-access sealed copies of the details
+ * (`sealedFields`, `sealedContent`) are removed; `redacted` is `true`.
  * `event` itself is not modified (it may be a cached entity). An event that doesn't hide its details is returned as it is.
  */
 export function redactEventForReader<E extends Partial<CalendarEvent>>(event: E): E {
@@ -81,6 +82,10 @@ export function redactEventForReader<E extends Partial<CalendarEvent>>(event: E)
         "cancelNoticeSentAt",
         "reminderSentFor",
         "startAlarmSentFor",
+        // The sealed copies of the title, location and description: a READ delegate of the mailbox is a zero-access member, whose key
+        // wrap opens them.
+        "sealedFields",
+        "sealedContent",
         ...GUEST_PERMISSION_FIELDS,
     ]) {
         delete copy[field];

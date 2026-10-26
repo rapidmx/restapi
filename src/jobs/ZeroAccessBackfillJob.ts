@@ -15,7 +15,6 @@ import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { removeFromSearchIndex, SEARCH_REINDEX } from "../util/SearchIndexUtils.js";
 import type { SearchProvider } from "../search/SearchProvider.js";
-import { zeroAccessDraftBlobPrefix } from "../zeroaccess/ZeroAccessFiling.js";
 import { newZeroAccessWriter, type ZeroAccessSealedFields, type ZeroAccessWriter } from "../zeroaccess/ZeroAccessWriter.js";
 import { sealFieldsOnWrite } from "../zeroaccess/ZeroAccessFieldSealer.js";
 import { newZeroAccessRecordSealer, PROTECTED_FIELDS, type ZeroAccessRecordSealer } from "../zeroaccess/ZeroAccessRecordSealer.js";
@@ -34,9 +33,11 @@ const RECORD_TYPES: readonly ZeroAccessDataType[] = ["calendar", "contacts", "ta
  * every message still stored readable - delivered, sent, imported, drafts, deleted-but-restorable - is encrypted to the mailbox's
  * zero-access key exactly as delivery would have done (`ZeroAccessWriter`), indexed into its week (by the message's own receipt
  * date), and its readable copies removed: the body blob (unless another message still shares it), the sanitized HTML, and the
- * attachment rows and blobs. The message is then indexed again by `SearchIndexJob`, which now sees only its metadata; a deleted-but-
- * restorable one, which `SearchIndexJob` never selects, has its search document removed here instead (search leaves deleted messages out
- * anyway, and a restored one is indexed again from its sealed row).
+ * attachment rows and blobs - except a draft's, which are its working attachments and only lose their extracted text
+ * (`ZeroAccessWriter.discardDraftPlaintext()`). A draft's index entry is written only once its sealed row is stored, so a seal that loses
+ * to a concurrent write (a compose save, another replica's run) never touches the entry the winner wrote. The message is then indexed
+ * again by `SearchIndexJob`, which now sees only its metadata - a deleted-but-restorable one too, by its pass over sealed soft-deleted
+ * mail; its search document is also removed here at once (search leaves deleted messages out anyway).
  *
  * Each run seals at most `batch_size` messages across all mailboxes, newest first within a mailbox, so the newest mail is protected
  * first and a large backlog is worked through over many runs. It is idempotent: a message is selected while its `zeroAccess` is unset,
@@ -45,8 +46,11 @@ const RECORD_TYPES: readonly ZeroAccessDataType[] = ["calendar", "contacts", "ta
  * failed for a reason that passes (the blob store or the database failing for a moment) is tried again next run. A body that can't be
  * parsed is still sealed whole (`ZeroAccessWriter.sealRaw()`).
  *
- * Messages in Outbox are left alone - they are being sent, and `ScheduledSendJob` seals the Sent Items copy - and so is mail the
- * sender encrypted end to end. Turning zero-access off never decrypts anything (the server can't): this job only ever seals.
+ * Messages in Outbox are left alone while their send can still go ahead - due, scheduled or waiting out a retry (`scheduledSendTime`), or
+ * claimed (a live `scheduledSendLeaseExpiresAt`) - since they are relayed from the readable copy and `ScheduledSendJob` seals the Sent
+ * Items copy. One whose send failed for good, or that was relayed but never filed, is nothing left to send: it is sealed, as a draft
+ * when it was never relayed (reopened and sent again like any sealed draft) and as sent mail when it was. Mail the sender encrypted end
+ * to end is left alone. Turning zero-access off never decrypts anything (the server can't): this job only ever seals.
  *
  * Calendar events, contacts and tasks are sealed the same way, per data type, once that type is protected for the mailbox (`specs/search.md`
  * §3 *What It Covers*), within the same budget and after its mail: each record that has no `sealedFields` yet gets its protected fields
@@ -347,16 +351,20 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
         const folders: F[] = await this.folderRepo!.find({ mailboxUid: mailbox.uid, limit: 10_000 } as any, { ignoreACL: true, limit: 10_000 });
         const drafts: Set<string> = new Set(folders.filter((f) => f.type === FolderType.DRAFTS).map((f) => f.uid));
         const outbox: Set<string> = new Set(folders.filter((f) => f.type === FolderType.OUTBOX).map((f) => f.uid));
+        const now: number = Date.now();
         let attempted: number = 0;
         for (const message of candidates) {
             if (attempted >= limit) {
                 break;
             }
-            if (outbox.has(message.folderUid) || message.encrypted) {
+            const inOutbox: boolean = outbox.has(message.folderUid);
+            if (message.encrypted || (inOutbox && ZeroAccessBackfillJob.sendPending(message, now))) {
                 continue;
             }
             attempted++;
-            if (!(await this.sealMessage(mailbox, message, drafts))) {
+            // An Outbox message never relayed is a draft whose send failed: sealed as one, so it can be reopened and sent again.
+            const isDraft: boolean = drafts.has(message.folderUid) || (inOutbox && !(message as any).scheduledSendRelayedAt);
+            if (!(await this.sealMessage(mailbox, message, isDraft))) {
                 // Zero-access stopped being active for this mailbox meanwhile: leave the rest for when it is again.
                 break;
             }
@@ -364,10 +372,14 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
         return attempted;
     }
 
-    /** Seals one message; `false` when zero-access is no longer active for its mailbox (nothing was changed). `drafts`: the mailbox's
-     * Drafts folders. */
-    private async sealMessage(mailbox: X, message: M, drafts: Set<string>): Promise<boolean> {
-        const isDraft: boolean = drafts.has(message.folderUid);
+    /** Whether an Outbox message's send can still go ahead: it is due, scheduled or waiting out a retry, or a send holds a live claim. */
+    private static sendPending(message: Message, now: number): boolean {
+        const lease: any = (message as any).scheduledSendLeaseExpiresAt;
+        return !!message.scheduledSendTime || (!!lease && new Date(lease).getTime() > now);
+    }
+
+    /** Seals one message, as a draft when `isDraft`; `false` when zero-access is no longer active for its mailbox (nothing was changed). */
+    private async sealMessage(mailbox: X, message: M, isDraft: boolean): Promise<boolean> {
         let raw: Buffer;
         try {
             raw = await this.blobStore!.get(message.bodyBlobKey);
@@ -382,8 +394,9 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
         let sealed: ZeroAccessSealedFields | undefined;
         try {
             const receivedAt: Date = new Date(message.receivedDate ?? message.sentDate ?? Date.now());
+            // A draft's index entry is written only once its sealed row has won (`writeDraftIndex()`).
             sealed = isDraft
-                ? await this.zeroAccessWriter!.sealDraft(mailbox, raw, message.uid, receivedAt)
+                ? await this.zeroAccessWriter!.sealDraft(mailbox, raw, message.uid, receivedAt, { deferIndex: true })
                 : await this.zeroAccessWriter!.sealRaw(mailbox, raw, message.uid, receivedAt);
         } catch (err: any) {
             // Even a message that can't be parsed is sealed (`sealRaw()`): storing the sealed copy or its index entry fails only for a while.
@@ -412,53 +425,48 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
                 { ignoreACL: true, includeDeleted: true } as any,
             );
         } catch (err: any) {
-            // Changed meanwhile (a move, a flag): the next run picks it up again. A draft's fresh blob isn't the message's, and the index
-            // entry `sealDraft()` replaced may now stand in for content the draft no longer has (`losingDraftEntryMayGo()`).
+            // Changed meanwhile (a move, a flag, a compose save, another replica's seal): the next run picks it up again if it is still
+            // readable. A draft's fresh blob isn't the message's; its index entry was never written, so the winner's stands.
             if (isDraft) {
                 await this.blobStore!.delete(sealed.bodyBlobKey).catch(() => undefined);
-                if (await this.losingDraftEntryMayGo(message, drafts)) {
-                    await this.zeroAccessWriter!.removeIndexEntry(sealed.indexEntryUid).catch((removeErr: any) => {
-                        this.logger?.warn(`ZeroAccessBackfillJob: draft ${message.uid}'s index entry couldn't be removed after a failed seal: ${removeErr?.message ?? removeErr}`);
-                    });
-                }
             }
             this.logger?.debug?.(`ZeroAccessBackfillJob: message ${message.uid} changed while it was sealed; retrying later: ${err?.message}`);
             return true;
         }
+        if (isDraft) {
+            await this.writeDraftIndex(message, sealed);
+        }
         try {
-            await this.zeroAccessWriter!.discardPlaintext(this.blobRepos, message.uid, previous);
+            // A draft keeps its attachment rows: they are its working attachments, which the compose window lists and its send is built from.
+            if (isDraft) {
+                await this.zeroAccessWriter!.discardDraftPlaintext(this.blobRepos, message.uid, previous);
+            } else {
+                await this.zeroAccessWriter!.discardPlaintext(this.blobRepos, message.uid, previous);
+            }
         } catch (err: any) {
             this.logger?.warn(`ZeroAccessBackfillJob: message ${message.uid} is sealed but its readable copies couldn't all be removed: ${err?.message}`);
         }
         if ((message as any).deleted === true) {
-            // `SearchIndexJob` never selects a soft-deleted row, so `SEARCH_REINDEX` alone would leave its readable document in place until
-            // a purge. Best effort (logged).
+            // At once, best effort (logged): `SearchIndexJob` replaces it with the metadata document on its pass over sealed soft-deleted
+            // mail (the stamp is null), retrying until that is written or the document is gone, so a failure here is caught up.
             await removeFromSearchIndex(this.searchProvider, "message", message.uid, this.logger);
         }
         return true;
     }
 
     /**
-     * Whether the index entry a draft's seal wrote (`sealDraft()` replaces the draft's entry) must go once the draft's own update lost to a
-     * concurrent write - the rule the server's compose route applies to a losing sealed save (`losingIndexEntryMayGo()`). It goes when the
-     * draft is gone, when a sealed draft save won (that save wrote its own entry, which this one replaced; its next save writes a fresh
-     * one), and when the draft is still readable in Drafts (the next run seals it again, entry included). It stays when the message was
-     * filed as its sealed Sent Items copy, which shares its uid, or left Drafts to be sent (the copy filed then keeps the entry it finds),
-     * and when the draft can't be read.
+     * Writes the index entry of a draft whose sealed row was just stored (`sealDraft()`'s deferred `writeIndex()`), replacing the one it
+     * had. Not when the row no longer points at this seal's blob - a compose save after it wrote its own entry - or can't be read.
+     * Best effort (logged): a draft left without an entry gets one at its next save or when it is sent.
      */
-    private async losingDraftEntryMayGo(message: M, drafts: Set<string>): Promise<boolean> {
+    private async writeDraftIndex(message: M, sealed: ZeroAccessSealedFields): Promise<void> {
         try {
-            const current: any = await this.messageRepo!.findOne(message.uid, { ignoreACL: true, includeDeleted: true });
-            if (!current) {
-                return true;
+            const current: M | undefined = await this.messageRepo!.findOne(message.uid, { ignoreACL: true, includeDeleted: true, skipCache: true });
+            if (current?.bodyBlobKey === sealed.bodyBlobKey) {
+                await sealed.writeIndex?.();
             }
-            if (current.zeroAccess) {
-                return typeof current.bodyBlobKey === "string" && current.bodyBlobKey.startsWith(zeroAccessDraftBlobPrefix(message.mailboxUid));
-            }
-            return drafts.has(current.folderUid);
         } catch (err: any) {
-            this.logger?.warn(`ZeroAccessBackfillJob: couldn't tell whether draft ${message.uid}'s index entry outlived a failed seal; keeping it: ${err?.message ?? err}`);
-            return false;
+            this.logger?.warn(`ZeroAccessBackfillJob: draft ${message.uid} is sealed but its index entry couldn't be written: ${err?.message ?? err}`);
         }
     }
 

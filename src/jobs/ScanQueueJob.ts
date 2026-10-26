@@ -86,7 +86,7 @@ import {
     ScanResult,
     ScanTargetType,
 } from "../models/types.js";
-import { hasSealedFields, sealFieldsOnWrite } from "../zeroaccess/ZeroAccessFieldSealer.js";
+import { hasSealedFields, isSealedEvent, sealFieldsOnWrite } from "../zeroaccess/ZeroAccessFieldSealer.js";
 import { EVENT_PROTECTED_FIELDS, newZeroAccessRecordSealer, PROTECTED_EVENT_TITLE, type ZeroAccessRecordSealer } from "../zeroaccess/ZeroAccessRecordSealer.js";
 
 /** `true` if two `CalendarEvent.recurrenceId` values name the same occurrence (or both are the master row's
@@ -2952,7 +2952,7 @@ export abstract class ScanQueueJob<
         }
 
         if (mailbox && decision !== undefined) {
-            await this.finalizeResourceDecision(mailbox, row, decision);
+            await this.finalizeResourceDecision(mailbox, row, decision, parsed.summary);
         }
     }
 
@@ -3165,8 +3165,12 @@ export abstract class ScanQueueJob<
      * own attendee entry back to the organizer - reusing the exact same `buildEventIcs()`/`MailComposer`/
      * `MailTransport.send()` sequence `respond()` already uses, best-effort (a send failure is logged, not
      * thrown - the calendar mutation itself has already succeeded either way).
+     *
+     * A row filed sealed (zero-access mail, a protected calendar) holds a placeholder title and no location or description: the reply
+     * names the event by `title`, the SUMMARY the invitation carried, and leaves SUMMARY, LOCATION and DESCRIPTION out when there is none,
+     * so the organizer never gets "Accepted: [...]" or a REPLY that renames the meeting to a placeholder.
      */
-    private async finalizeResourceDecision(mailbox: X, row: CE, decision: AttendeeResponseStatus): Promise<void> {
+    private async finalizeResourceDecision(mailbox: X, row: CE, decision: AttendeeResponseStatus, title?: string): Promise<void> {
         if (decision === AttendeeResponseStatus.DECLINED) {
             await this.deleteReceivedEventCopy(row);
         }
@@ -3177,14 +3181,20 @@ export abstract class ScanQueueJob<
             return;
         }
 
+        const sealed: boolean = isSealedEvent(row) || row.title === PROTECTED_SUBJECT || row.title === PROTECTED_EVENT_TITLE;
+        const realTitle: string | undefined = title && title !== PROTECTED_SUBJECT && title !== PROTECTED_EVENT_TITLE ? title : undefined;
+        const displayTitle: string | undefined = sealed ? realTitle : row.title;
+        const event: CE = sealed
+            ? { ...row, title: displayTitle, location: undefined, description: undefined, descriptionHtml: undefined }
+            : row;
         try {
-            const ics = buildEventIcs({ ...row, attendees: [resourceAttendee] }, "REPLY", { onlyAttendee: resourceAttendee });
+            const ics = buildEventIcs({ ...event, attendees: [resourceAttendee] }, "REPLY", { onlyAttendee: resourceAttendee });
             const verb = decision === AttendeeResponseStatus.DECLINED ? "declined" : "accepted";
             const composed: Buffer = await new MailComposer({
                 from: { name: safeDisplayName(mailbox.displayName), address: mailbox.primarySmtpAddress },
                 to: row.organizer.address,
-                subject: `${decision === AttendeeResponseStatus.DECLINED ? "Declined" : "Accepted"}: ${row.title}`,
-                text: `${mailbox.displayName || mailbox.primarySmtpAddress} has automatically ${verb}: ${row.title}`,
+                subject: `${decision === AttendeeResponseStatus.DECLINED ? "Declined" : "Accepted"}: ${displayTitle ?? "meeting request"}`,
+                text: `${mailbox.displayName || mailbox.primarySmtpAddress} has automatically ${verb}${displayTitle ? `: ${displayTitle}` : " the meeting request"}`,
                 icalEvent: { method: "reply", content: ics },
             })
                 .compile()

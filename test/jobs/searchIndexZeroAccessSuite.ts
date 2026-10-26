@@ -125,6 +125,68 @@ export function searchIndexZeroAccessSuite(ctx: SearchIndexZeroAccessSuiteContex
             expect(docOf(message.uid)).toMatchObject({ metadataOnly: true, subject: "[...]" });
         });
 
+        describe("soft-deleted sealed mail", () => {
+            /** A soft-deleted sealed message whose readable document - from before it was sealed - is still in the index. */
+            const deletedSealed = async (fields: any = {}) => {
+                const message = await ctx.createMessage({ subject: "[...]", zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" }, deleted: true, ...fields });
+                await ctx.searchProvider().index({ entityType: "message", entityUid: message.uid, mailboxUid: message.mailboxUid, subject: CANARY_SUBJECT, body: CANARY_BODY } as any);
+                return message;
+            };
+
+            it("replaces the readable document of a sealed message deleted before it was re-indexed, and leaves other deleted mail alone", async () => {
+                const sealed = await deletedSealed();
+                const plain = await ctx.createMailbox();
+                const deletedReadable = await readable(plain, { deleted: true });
+
+                await ctx.job().run();
+
+                expect(docOf(sealed.uid)).toMatchObject({ subject: "[...]", body: "", metadataOnly: true });
+                expect(JSON.stringify(docOf(sealed.uid))).not.toContain("CANARY");
+                const stamped = await ctx.findMessage(sealed.uid);
+                expect(stamped.searchIndexedAt).toBeTruthy();
+                expect(stamped.deleted).toBe(true);
+                // Deleted readable mail keeps today's behaviour: never selected.
+                expect(docOf(deletedReadable.uid)).toBeUndefined();
+                expect((await ctx.findMessage(deletedReadable.uid)).searchIndexedAt ?? null).toBeNull();
+            });
+
+            it("retries one whose metadata document can't be written, as it does live mail, until it is", async () => {
+                const sealed = await deletedSealed();
+                vi.spyOn(ctx.searchProvider(), "bulkIndex").mockRejectedValueOnce(new Error("cluster down"));
+
+                await ctx.job().run();
+
+                expect(docOf(sealed.uid)).toMatchObject({ body: CANARY_BODY });
+                const failed = await ctx.findMessage(sealed.uid);
+                expect(failed.searchIndexAttempts).toBe(1);
+                expect(failed.searchIndexError).toContain("cluster down");
+
+                await ctx.updateMessage(sealed.uid, { searchIndexNextAttemptAt: new Date(Date.now() - 1000) });
+                await ctx.job().run();
+                expect(docOf(sealed.uid)).toMatchObject({ body: "", metadataOnly: true });
+                expect((await ctx.findMessage(sealed.uid)).searchIndexedAt).toBeTruthy();
+            });
+
+            it("takes them only in what is left of a batch after live mail", async () => {
+                const job = ctx.job();
+                const savedBatchSize: number = job.batchSize;
+                job.batchSize = 1;
+                try {
+                    const live = await ctx.createMessage({ subject: "[...]", zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" } });
+                    const sealed = await deletedSealed();
+
+                    await job.run();
+                    expect(docOf(live.uid)).toMatchObject({ metadataOnly: true });
+                    expect(docOf(sealed.uid)).toMatchObject({ body: CANARY_BODY });
+
+                    await job.run();
+                    expect(docOf(sealed.uid)).toMatchObject({ body: "", metadataOnly: true });
+                } finally {
+                    job.batchSize = savedBatchSize;
+                }
+            });
+        });
+
         describe("a sealed message whose metadata document can't be written", () => {
             let savedMaxAttempts: number;
             beforeEach(() => {

@@ -350,6 +350,35 @@ export function calendarEventDialogSuite(ctx: CalendarEventDialogSuiteContext): 
             isFull((await other(request(ctx.app()).get(`${ctx.baseUrl}/${events.normal.uid}`))).body, "Normal");
         });
 
+        it("Leaves the zero-access sealed copies of a private event's details out of its busy block, which a mailbox member's key would open.", async () => {
+            const { mailbox, calendar } = await setup();
+            await ctx.grantFolder(calendar.uid, ctx.otherUid, ["read", "list"]);
+            const fieldSealed = await ctx.createCalendarEvent(mailbox.uid, calendar.uid, {
+                title: "Protected event",
+                visibility: "private",
+                sealedFields: { title: "c2VhbGVkLXRpdGxl", location: "c2VhbGVkLWxvY2F0aW9u" },
+            });
+            const contentSealed = await ctx.createCalendarEvent(mailbox.uid, calendar.uid, {
+                title: "[...]",
+                visibility: "confidential",
+                sealedContent: { keyFingerprint: "ab".repeat(32), sealed: "c2VhbGVkLWNvbnRlbnQ=" },
+            });
+
+            const list = await other(request(ctx.app()).get(`${ctx.baseUrl}?folderUid=${calendar.uid}`));
+            expect(list.status).toBe(200);
+            expect(list.body).toHaveLength(2);
+            const one = await other(request(ctx.app()).get(`${ctx.baseUrl}/${contentSealed.uid}`));
+            for (const event of [...list.body, one.body]) {
+                isBlock(event);
+                expect("sealedFields" in event).toBe(false);
+                expect("sealedContent" in event).toBe(false);
+            }
+            // The owner still gets them, to open.
+            const mine = await owner(request(ctx.app()).get(`${ctx.baseUrl}/${fieldSealed.uid}`));
+            expect(mine.body.sealedFields).toEqual({ title: "c2VhbGVkLXRpdGxl", location: "c2VhbGVkLWxvY2F0aW9u" });
+            expect((await owner(request(ctx.app()).get(`${ctx.baseUrl}/${contentSealed.uid}`))).body.sealedContent).toMatchObject({ sealed: "c2VhbGVkLWNvbnRlbnQ=" });
+        });
+
         it("Counts the same events as it lists.", async () => {
             const { calendar } = await shared(["read", "list", "count"]);
 

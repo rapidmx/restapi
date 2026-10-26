@@ -17,6 +17,7 @@ import {
     DomainMongo,
     EscrowScopeMongo,
     FolderMongo,
+    KeyVaultMongo,
     MailboxMongo,
     MailboxPolicyMongo,
     MatterMongo,
@@ -37,6 +38,7 @@ export class MailboxRouteMongo extends BaseMailboxRoute<MailboxMongo> {
     protected matterClass: any = MatterMongo;
     protected mailboxPolicyClass: any = MailboxPolicyMongo;
     protected messageClass: any = MessageMongo;
+    protected keyVaultClass: any = KeyVaultMongo;
     protected dataSubjectErasureRequestClass: any = DataSubjectErasureRequestMongo;
 
     // `@Repository`-injected, always present in any functioning deployment (the `acl` datastore is a hard

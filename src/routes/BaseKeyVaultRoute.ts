@@ -68,8 +68,10 @@ export type PublicKeyVault = Pick<KeyVault, "wrappedKeys" | "masterKeyWraps"> & 
  * vault would, after enough rotations, refuse the new key's wraps and leave new mail sealed to a key no member holds. */
 const MAX_MEMBER_KEY_WRAPS = 2000;
 
-/** The most member key wraps one vault holds across all its keys - a bound on the document's size (a wrap is about 1 KB), far above
- * what members times retained keys reach in practice. */
+/** The most member key wraps one vault holds across all its keys - a bound on the document's size (a wrap is about 1 KB). Members times
+ * retained keys reach it after about 10,000 / members rotations (5 at 2000 members, 50 at 200), well before `MAX_ENROLLED_KEYS` for a
+ * mailbox of more than 200 members: a rotation that would pass it is refused before its certificate is issued
+ * (`assertRoomForMemberWraps()`, `enrollSharedZeroAccessKey()`), so the current key stays active rather than strand the members. */
 const MAX_MEMBER_KEY_WRAPS_TOTAL = 10_000;
 
 /** The most escrow copies of zero-access keys one vault holds (keys times the scopes a mailbox was assigned to over time). */
@@ -686,6 +688,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             if (!body.csr) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "csr is required for useType 'zero-access'.");
             }
+            await this.assertRoomForMemberWraps(mailbox);
             const issued = await this.encryptionCa!.issue(mailbox.primarySmtpAddress, body.csr);
             const cert = new crypto.X509Certificate(issued.certificate);
             fingerprint = issued.fingerprint;
@@ -954,6 +957,29 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             { user },
         );
         return await this.sharedKeyStatus(await this.requireMailbox(mailbox.uid), user, members);
+    }
+
+    /**
+     * Refuses (400), before a certificate is issued, an owner's new zero-access key whose member wraps - one per member, which the owner's
+     * client adds right after (`putMemberKeyWraps()`) - wouldn't fit in the vault next to the wraps it holds (`MAX_MEMBER_KEY_WRAPS_TOTAL`).
+     * The new key becomes active as soon as it is enrolled, so otherwise new mail would be sealed to a key no member could be given, and
+     * members would lose it; refused, the current key stays active and members keep reading. The owner-less counterpart is the check in
+     * `enrollSharedZeroAccessKey()`. A mailbox without members needs no wraps.
+     */
+    private async assertRoomForMemberWraps(mailbox: M): Promise<void> {
+        const members: MailboxMember[] = await this.members(mailbox);
+        if (members.length === 0) {
+            return;
+        }
+        const held: number = ((await this.findKeyVault(mailbox.uid))?.memberKeyWraps ?? []).length;
+        if (held + members.length > MAX_MEMBER_KEY_WRAPS_TOTAL) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                400,
+                `A new zero-access key's wraps for this mailbox's ${members.length} members wouldn't fit next to the ${held} it holds ` +
+                    `(at most ${MAX_MEMBER_KEY_WRAPS_TOTAL} member key wraps); the current key stays active.`,
+            );
+        }
     }
 
     /** Refuses (400) a vault's member wraps once one zero-access key would have more than `MAX_MEMBER_KEY_WRAPS` of them, or the vault more

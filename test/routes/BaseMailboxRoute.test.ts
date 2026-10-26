@@ -119,4 +119,15 @@ describe("BaseMailboxRoute Tests (repoUtils guard clauses only)", () => {
 
         await expect(route.truncate({}, {}, { uid: "user-1" } as any)).rejects.toThrow(/internal error/i);
     });
+
+    it("masterKeyHoldsZeroAccessKeys() is false without the KeyVault model, or when the vault can't be read, so an owner change is refused.", async () => {
+        const route: any = objectFactory.newInstance<TestMailboxRoute>(TestMailboxRoute, { initialize: false });
+        const mailbox = { uid: "mbx", zeroAccessKeys: [{ fingerprint: "fp" }] };
+        expect(await route.masterKeyHoldsZeroAccessKeys(mailbox)).toBe(false);
+
+        const logger = { warn: vi.fn() };
+        Object.assign(route, { logger, keyVaultRepo: { find: vi.fn().mockRejectedValue(new Error("database down")) } });
+        expect(await route.masterKeyHoldsZeroAccessKeys(mailbox)).toBe(false);
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("database down"));
+    });
 });

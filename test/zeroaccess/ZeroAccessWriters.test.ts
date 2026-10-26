@@ -154,6 +154,37 @@ describe("ZeroAccessWriter", () => {
         expect([...entries.values()][0].sealed).not.toBe(firstEntry.sealed);
     });
 
+    it("discards a sealed draft's replaced body and its attachments' extracted text, keeping the attachment rows, and a row changed meanwhile its text", async () => {
+        const blobStore = { delete: vi.fn() };
+        const w = writer({ blobStore });
+        const rows = [
+            { uid: "a1", version: 1, blobKey: "attachments/a1", extractedTextBlobKey: "attachment-text/a1" },
+            { uid: "a2", version: 1, blobKey: "attachments/a2", extractedTextBlobKey: "attachment-text/a2" },
+            { uid: "a3", version: 1, blobKey: "attachments/a3" },
+        ];
+        const attachmentRepo = {
+            find: vi.fn(async (query: any) => (query.uid ? [] : rows)),
+            update: vi.fn(async (patch: any) => {
+                if (patch.uid === "a2") {
+                    throw new Error("version");
+                }
+                return patch;
+            }),
+            delete: vi.fn(),
+            count: vi.fn().mockResolvedValue(0),
+        };
+        await w.discardDraftPlaintext({ attachmentRepo } as any, "d1", ["bodies/d1", null]);
+        expect(attachmentRepo.delete).not.toHaveBeenCalled();
+        expect(attachmentRepo.update.mock.calls.map((call: any[]) => call[0])).toEqual([
+            { uid: "a1", version: 1, extractedTextBlobKey: null },
+            { uid: "a2", version: 1, extractedTextBlobKey: null },
+        ]);
+        const deleted = blobStore.delete.mock.calls.map((call: any[]) => call[0]);
+        expect(deleted).toEqual(expect.arrayContaining(["bodies/d1", "attachment-text/a1"]));
+        expect(deleted).not.toContain("attachment-text/a2");
+        expect(deleted).not.toContain("attachments/a1");
+    });
+
     it("discards plaintext blobs without an attachment repo too", async () => {
         const blobStore = { delete: vi.fn() };
         const w = writer({ blobStore });

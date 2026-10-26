@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
-import { BackgroundService, NotificationUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { ApiErrors, BackgroundService, NotificationUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { boundIndexedValue, findThreadConversationId, resolveConversationId } from "../util/ConversationUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { refreshFolderCounts } from "../util/FolderCountUtils.js";
@@ -34,6 +34,9 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /** Maximum length of a persisted `scheduledSendError`. */
 const MAX_ERROR_LENGTH = 1000;
+
+/** How many times a relayed message's version-checked filing into Sent Items is tried against a fresh read of the row while the claim stands. */
+const FILING_ATTEMPTS = 3;
 
 /** What a send attempt came to - the `action` of the event `ScheduledSendJob` publishes. */
 export type SendEventAction = "send-succeeded" | "send-failed" | "send-retrying";
@@ -546,11 +549,11 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
             // enough that trusting a version fetched before it risks a spurious conflict against a
             // completely unrelated concurrent write to this same row (e.g. the user separately marking it
             // read), mirroring `DataExportJob.processRequest()`'s identical final-transition re-fetch.
-            const refetched: M | undefined = await this.messageRepo!.findOne(claimed.uid, { ignoreACL: true });
+            let refetched: M | undefined = await this.messageRepo!.findOne(claimed.uid, { ignoreACL: true });
             // Filed only while this run's claim still stands: the message is still in the Outbox it was claimed in and
             // still carries this claim's lease. Otherwise another claim took it over (a lapsed lease) or it was moved
             // after the lease lapsed - either way it's no longer this run's to file, and nothing is written.
-            if (!refetched || !this.stillClaimed(refetched, claimed)) {
+            const notClaimed = async (): Promise<void> => {
                 this.logger?.warn(`ScheduledSendJob: not filing message ${claimed.uid} - it is no longer in Outbox under this run's claim.`);
                 // This relay's own sanitized render is on no row: nothing would ever remove it.
                 if (sanitizedHtmlBlobKey && sanitizedHtmlBlobKey !== ((claimed as any).sanitizedHtmlBlobKey ?? undefined)) {
@@ -562,6 +565,9 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     }
                     /* v8 ignore stop */
                 }
+            };
+            if (!refetched || !this.stillClaimed(refetched, claimed)) {
+                await notClaimed();
                 return;
             }
 
@@ -586,7 +592,6 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                 claimed.mailboxUid,
                 FolderType.SENT_ITEMS,
             );
-            const flags = { ...refetched.flags, read: true };
             // The Sent Items copy of a zero-access mailbox is sealed (`BaseMessageRoute.sealSentCopy()`'s counterpart) - unless the sender
             // encrypted it end to end, or a previous run already sealed it.
             const sealed: ZeroAccessSealedFields | undefined =
@@ -594,15 +599,19 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     ? undefined
                     : await this.sealSentCopy(refetched, relayedRaw ?? (await this.blobStore!.get(claimed.bodyBlobKey)));
 
-            const updated: M = await this.messageRepo!.update(
-                {
-                    uid: refetched.uid,
-                    version: (refetched as any).version,
+            // Built from the row as last read: a concurrent write that lands while the Sent copy is sealed (`SearchIndexJob` stamping
+            // the Outbox row, a flag change) fails the version-checked filing, which is then retried against a fresh read, with what was
+            // already sealed, while this run's claim stands (`FILING_ATTEMPTS`).
+            const filing = (row: M): any => {
+                const flags = { ...row.flags, read: true };
+                return {
+                    uid: row.uid,
+                    version: (row as any).version,
                     folderUid: sentFolder.uid,
                     flags,
                     // An update is a patch, not a constructed entity, so `flags`' denormalized list mirrors have
                     // to be re-derived alongside it - see `util/MessageListUtils.ts`.
-                    ...deriveMessageListFields({ ...refetched, flags, ...(sealed ? { subject: sealed.subject, bodyPreview: sealed.bodyPreview } : {}) }),
+                    ...deriveMessageListFields({ ...row, flags, ...(sealed ? { subject: sealed.subject, bodyPreview: sealed.bodyPreview } : {}) }),
                     sanitizedHtmlBlobKey: sealed ? null : (sanitizedHtmlBlobKey ?? null),
                     ...(sealed ? { subject: sealed.subject, bodyPreview: sealed.bodyPreview, bodyBlobKey: sealed.bodyBlobKey, zeroAccess: sealed.zeroAccess } : {}),
                     ...(messageId ? { messageId: boundIndexedValue(messageId) } : {}),
@@ -612,8 +621,8 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     ...(relayInfo
                         ? {
                               encrypted: relayInfo.encrypted,
-                              inReplyTo: relayInfo.inReplyTo ?? (refetched as any).inReplyTo ?? null,
-                              references: relayInfo.references.length > 0 ? relayInfo.references : ((refetched as any).references ?? []),
+                              inReplyTo: relayInfo.inReplyTo ?? (row as any).inReplyTo ?? null,
+                              references: relayInfo.references.length > 0 ? relayInfo.references : ((row as any).references ?? []),
                           }
                         : {}),
                     ...(attachesReceiptRequest ? { receiptStatus: seedReceiptStatus(envelopeRecipientsOf(claimed)) } : {}),
@@ -627,10 +636,24 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     sentByServerAt: new Date(),
                     // Indexed again: the search document names the Outbox, and may hold the readable draft's text (`SEARCH_REINDEX`).
                     ...SEARCH_REINDEX,
-                } as any,
-                asEntity(this.messageRepo!, refetched),
-                { ignoreACL: true },
-            );
+                };
+            };
+            let updated: M;
+            for (let attempt = 1; ; attempt++) {
+                try {
+                    updated = await this.messageRepo!.update(filing(refetched), asEntity(this.messageRepo!, refetched), { ignoreACL: true });
+                    break;
+                } catch (err: any) {
+                    if (err?.code !== ApiErrors.INVALID_OBJECT_VERSION || attempt >= FILING_ATTEMPTS) {
+                        throw err;
+                    }
+                    refetched = await this.messageRepo!.findOne(claimed.uid, { ignoreACL: true, skipCache: true });
+                    if (!refetched || !this.stillClaimed(refetched, claimed)) {
+                        await notClaimed();
+                        return;
+                    }
+                }
+            }
             if (sealed) {
                 await this.discardSentPlaintext(refetched, sanitizedHtmlBlobKey);
             }

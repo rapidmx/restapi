@@ -2612,6 +2612,65 @@ ${oversigningDkimSignature("example.com", "RapidMX-Key", "Autocrypt")}`,
             expect(transport.sent[0].raw.toString()).toContain("ACCEPTED");
         });
 
+        it("Names the event by the invitation's SUMMARY in a sealed resource's reply, never by the placeholder its copy is filed under.", async () => {
+            const za = await testZeroAccessKey();
+            await createMailbox({ isResource: true, autoAcceptBookings: true, zeroAccessKeys: [za.key], zeroAccessTypes: { mail: false, calendar: true } });
+            const icalUid = uuid.v4();
+
+            await sendItipRequest({ icalUid, title: "Board review", location: "Room 4" });
+
+            const [event]: any[] = (await calendarEventRepo.find({ where: { mailboxUid, icalUid } }));
+            expect(event.title).toBe("Protected event");
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent).toHaveLength(1);
+            const reply: string = transport.sent[0].raw.toString();
+            expect(reply).toContain("Subject: Accepted: Board review");
+            expect(reply).toContain("has automatically accepted: Board review");
+            expect(reply).toContain("SUMMARY:Board review");
+            expect(reply).not.toContain("Protected event");
+            expect(reply).not.toContain("Room 4");
+        });
+
+        it("Leaves the title out of a zero-access resource's reply to an invitation without SUMMARY, rather than naming its placeholder.", async () => {
+            const za = await testZeroAccessKey();
+            await createMailbox({ isResource: true, autoAcceptBookings: true, zeroAccessKeys: [za.key] });
+            const icalUid = uuid.v4();
+            const ics = buildEventIcs(makeIcsEventFixture({ icalUid, title: "" }), "REQUEST");
+            const entry = await createIngestEntry({ rawBlobKey: "", envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"], zeroAccessKeyFingerprint: za.key.fingerprint });
+
+            await job.processInline(entry.uid, makeItipRawMessage(ics));
+
+            const [event]: any[] = (await calendarEventRepo.find({ where: { mailboxUid, icalUid } }));
+            expect(event.title).toBe("[...]");
+            expect(event.sealedContent).toBeTruthy();
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            expect(transport.sent).toHaveLength(1);
+            const reply: string = transport.sent[0].raw.toString();
+            expect(reply).toContain("METHOD:REPLY");
+            expect(reply).toContain("Subject: Accepted: meeting request");
+            expect(reply).toContain("has automatically accepted the meeting request");
+            expect(reply).not.toContain("SUMMARY");
+            expect(reply).not.toContain("[...]");
+        });
+
+        it("Names the event by the invitation's SUMMARY in a zero-access resource's reply.", async () => {
+            const za = await testZeroAccessKey();
+            await createMailbox({ isResource: true, autoAcceptBookings: true, zeroAccessKeys: [za.key] });
+            const icalUid = uuid.v4();
+            const ics = buildEventIcs(makeIcsEventFixture({ icalUid, title: "Board review" }), "REQUEST");
+            const entry = await createIngestEntry({ rawBlobKey: "", envelopeFrom: "organizer@example.com", envelopeTo: ["recipient@example.com"], zeroAccessKeyFingerprint: za.key.fingerprint });
+
+            await job.processInline(entry.uid, makeItipRawMessage(ics));
+
+            const [event]: any[] = (await calendarEventRepo.find({ where: { mailboxUid, icalUid } }));
+            expect(event.title).toBe("[...]");
+            const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+            const reply: string = transport.sent[0].raw.toString();
+            expect(reply).toContain("Subject: Accepted: Board review");
+            expect(reply).toContain("SUMMARY:Board review");
+            expect(reply).not.toContain("[...]");
+        });
+
         it("Auto-declines a request that conflicts with an existing booking, soft-deleting its own copy.", async () => {
             await createMailbox({ isResource: true, autoAcceptBookings: true });
             const startDate = new Date(Date.now() + 60 * 60 * 1000);

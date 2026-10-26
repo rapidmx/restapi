@@ -35,6 +35,7 @@ function job(options: { mailboxes?: any[]; messages?: any[]; writer?: any; updat
             sealRaw: vi.fn().mockResolvedValue(sealed),
             sealDraft: vi.fn().mockResolvedValue(sealed),
             discardPlaintext: vi.fn().mockResolvedValue(undefined),
+            discardDraftPlaintext: vi.fn().mockResolvedValue(undefined),
         });
     }
     return { instance, logger };
@@ -145,49 +146,77 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
         expect(instance.zeroAccessWriter.discardPlaintext).not.toHaveBeenCalled();
     });
 
-    describe("a draft whose sealed update lost to a concurrent write", () => {
-        /** A run over draft d1 whose update fails, with the row as `current` (or a rejection) read back afterwards. */
-        async function lostDraft(current: any) {
-            const { instance, logger } = job({ messages: [message("d1", { folderUid: "drafts" })], update: vi.fn().mockRejectedValue(new Error("version")) });
-            instance.folderRepo.find.mockResolvedValue([{ uid: "drafts", type: "drafts" }, { uid: "outbox", type: "outbox" }, { uid: "sent", type: "sent" }]);
-            instance.messageRepo.findOne = current instanceof Error ? vi.fn().mockRejectedValue(current) : vi.fn().mockResolvedValue(current);
+    describe("a draft's index entry", () => {
+        /** A run over draft d1 sealed with a deferred index write, whose row reads back as `current` (or a rejection) after its update. */
+        async function sealedDraft(current: any, update?: any) {
+            const writeIndex = vi.fn().mockResolvedValue(undefined);
+            const { instance, logger } = job({ messages: [message("d1", { folderUid: "drafts" })], update });
+            instance.zeroAccessWriter.sealDraft = vi.fn().mockResolvedValue({ ...sealed, writeIndex });
             instance.zeroAccessWriter.removeIndexEntry = vi.fn().mockResolvedValue(undefined);
+            instance.messageRepo.findOne = current instanceof Error ? vi.fn().mockRejectedValue(current) : vi.fn().mockResolvedValue(current);
             await instance.run();
-            return { instance, logger };
+            return { instance, logger, writeIndex };
         }
 
-        it("removes the index entry its seal replaced when the draft is gone, a sealed save won, or it is still readable in Drafts", async () => {
-            for (const current of [
-                undefined,
-                { uid: "d1", folderUid: "drafts", zeroAccess: { keyFingerprint: "fp" }, bodyBlobKey: "za/mb/drafts/other" },
-                { uid: "d1", folderUid: "drafts", zeroAccess: null, bodyBlobKey: "bodies/b" },
-            ]) {
-                const { instance } = await lostDraft(current);
-                expect(instance.zeroAccessWriter.removeIndexEntry).toHaveBeenCalledWith(sealed.indexEntryUid);
-            }
+        it("is written only once the sealed row is stored, deferred from the seal, and replaces the draft's", async () => {
+            const { instance, writeIndex } = await sealedDraft({ uid: "d1", bodyBlobKey: sealed.bodyBlobKey });
+            expect(instance.zeroAccessWriter.sealDraft).toHaveBeenCalledWith(expect.anything(), expect.anything(), "d1", expect.any(Date), { deferIndex: true });
+            expect(writeIndex).toHaveBeenCalledTimes(1);
+            expect(instance.messageRepo.update.mock.invocationCallOrder[0]).toBeLessThan(writeIndex.mock.invocationCallOrder[0]);
         });
 
-        it("keeps it once the draft was filed as its sealed Sent Items copy or left Drafts to be sent, and when the draft can't be read", async () => {
-            for (const current of [
-                { uid: "d1", folderUid: "sent", zeroAccess: { keyFingerprint: "fp" }, bodyBlobKey: "za/mb/d1" },
-                { uid: "d1", folderUid: "outbox", zeroAccess: null, bodyBlobKey: "bodies/b" },
-                new Error("database down"),
-            ]) {
-                const { instance, logger } = await lostDraft(current);
-                expect(instance.zeroAccessWriter.removeIndexEntry).not.toHaveBeenCalled();
-                if (current instanceof Error) {
-                    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("database down"));
-                }
-            }
+        it("is never touched by a seal that lost to a concurrent write - a compose save or another replica's seal - whose entry stands", async () => {
+            const { instance, writeIndex } = await sealedDraft({ uid: "d1", bodyBlobKey: "za/mb/drafts/winner" }, vi.fn().mockRejectedValue(new Error("version")));
+            expect(writeIndex).not.toHaveBeenCalled();
+            expect(instance.zeroAccessWriter.removeIndexEntry).not.toHaveBeenCalled();
+            expect(instance.blobStore.delete).toHaveBeenCalledWith(sealed.bodyBlobKey);
         });
 
-        it("logs an entry it can't remove", async () => {
-            const { instance, logger } = job({ messages: [message("d1", { folderUid: "drafts" })], update: vi.fn().mockRejectedValue(new Error("version")) });
-            instance.messageRepo.findOne = vi.fn().mockResolvedValue(undefined);
-            instance.zeroAccessWriter.removeIndexEntry = vi.fn().mockRejectedValue(new Error("index down"));
-            await instance.run();
-            expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("index down"));
+        it("isn't written over a later save's entry, nor for a draft that is gone, and a failure is logged with the draft left sealed", async () => {
+            for (const current of [{ uid: "d1", bodyBlobKey: "za/mb/drafts/later-save" }, undefined]) {
+                const { writeIndex } = await sealedDraft(current);
+                expect(writeIndex).not.toHaveBeenCalled();
+            }
+            const unread = await sealedDraft(new Error("database down"));
+            expect(unread.writeIndex).not.toHaveBeenCalled();
+            expect(unread.logger.warn).toHaveBeenCalledWith(expect.stringContaining("database down"));
+            expect(unread.instance.zeroAccessWriter.discardDraftPlaintext).toHaveBeenCalled();
         });
+    });
+
+    it("keeps a sealed draft's attachment rows, discarding only its replaced body and extracted text, and a sent message's go", async () => {
+        const { instance } = job({ messages: [message("d1", { folderUid: "drafts", sanitizedHtmlBlobKey: "sanitized/d1" }), message("m1")] });
+        instance.messageRepo.findOne = vi.fn().mockResolvedValue(undefined);
+        await instance.run();
+        expect(instance.zeroAccessWriter.discardDraftPlaintext).toHaveBeenCalledTimes(1);
+        expect(instance.zeroAccessWriter.discardDraftPlaintext).toHaveBeenCalledWith(instance.blobRepos, "d1", ["b/d1", "sanitized/d1"]);
+        expect(instance.zeroAccessWriter.discardPlaintext).toHaveBeenCalledTimes(1);
+        expect(instance.zeroAccessWriter.discardPlaintext).toHaveBeenCalledWith(instance.blobRepos, "m1", ["b/m1", undefined]);
+    });
+
+    it("leaves an Outbox message whose send can still go ahead, and seals one whose send failed for good or was relayed but never filed", async () => {
+        const future = new Date(Date.now() + 60_000);
+        const past = new Date(Date.now() - 60_000);
+        const { instance } = job({
+            messages: [
+                message("due", { folderUid: "outbox", scheduledSendTime: past }),
+                message("scheduled", { folderUid: "outbox", scheduledSendTime: future }),
+                message("claimed", { folderUid: "outbox", scheduledSendTime: null, scheduledSendLeaseExpiresAt: future }),
+                message("failed", { folderUid: "outbox", scheduledSendTime: null, scheduledSendError: "550 no such user" }),
+                message("lapsed", { folderUid: "outbox", scheduledSendTime: null, scheduledSendLeaseExpiresAt: past }),
+                message("unfiled", { folderUid: "outbox", scheduledSendTime: null, scheduledSendRelayedAt: past, sanitizedHtmlBlobKey: "sanitized/u" }),
+            ],
+        });
+        instance.folderRepo.find.mockResolvedValue([{ uid: "outbox", type: "outbox" }]);
+        instance.messageRepo.findOne = vi.fn().mockResolvedValue(undefined);
+        await instance.run();
+        // Never relayed: sealed as a draft, reopened and sent again like any sealed draft; its attachment rows are kept.
+        expect(instance.zeroAccessWriter.sealDraft.mock.calls.map((call: any[]) => call[2])).toEqual(["failed", "lapsed"]);
+        expect(instance.zeroAccessWriter.discardDraftPlaintext.mock.calls.map((call: any[]) => call[1])).toEqual(["failed", "lapsed"]);
+        // Relayed: sealed as sent mail, its relay's render and attachments removed.
+        expect(instance.zeroAccessWriter.sealRaw.mock.calls.map((call: any[]) => call[2])).toEqual(["unfiled"]);
+        expect(instance.zeroAccessWriter.discardPlaintext).toHaveBeenCalledWith(instance.blobRepos, "unfiled", ["b/unfiled", "sanitized/u"]);
+        expect(instance.messageRepo.update.mock.calls.map((call: any[]) => call[0].uid)).toEqual(["failed", "lapsed", "unfiled"]);
     });
 
     it("keeps a message sealed, and logs it, when its readable copies can't all be removed", async () => {
@@ -204,10 +233,12 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
         expect(instance.blobStore.delete).not.toHaveBeenCalled();
     });
 
-    it("skips Outbox and end-to-end encrypted rows if the query returns them", async () => {
+    it("skips a pending Outbox send and end-to-end encrypted rows if the query returns them", async () => {
         const { instance } = job({ messages: [message("m1", { encrypted: true })] });
         instance.folderRepo.find.mockResolvedValue([{ uid: "outbox", type: "outbox" }]);
-        instance.messageRepo.find = vi.fn(async (query: any) => (query.deleted ? [message("m2", { folderUid: "outbox" })] : [message("m1", { encrypted: true })]));
+        instance.messageRepo.find = vi.fn(async (query: any) =>
+            query.deleted ? [message("m2", { folderUid: "outbox", scheduledSendTime: new Date() })] : [message("m1", { encrypted: true })],
+        );
         await instance.run();
         expect(instance.zeroAccessWriter.sealRaw).not.toHaveBeenCalled();
     });

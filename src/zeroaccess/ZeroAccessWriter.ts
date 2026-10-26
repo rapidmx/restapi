@@ -11,6 +11,7 @@ import type { Mailbox, MessageZeroAccess, Recipient, ZeroAccessDataType } from "
 import { htmlPreview } from "../scan/HtmlPreview.js";
 import { ExtractorRegistry } from "../search/extraction/ExtractorRegistry.js";
 import { deleteBlobsIfUnreferenced, messageBlobReferenceSources, type MessageBlobRepos } from "../util/BlobReferenceUtils.js";
+import { asEntity } from "../util/EntityUtils.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { parseHeaderRecipients } from "../util/RecipientUtils.js";
 import { ZeroAccessFiling, zeroAccessDraftBlobPrefix, zeroAccessIndexEntryUid } from "./ZeroAccessFiling.js";
@@ -30,6 +31,9 @@ export interface ZeroAccessSealOptions {
     blobKey?: string;
     /** Replace the message's index entry when it has one, instead of keeping it. */
     replaceIndexEntry?: boolean;
+    /** Don't write the index entry: the caller writes it with the returned `writeIndex()` once its own write of the row has won, so a
+     * seal that loses never touches the entry the winner wrote. */
+    deferIndex?: boolean;
 }
 
 /** How much of a body becomes a sealed message's preview - the same length delivery's `bodyPreview` has. */
@@ -61,6 +65,8 @@ export interface ZeroAccessSealedFields {
     zeroAccess: MessageZeroAccess;
     /** The index entry written for the message, so a caller can remove it again if its filing fails. */
     indexEntryUid: string;
+    /** With `deferIndex`: writes the index entry `seal()` left out (replacing one when `replaceIndexEntry` was set). */
+    writeIndex?: () => Promise<void>;
 }
 
 /**
@@ -145,14 +151,24 @@ export class ZeroAccessWriter {
             async (mimeType, content) => this.extractorRegistry?.extract(mimeType, content),
             { budgetMs: this.extractionBudgetMs, maxAttachmentBytes: this.extractionMaxBytes },
         );
-        await filing.index(this.indexEntryRepo, this.indexEntryClass, input.messageUid, input.receivedAt, document, options.replaceIndexEntry);
-        return { subject: PROTECTED_SUBJECT, bodyPreview: "", bodyBlobKey, zeroAccess, indexEntryUid: zeroAccessIndexEntryUid(input.messageUid) };
+        const indexEntryRepo: RepoUtils<any> = this.indexEntryRepo;
+        const writeIndex = async (): Promise<void> =>
+            await filing.index(indexEntryRepo, this.indexEntryClass, input.messageUid, input.receivedAt, document, options.replaceIndexEntry);
+        const sealed: ZeroAccessSealedFields = { subject: PROTECTED_SUBJECT, bodyPreview: "", bodyBlobKey, zeroAccess, indexEntryUid: zeroAccessIndexEntryUid(input.messageUid) };
+        if (options.deferIndex) {
+            sealed.writeIndex = writeIndex;
+        } else {
+            await writeIndex();
+        }
+        return sealed;
     }
 
     /**
      * Removes what a message no longer needs in plaintext once it has been sealed (`seal()`/`sealRaw()`) and its row points at the sealed
      * blob: `blobKeys` (its former body, sanitized HTML...) and its attachment rows and their blobs - the attachments are inside the
-     * sealed message, where the client reads them. A blob something else still names is kept.
+     * sealed message, where the client reads them. A blob something else still names is kept. Never for a draft, whose attachment rows
+     * are its working attachments (the compose window lists them, and its send builds the message from them): see
+     * `discardDraftPlaintext()`.
      */
     public async discardPlaintext(repos: MessageBlobRepos, messageUid: string, blobKeys: (string | null | undefined)[]): Promise<void> {
         const keys: (string | null | undefined)[] = [...blobKeys];
@@ -161,6 +177,38 @@ export class ZeroAccessWriter {
                 for (const attachment of page) {
                     keys.push(attachment.blobKey, attachment.extractedTextBlobKey);
                     await repos.attachmentRepo.delete(attachment.uid, { ignoreACL: true, purge: true });
+                }
+            }
+        }
+        await deleteBlobsIfUnreferenced(this.blobStore!, messageBlobReferenceSources(repos), keys);
+    }
+
+    /**
+     * `discardPlaintext()` for a draft just sealed (`sealDraft()`): removes `blobKeys` (its former body, sanitized HTML), but keeps its
+     * attachment rows and their blobs, which are the draft's working attachments - readable until it is sent, as a sealed save keeps them.
+     * Only their extracted text goes, a derivative nothing indexes while the draft is sealed: each row's `extractedTextBlobKey` is cleared
+     * (version-checked; a row changed meanwhile keeps it) and its blob removed. `AttachmentExtractionJob` puts such a row off while the
+     * draft stays sealed, and extracts it again once the draft is readable.
+     */
+    public async discardDraftPlaintext(repos: MessageBlobRepos, messageUid: string, blobKeys: (string | null | undefined)[]): Promise<void> {
+        const keys: (string | null | undefined)[] = [...blobKeys];
+        if (repos.attachmentRepo) {
+            for await (const page of findPagesByUid<any>(repos.attachmentRepo, { messageUid })) {
+                for (const attachment of page) {
+                    if (!attachment.extractedTextBlobKey) {
+                        continue;
+                    }
+                    try {
+                        await repos.attachmentRepo.update(
+                            { uid: attachment.uid, version: attachment.version, extractedTextBlobKey: null } as any,
+                            asEntity(repos.attachmentRepo, attachment),
+                            { ignoreACL: true },
+                        );
+                    } catch {
+                        // Changed meanwhile: it keeps its text.
+                        continue;
+                    }
+                    keys.push(attachment.extractedTextBlobKey);
                 }
             }
         }
@@ -213,17 +261,19 @@ export class ZeroAccessWriter {
     /**
      * Seals a saved draft's composed MIME for `mailbox` when zero-access is active for it (`undefined` when it isn't): to a fresh blob
      * under `zeroAccessDraftBlobPrefix()` each save, with the draft's index entry replaced. The caller points the draft at the returned
-     * `bodyBlobKey` and removes the body it replaces, as it does for a plaintext save.
+     * `bodyBlobKey` and removes the body it replaces, as it does for a plaintext save. `deferIndex`: see `ZeroAccessSealOptions`.
      */
     public async sealDraft(
         mailbox: Pick<Mailbox, "uid"> & ZeroAccessMailbox,
         raw: Buffer,
         messageUid: string,
         savedAt: Date,
+        options: Pick<ZeroAccessSealOptions, "deferIndex"> = {},
     ): Promise<ZeroAccessSealedFields | undefined> {
         return this.sealRaw(mailbox, raw, messageUid, savedAt, {
             blobKey: `${zeroAccessDraftBlobPrefix(mailbox.uid)}${randomUUID()}`,
             replaceIndexEntry: true,
+            deferIndex: options.deferIndex,
         });
     }
 }

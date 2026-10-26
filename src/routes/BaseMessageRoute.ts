@@ -108,6 +108,9 @@ const SENT_MESSAGE_FIELDS: readonly string[] = [...HELD_MESSAGE_FIELDS, "envelop
 /** The dates a legal hold's range is judged by - frozen with `HELD_MESSAGE_FIELDS`. */
 const HELD_MESSAGE_DATE_FIELDS: readonly string[] = ["sentDate", "receivedDate"];
 
+/** How many times a send's version-checked filing into Sent Items is tried against a fresh read of the row while its claim stands. */
+const FILING_ATTEMPTS = 3;
+
 /** The answer to a background send: the message as it now sits in Outbox. */
 export interface QueuedSend<T> {
     status: "queued";
@@ -1519,7 +1522,9 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     }
 
     /** Files a message `send()` just relayed into Sent Items - only while `send()`'s claim still stands (the message is
-     * still in Outbox carrying the claim's lease); otherwise nothing is written and the message is returned as it is. */
+     * still in Outbox carrying the claim's lease); otherwise nothing is written and the message is returned as it is. A concurrent write
+     * that lands while the Sent copy is being sealed (`SearchIndexJob` stamping the Outbox row, a flag change) fails the version-checked
+     * filing; it is re-read and filed again, with what was already sealed, while the claim stands (`FILING_ATTEMPTS`). */
     private async fileSentMessage(
         message: T,
         claimed: T,
@@ -1539,13 +1544,16 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     ): Promise<T> {
         const { messageId, conversationId, inReplyTo, references, scannedHtmlBlobKey, encrypted } = relay;
         // Re-read: the relay can take a while, and an unrelated write (e.g. a flag change) must not fail the filing.
-        const current: T = (await this.repoUtils!.findOne(message.uid, { ignoreACL: true, skipCache: true }))!;
-        /* v8 ignore start -- only a lapsed lease (a relay slower than lease_ms) or a trusted caller's move */
-        if (!current || !BaseMessageRoute.stillClaimed(current, claimed)) {
+        let current: T | undefined = await this.repoUtils!.findOne(message.uid, { ignoreACL: true, skipCache: true });
+        const notClaimed = async (): Promise<T> => {
             this.logger?.warn(`BaseMessageRoute: not filing message ${message.uid} - it is no longer in Outbox under this send's claim.`);
             // The relay's sanitized render is on no row: nothing would ever remove it.
             await this.deleteUnfiledBlob(scannedHtmlBlobKey);
             return current ?? claimed;
+        };
+        /* v8 ignore start -- only a lapsed lease (a relay slower than lease_ms) or a trusted caller's move */
+        if (!current || !BaseMessageRoute.stillClaimed(current, claimed)) {
+            return await notClaimed();
         }
         /* v8 ignore stop */
         if (relayedRaw !== raw) {
@@ -1563,7 +1571,6 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             FolderType.SENT_ITEMS,
             user,
         );
-        const flags: MessageFlags = { ...current.flags, read: true };
         // `scanAndRelay()` only stores a new blob when this send pass actually produced sanitized HTML - a
         // message with no HTML body at all keeps whatever `sanitizedHtmlBlobKey` it already had (absent, for a
         // freshly composed draft).
@@ -1585,21 +1592,23 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // `messageId`/`conversationId` come from the relayed MIME and are written as a patch (no model constructor), so
         // they are bounded here - see `boundIndexedValue()`. The same patch rewrites `flags`, so the denormalized list
         // mirrors are re-derived with it (`syncMessageListFields()`), keeping the Sent Items list's Unread filter right.
-        const filed: T = await this.repoUtils!.update(
-            {
+        // Built from the row as last read, so a retry keeps a flag change that landed meanwhile.
+        const filing = (row: T): any => {
+            const rowFlags: MessageFlags = { ...row.flags, read: true };
+            return {
                 uid: message.uid,
-                version: (current as any).version,
+                version: (row as any).version,
                 folderUid: sentFolder.uid,
-                flags,
-                ...deriveMessageListFields({ ...current, flags, ...(sealed ? { subject: sealed.subject, bodyPreview: sealed.bodyPreview } : {}) }),
+                flags: rowFlags,
+                ...deriveMessageListFields({ ...row, flags: rowFlags, ...(sealed ? { subject: sealed.subject, bodyPreview: sealed.bodyPreview } : {}) }),
                 sanitizedHtmlBlobKey,
                 messageId: boundIndexedValue(messageId),
                 conversationId: boundIndexedValue(conversationId),
                 // What the relayed bytes actually say this message replies to, so the Sent Items copy's own
                 // record matches the headers every recipient received (the `assemble-raw` path composes its MIME
                 // client-side, and may carry threading headers the draft row never recorded).
-                inReplyTo: inReplyTo ?? (current as any).inReplyTo ?? null,
-                references: references.length > 0 ? references : ((current as any).references ?? []),
+                inReplyTo: inReplyTo ?? (row as any).inReplyTo ?? null,
+                references: references.length > 0 ? references : ((row as any).references ?? []),
                 receiptStatus,
                 encrypted,
                 scheduledSendTime: null,
@@ -1611,10 +1620,23 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
                 // zero-access mailbox sends - which a sealed copy must replace with its metadata only (as the backfill does).
                 ...SEARCH_REINDEX,
                 ...sealedFields,
-            } as any,
-            current,
-            { user, ignoreACL: true },
-        );
+            };
+        };
+        let filed: T;
+        for (let attempt = 1; ; attempt++) {
+            try {
+                filed = await this.repoUtils!.update(filing(current), current, { user, ignoreACL: true });
+                break;
+            } catch (err: any) {
+                if (err?.code !== ApiErrors.INVALID_OBJECT_VERSION || attempt >= FILING_ATTEMPTS) {
+                    throw err;
+                }
+                current = await this.repoUtils!.findOne(message.uid, { ignoreACL: true, skipCache: true });
+                if (!current || !BaseMessageRoute.stillClaimed(current, claimed)) {
+                    return await notClaimed();
+                }
+            }
+        }
         if (sealed) {
             await this.discardSentPlaintext(current, scannedHtmlBlobKey);
         }

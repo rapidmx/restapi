@@ -17,7 +17,7 @@ import {
     RouteDecorators,
     type UpdateObject,
 } from "@rapidrest/service-core";
-import { AuditAction, DistributionList, EscrowScope, Mailbox, MailboxPolicy, Matter } from "../models/types.js";
+import { AuditAction, DistributionList, EscrowScope, KeyVault, Mailbox, MailboxPolicy, Matter } from "../models/types.js";
 import { isEndToEndFormat } from "../util/PreferredFormatUtils.js";
 import { isZeroAccessDataType, settleZeroAccessTypes } from "../util/ZeroAccessUtils.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
@@ -512,6 +512,12 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * `ErasureExecutionJob` runs, and so `create()` can see one in flight - see `util/LeftoverMailboxUtils.ts`. */
     protected abstract dataSubjectErasureRequestClass: any;
 
+    /** The backend's `KeyVault` model, so an owner change can tell whether an ownerless mailbox's zero-access keys have a master-key copy
+     * (`assertOwnerChangeAllowed()`). Optional: without it such a change is refused as if they had none. */
+    protected keyVaultClass?: any;
+
+    protected keyVaultRepo?: RepoUtils<KeyVault>;
+
     protected folderRepo?: RecoverableRepoUtils<any>;
 
     protected messageRepo?: RecoverableRepoUtils<any>;
@@ -562,6 +568,9 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
         }
         if (!this.matterRepo && this.matterClass) {
             this.matterRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.matterClass.name, args: [this.matterClass] });
+        }
+        if (!this.keyVaultRepo && this.keyVaultClass) {
+            this.keyVaultRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.keyVaultClass.name, args: [this.keyVaultClass] });
         }
         if (!this.mailboxPolicyRepo && this.mailboxPolicyClass) {
             this.mailboxPolicyRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.mailboxPolicyClass.name, args: [this.mailboxPolicyClass] });
@@ -1289,10 +1298,13 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * one: the same kind of grant `BaseMailboxAccessRoute` refuses an administrator on an owned mailbox. So it needs an administrator
      * (trusted AND elevated), and that administrator can't make themselves the owner of a mailbox they hold no grant on.
      *
-     * A mailbox without an owner that has zero-access keys can't be given one (`409`, `specs/search.md` §3 *Shared Mailboxes*): its keys'
-     * only copies are its members' wraps and its escrow wraps, which an owner - who opens a mailbox's keys with their master key and is no
-     * member - never reads, so the new owner, and escrow through the owner's master key, could open none of its mail, while new mail went
-     * on being sealed to those keys.
+     * A mailbox without an owner whose zero-access keys aren't all in its vault under a master key can't be given one (`409`,
+     * `specs/search.md` §3 *Shared Mailboxes*): a key provisioned while it had no owner (`enrollSharedZeroAccessKey()`) has only its
+     * members' wraps and its escrow wraps, which an owner - who opens a mailbox's keys with their master key and is no member - never reads,
+     * so the new owner, and escrow through the owner's master key, could open none of its mail, while new mail went on being sealed to
+     * those keys. Keys an owner enrolled (`enrollKey()`) before the owner was removed are still in the vault under that owner's master key:
+     * that mailbox can be given an owner again, as an owned one can be given another (`masterKeyHoldsZeroAccessKeys()`). The vault doesn't
+     * say whose master key it is; giving it to the right person is the administrator's to check, as for any owner change.
      */
     private async assertOwnerChangeAllowed(id: string, nextOwner: unknown, user: JWTUser | undefined, existing: T | undefined): Promise<void> {
         assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
@@ -1303,13 +1315,34 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                 "An administrator can't make themselves the owner of a mailbox they hold no grant on.",
             );
         }
-        if (nextOwner && existing && !existing.ownerUserUid && (existing.zeroAccessKeys ?? []).length > 0) {
+        if (nextOwner && existing && !existing.ownerUserUid && (existing.zeroAccessKeys ?? []).length > 0 && !(await this.masterKeyHoldsZeroAccessKeys(existing))) {
             throw new ApiError(
                 ApiErrors.IDENTIFIER_EXISTS,
                 409,
                 "This shared mailbox's zero-access keys are held only by its members and escrow, so it can't be given an owner while it has them.",
             );
         }
+    }
+
+    /** Whether every zero-access key of `mailbox` is in its vault wrapped under a master key (a `zero-access` `WrappedPrivateKey`, and
+     * the vault has master key wraps) - what `enrollKey()` writes, and `enrollSharedZeroAccessKey()` never does. `false` when the vault
+     * can't be read, or without the `KeyVault` model. */
+    private async masterKeyHoldsZeroAccessKeys(mailbox: T): Promise<boolean> {
+        if (!this.keyVaultRepo) {
+            return false;
+        }
+        let vault: KeyVault | undefined;
+        try {
+            vault = (await this.keyVaultRepo.find({ mailboxUid: mailbox.uid, limit: 1 } as any, { ignoreACL: true, limit: 1, skipCache: true }))[0];
+        } catch (err: any) {
+            this.logger?.warn(`BaseMailboxRoute: couldn't read mailbox ${mailbox.uid}'s key vault for an owner change: ${err?.message ?? err}`);
+            return false;
+        }
+        if (!vault || (vault.masterKeyWraps ?? []).length === 0) {
+            return false;
+        }
+        const wrapped: Set<string> = new Set((vault.wrappedKeys ?? []).filter((key) => key.useType === "zero-access").map((key) => key.fingerprint));
+        return (mailbox.zeroAccessKeys ?? []).every((key) => wrapped.has(key.fingerprint));
     }
 
     /** Drops `keys`/`keyDiscoveryHash` (already refused when non-empty) from a body whose caller doesn't own the mailbox: a delegate

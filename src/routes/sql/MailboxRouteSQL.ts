@@ -12,6 +12,7 @@ import {
     DomainSQL,
     EscrowScopeSQL,
     FolderSQL,
+    KeyVaultSQL,
     MailboxSQL,
     MailboxPolicySQL,
     MatterSQL,
@@ -33,6 +34,7 @@ export class MailboxRouteSQL extends BaseMailboxRoute<MailboxSQL> {
     protected matterClass: any = MatterSQL;
     protected mailboxPolicyClass: any = MailboxPolicySQL;
     protected messageClass: any = MessageSQL;
+    protected keyVaultClass: any = KeyVaultSQL;
     protected dataSubjectErasureRequestClass: any = DataSubjectErasureRequestSQL;
 
     // `@Repository`-injected, always present in any functioning deployment (the `acl` datastore is a hard

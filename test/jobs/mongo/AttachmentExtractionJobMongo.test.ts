@@ -267,7 +267,7 @@ describe("AttachmentExtractionJobMongo Tests (real DB + DI)", () => {
         expect(untouchedMessage!.version).toBe(message.version);
     });
 
-    it("Never extracts the text of an attachment of a message stored zero-access sealed (a sealed draft's upload), nor clears its stamp.", async () => {
+    it("Never extracts the text of an attachment of a message stored zero-access sealed (a sealed draft's upload), nor stamps it, and extracts it once the message is readable.", async () => {
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
         const blobKey = `attachments/${uuid.v4()}`;
         await blobStore.put(blobKey, Buffer.from("CANARY draft attachment text"));
@@ -277,14 +277,36 @@ describe("AttachmentExtractionJobMongo Tests (real DB + DI)", () => {
             searchIndexedAt: new Date("2026-01-01T00:00:00Z"),
         });
         const attachment = await createAttachment({ messageUid: message.uid, mimeType: "text/plain", blobKey });
+        const putSpy = vi.spyOn(blobStore, "put");
 
         await job.run();
 
-        const updated = await attachmentRepo.findOne({ uid: attachment.uid } as any);
-        expect((await blobStore.get(updated!.extractedTextBlobKey!)).toString()).toBe("");
-        const untouchedMessage = await messageRepo.findOne({ uid: message.uid } as any);
+        // Put off, not stamped: no text blob, and not selected again until the deferral passes.
+        const deferred: any = await attachmentRepo.findOne({ uid: attachment.uid } as any);
+        expect(deferred.extractedTextBlobKey ?? null).toBeNull();
+        expect(deferred.extractionAttempts).toBe(0);
+        expect(deferred.extractionError ?? null).toBeNull();
+        expect(new Date(deferred.extractionNextAttemptAt).getTime()).toBeGreaterThan(Date.now() + 500_000);
+        expect(putSpy.mock.calls.filter((call: any[]) => String(call[0]).startsWith("attachment-text/"))).toHaveLength(0);
+        putSpy.mockRestore();
+        const untouchedMessage: any = await messageRepo.findOne({ uid: message.uid } as any);
         expect(untouchedMessage!.searchIndexedAt).toEqual(message.searchIndexedAt);
         expect(untouchedMessage!.version).toBe(message.version);
+        await job.run();
+        expect(((await attachmentRepo.findOne({ uid: attachment.uid } as any)) as any).extractedTextBlobKey ?? null).toBeNull();
+
+        // Zero-access turned off: the draft is saved readable, with the same rows. Once the deferral has passed it is extracted and the
+        // message re-indexed with its text.
+        await messageRepo.updateOne({ uid: message.uid } as any, { $set: { zeroAccess: null, subject: "Plain draft" } } as any);
+        await attachmentRepo.updateOne({ uid: attachment.uid } as any, { $set: { extractionNextAttemptAt: new Date(Date.now() - 1000) } } as any);
+
+        await job.run();
+
+        const extracted: any = await attachmentRepo.findOne({ uid: attachment.uid } as any);
+        expect((await blobStore.get(extracted.extractedTextBlobKey)).toString()).toBe("CANARY draft attachment text");
+        expect(extracted.extractionAttempts ?? null).toBeNull();
+        expect(extracted.extractionNextAttemptAt ?? null).toBeNull();
+        expect(((await messageRepo.findOne({ uid: message.uid } as any)) as any).searchIndexedAt ?? null).toBeNull();
     });
 
     it("Extracts non-empty text without crashing when the parent message no longer exists.", async () => {

@@ -37,6 +37,9 @@ const MAX_INVALIDATE_ATTEMPTS = 3;
  * `mail:jobs:attachment_extraction:max_attempts` times, then left unextracted with `extractionError` recorded -
  * excluded from every later candidate query, so it can never occupy the head of the queue forever.
  *
+ * An attachment of a message stored zero-access sealed (a sealed draft's upload) is neither extracted nor stamped, only put off
+ * (`deferWhileSealed()`), so it is extracted once its message is readable outside zero-access.
+ *
  * @author Jean-Philippe Steinmetz
  */
 export abstract class AttachmentExtractionJob<A extends Attachment, M extends Message> extends BackgroundService {
@@ -68,6 +71,10 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
 
     @Config("mail:jobs:attachment_extraction:retry_backoff_seconds", 60)
     private retryBackoffSeconds: number = 60;
+
+    /** How long an attachment of a message stored zero-access sealed waits before it is looked at again - see `deferWhileSealed()`. */
+    @Config("mail:jobs:attachment_extraction:zero_access_defer_seconds", 600)
+    private zeroAccessDeferSeconds: number = 600;
 
     /** The same ceiling `ExtractorRegistry` applies to an attachment's size: one declared larger is never downloaded just to be refused. */
     @Config("mail:search:extraction:max_bytes", 25 * 1024 * 1024)
@@ -212,14 +219,18 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
         // (`application/pdf; name=a.pdf`) or odd casing, which the registry's exact-match lookup would never find. An attachment
         // whose declared size already exceeds what the registry would take is not downloaded at all.
         //
-        // An attachment of a message stored zero-access sealed - a sealed draft's upload, readable until the draft is sent - is skipped
-        // the same way: its text would be one more readable copy of a zero-access mailbox's content, which nothing indexes
-        // (`SearchIndexJob` indexes such a message as metadata only), and the sealed copy the send files carries the attachment itself.
+        // An attachment of a message stored zero-access sealed - a sealed draft's upload, readable until the draft is sent - is not
+        // extracted: its text would be one more readable copy of a zero-access mailbox's content, which nothing indexes (`SearchIndexJob`
+        // indexes such a message as metadata only), and the sealed copy the send files carries the attachment itself. Nor is it stamped
+        // (`deferWhileSealed()`): a draft saved readable once zero-access is no longer active is sent with these same rows.
+        if (message && !message.encrypted && (message as any).zeroAccess) {
+            await this.deferWhileSealed(attachment);
+            return;
+        }
         const mimeType: string = (attachment.mimeType ?? "").split(";")[0].trim().toLowerCase();
         const text: string | undefined =
             !message ||
             message.encrypted ||
-            (message as any).zeroAccess ||
             (attachment.sizeBytes ?? 0) > this.maxExtractBytes ||
             !this.extractorRegistry!.supports(mimeType)
                 ? undefined
@@ -254,6 +265,27 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
         if (text && text.length > 0 && message) {
             await this.invalidateSearchIndex(message.uid);
         }
+    }
+
+    /**
+     * Puts off an attachment of a message stored zero-access sealed for `zero_access_defer_seconds`, without extracting or stamping it:
+     * an empty stamp would keep it from ever being extracted, and a sealed draft's uploads are the rows its message is sent with once
+     * it is saved readable (zero-access turned off meanwhile), whose attachment text must then be indexed. Not a failed attempt: the
+     * bookkeeping is reset (`extractionAttempts` 0, so the candidate query's backoff branch applies), and a successful extraction later
+     * clears it. The rows of a sealed draft that is sent are removed when its sealed Sent copy is filed.
+     */
+    private async deferWhileSealed(attachment: A): Promise<void> {
+        await this.attachmentRepo!.update(
+            {
+                uid: attachment.uid,
+                version: (attachment as any).version,
+                extractionAttempts: 0,
+                extractionNextAttemptAt: new Date(Date.now() + this.zeroAccessDeferSeconds * 1000),
+                extractionError: null,
+            } as any,
+            asEntity(this.attachmentRepo!, attachment),
+            { ignoreACL: true },
+        );
     }
 
     /**

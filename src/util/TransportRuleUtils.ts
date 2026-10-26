@@ -230,7 +230,8 @@ const HTML_BREAKS: ReadonlySet<string> = new Set(
  * `<style>`/`<script>` inside `<svg>`/`<math>`, follows the rest: a browser ends a comment where `htmlparser2` doesn't (`--!>`, a bogus
  * `<![CDATA[` comment's first `>`) and renders an HTML element inside foreign content's `<style>`, so leaving either out would hide what
  * the reader is shown. Such text is kept as it is and, read as HTML once more (`nested`), as the reader may see it: entities decoded,
- * markup a space or nothing as above.
+ * markup a space or nothing as above. Past a `<plaintext>` start tag (outside foreign content) a browser shows the rest of the source as
+ * it is, tags included, so that is what is kept, and nothing after it is read as markup.
  */
 function htmlText(html: string, nested: boolean = false): string {
     const parts: string[] = [];
@@ -243,6 +244,8 @@ function htmlText(html: string, nested: boolean = false): string {
     let skipped: number = 0;
     let foreign: number = 0;
     let foreignRaw: number = 0;
+    // Set at a `<plaintext>` start tag outside foreign content, past which a browser shows the rest of the source literally.
+    let plaintext: boolean = false;
     const separate = (): void => {
         if (parts.length > 0 && parts[parts.length - 1] !== " ") {
             parts.push(" ");
@@ -264,6 +267,9 @@ function htmlText(html: string, nested: boolean = false): string {
     const parser: Parser = new Parser(
         {
             onopentagname(name: string): void {
+                if (plaintext) {
+                    return;
+                }
                 if (HTML_FOREIGN.has(name)) {
                     foreign++;
                 }
@@ -279,7 +285,23 @@ function htmlText(html: string, nested: boolean = false): string {
                     separate();
                 }
             },
+            onopentag(name: string): void {
+                // A browser's tokenizer switches to its PLAINTEXT state for good at `<plaintext>`: everything after the tag, markup
+                // included and entities undecoded, is shown as it is, while `htmlparser2` goes on reading it as markup (and skips a
+                // `<style>` in it). Kept as the source has it, and nothing after it is read again. Inside `<svg>`/`<math>` it is just
+                // a foreign element.
+                if (plaintext || name !== "plaintext" || foreign > 0) {
+                    return;
+                }
+                plaintext = true;
+                separate();
+                const start: number = parser.endIndex + 1;
+                keep(parts, html.slice(start, start + Math.max(BODY_TEXT_MAX_LENGTH - length, 0)));
+            },
             onclosetag(name: string): void {
+                if (plaintext) {
+                    return;
+                }
                 if (HTML_SKIPPED.has(name)) {
                     if (foreignRaw > 0) {
                         foreignRaw--;
@@ -295,6 +317,9 @@ function htmlText(html: string, nested: boolean = false): string {
                 }
             },
             ontext(text: string): void {
+                if (plaintext) {
+                    return;
+                }
                 if (foreignRaw > 0) {
                     keepExtra(text);
                 } else if (skipped === 0) {
@@ -302,7 +327,11 @@ function htmlText(html: string, nested: boolean = false): string {
                 }
             },
             // Outside XML mode a `<![CDATA[...]]>` section is a comment too.
-            oncomment: keepExtra,
+            oncomment(text: string): void {
+                if (!plaintext) {
+                    keepExtra(text);
+                }
+            },
         },
         { decodeEntities: true },
     );

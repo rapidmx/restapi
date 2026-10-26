@@ -351,6 +351,24 @@ describe("TransportRuleUtils Tests", () => {
             expect(deep.bodyText).toContain("deep");
         });
 
+        it("Keeps what follows a <plaintext> tag as the source has it, which a browser shows literally, so a style or script after it can't hide a phrase.", async () => {
+            const rule: any = { enabled: true, sequence: 1, conditions: { bodyContains: ["wire the money"] }, actions: [{ type: TransportRuleActionType.QUARANTINE }] };
+            const context = async (html: string) =>
+                buildTransportRuleContext(Buffer.from(["From: sender@example.com", "Content-Type: text/html", "", html, ""].join("\r\n")), "sender@example.com", ["a@example.com"], []);
+            for (const html of [
+                "<p>Hi</p><plaintext><style>wire the money to account 123</style>",
+                "<plaintext><script>wire the money</script>",
+                '<PLAINTEXT class="x"><style>wire the money</style><!-- wire -->',
+                "<plaintext/><style>wire the money</style>",
+            ]) {
+                expect(evaluateTransportRules([rule], await context(html)).quarantine, html).toBe(true);
+            }
+            // The rest is kept literally (entities undecoded, tags as they are), and read no further as markup.
+            expect((await context("<p>Hi</p><plaintext>a&amp;b <style>x</style> <!-- c --></plaintext>")).bodyText).toBe("Hi a&amp;b <style>x</style> <!-- c --></plaintext>");
+            // Inside foreign content <plaintext> is just an element: the foreign style is handled as before.
+            expect((await context("<svg><plaintext><style>x</style></plaintext></svg><style>y</style><p>Hello</p>")).bodyText).toBe("Hello x x");
+        });
+
         it("anyRecipientExternal is false when mail:domains is unconfigured (empty).", async () => {
             const raw = Buffer.from("From: sender@example.com\r\n\r\nBody\r\n");
             const context = await buildTransportRuleContext(raw, "sender@example.com", ["a@outside.com"], []);

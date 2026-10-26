@@ -16,6 +16,7 @@ import { request } from "@rapidrest/service-core/test";
 import { IngestStatus, TransportRuleActionType, type ZeroAccessKey } from "../../src/models/types.js";
 import type { InMemoryBlobStore, NoopSearchProvider } from "../testDoubles.js";
 import { isoWeekId } from "../../src/zeroaccess/ZeroAccessSealer.js";
+import { ZeroAccessWriter } from "../../src/zeroaccess/ZeroAccessWriter.js";
 import { MailEventStream } from "../../src/events/MailEventStream.js";
 import { postfixDsn } from "../fixtures/postfixDsn.js";
 import { deliveryFailureUid } from "../../src/util/DeliveryFailureNoticeUtils.js";
@@ -736,7 +737,7 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
                 const inbox = await ctx.createFolder(mailbox.uid, "inbox");
                 const draft = (await stored(mailbox, drafts)).message;
                 const deleted = (await stored(mailbox, inbox, { deleted: true })).message;
-                const sending = (await stored(mailbox, outbox)).message;
+                const sending = (await stored(mailbox, outbox, { scheduledSendTime: new Date(Date.now() + 3_600_000) })).message;
                 const e2e = (await stored(mailbox, inbox, { encrypted: true })).message;
                 const plain = await ctx.createMailbox();
                 const plainInbox = await ctx.createFolder(plain.uid, "inbox");
@@ -749,6 +750,67 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
                 for (const uid of [sending.uid, e2e.uid, untouched.uid]) {
                     expect((await ctx.findMessage(uid)).zeroAccess ?? undefined).toBeUndefined();
                 }
+            });
+
+            it("keeps a sealed draft's attachment rows and blobs, its working attachments, dropping only their extracted text, and writes its index entry", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const drafts = await ctx.createFolder(mailbox.uid, "drafts");
+                const { message, bodyBlobKey, sanitizedHtmlBlobKey, attachmentBlobKey } = await stored(mailbox, drafts);
+                const [attachment] = (await ctx.attachments()).filter((row) => row.messageUid === message.uid);
+                const textBlobKey = `attachment-text/${Math.random().toString(16).slice(2)}`;
+                await ctx.blobStore().put(textBlobKey, Buffer.from(CANARY_ATTACHMENT));
+                await ctx.createAttachment({ ...attachment, uid: undefined, version: undefined, _id: undefined, filename: "notes.txt", extractedTextBlobKey: textBlobKey });
+
+                await ctx.runBackfill();
+
+                const sealed = await ctx.findMessage(message.uid);
+                expect(sealed.bodyBlobKey).toMatch(new RegExp(`^za/${mailbox.uid}/drafts/`));
+                // The replaced body and render go; the attachments stay, for the compose window and the send built from them.
+                for (const key of [bodyBlobKey, sanitizedHtmlBlobKey, textBlobKey]) {
+                    expect(await ctx.blobStore().exists(key), key).toBe(false);
+                }
+                const kept = (await ctx.attachments()).filter((row) => row.messageUid === message.uid);
+                expect(kept.map((row) => row.filename).sort()).toEqual(["minutes.txt", "notes.txt"]);
+                expect(kept.every((row) => (row.extractedTextBlobKey ?? null) === null)).toBe(true);
+                expect((await ctx.blobStore().get(attachmentBlobKey)).toString()).toBe(CANARY_ATTACHMENT);
+                expect((await ctx.indexEntries()).map((entry) => entry.messageUid)).toEqual([message.uid]);
+            });
+
+            it("seals an Outbox message whose send failed for good as a draft, and one relayed but never filed as sent mail, leaving a pending one", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const outbox = await ctx.createFolder(mailbox.uid, "outbox");
+                const failed = await stored(mailbox, outbox, { scheduledSendTime: null, scheduledSendError: "550 5.1.1 no such user", scheduledSendAttempts: 1 });
+                const unfiled = await stored(mailbox, outbox, { scheduledSendTime: null, scheduledSendRelayedAt: new Date(), scheduledSendAttempts: 5, scheduledSendError: "filing failed" });
+                const claimed = (await stored(mailbox, outbox, { scheduledSendTime: null, scheduledSendLeaseExpiresAt: new Date(Date.now() + 600_000) })).message;
+                const retrying = (await stored(mailbox, outbox, { scheduledSendTime: new Date(Date.now() + 60_000), scheduledSendAttempts: 1 })).message;
+
+                await ctx.runBackfill();
+
+                const failedRow = await ctx.findMessage(failed.message.uid);
+                expect(failedRow.zeroAccess.keyFingerprint).toBe(recipient.key.fingerprint);
+                expect(failedRow.bodyBlobKey).toMatch(new RegExp(`^za/${mailbox.uid}/drafts/`));
+                expect(failedRow.subject).toBe("[...]");
+                expect(await ctx.blobStore().exists(failed.bodyBlobKey)).toBe(false);
+                expect(await ctx.blobStore().exists(failed.attachmentBlobKey)).toBe(true);
+                const unfiledRow = await ctx.findMessage(unfiled.message.uid);
+                expect(unfiledRow.bodyBlobKey).toBe(`za/${mailbox.uid}/${unfiled.message.uid}`);
+                for (const key of [unfiled.bodyBlobKey, unfiled.sanitizedHtmlBlobKey, unfiled.attachmentBlobKey]) {
+                    expect(await ctx.blobStore().exists(key), key).toBe(false);
+                }
+                expect((await ctx.attachments()).map((row) => row.messageUid).sort()).toEqual([failed.message.uid, claimed.uid, retrying.uid].sort());
+                for (const uid of [claimed.uid, retrying.uid]) {
+                    expect((await ctx.findMessage(uid)).zeroAccess ?? undefined).toBeUndefined();
+                }
+                // A sealed draft can't be relayed: retrying it from Outbox answers 409, so the client assembles it again.
+                await ctx.setAcl(mailbox.uid, [{ userOrRoleId: mailbox.ownerUserUid, actions: [ACLAction.FULL] }]);
+                const send = await request(ctx.app())
+                    .post(`${ctx.messagesUrl}/${failed.message.uid}/send`)
+                    .set("Authorization", `jwt ${ctx.tokenFor(mailbox.ownerUserUid)}`)
+                    .send({ background: true });
+                expect(send.status).toBe(409);
+                expect(JSON.stringify(send.body)).toContain("zero-access");
             });
 
             it("removes the search document of restorable deleted mail it seals, which the search indexer never revisits", async () => {
@@ -1035,6 +1097,105 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
                     }
                 }, 20_000);
             }
+
+            for (const background of [false, true]) {
+                it(`files ${background ? "a background" : "an immediate"} send whose Outbox row the search indexer stamps while its Sent copy is sealed`, async () => {
+                    const recipient = await makeKey();
+                    const mailbox = await zeroAccessMailbox(recipient);
+                    const { message, bodyBlobKey, attachmentBlobKey } = await draft(mailbox);
+                    // A `SearchIndexJob` stamp (a version-checked write) lands between the filing's read of the row and its update.
+                    const realSealRaw = ZeroAccessWriter.prototype.sealRaw;
+                    let stamped: number = 0;
+                    const sealRaw = vi.spyOn(ZeroAccessWriter.prototype, "sealRaw").mockImplementation(async function (this: any, ...args: any[]) {
+                        if (args[2] === message.uid && stamped === 0) {
+                            stamped++;
+                            const row = await ctx.findMessage(message.uid);
+                            await ctx.updateMessage(message.uid, { searchIndexedAt: new Date(), version: row.version + 1 });
+                        }
+                        return (realSealRaw as any).apply(this, args);
+                    } as any);
+                    try {
+                        const result = await request(ctx.app())
+                            .post(`${ctx.messagesUrl}/${message.uid}/send`)
+                            .set("Authorization", "jwt " + ctx.tokenFor(mailbox.ownerUserUid))
+                            .send(background ? { background: true } : {});
+                        expect(result.status).toBeLessThan(300);
+                        if (background) {
+                            await vi.waitFor(async () => expect((await ctx.findMessage(message.uid)).zeroAccess).toBeTruthy(), { timeout: 10_000, interval: 50 });
+                        }
+                    } finally {
+                        sealRaw.mockRestore();
+                    }
+
+                    expect(stamped).toBe(1);
+                    await expectSealedSentCopy(message.uid, recipient, [bodyBlobKey, attachmentBlobKey]);
+                    const filed = await ctx.findMessage(message.uid);
+                    expect(filed.scheduledSendAttempts ?? null).toBeNull();
+                    expect(filed.scheduledSendError ?? null).toBeNull();
+                    expect(filed.searchIndexedAt ?? null).toBeNull();
+                }, 20_000);
+
+                it(`leaves ${background ? "a background" : "an immediate"} send unfiled when its claim was taken over while its Sent copy was sealed`, async () => {
+                    const recipient = await makeKey();
+                    const mailbox = await zeroAccessMailbox(recipient);
+                    const { message } = await draft(mailbox);
+                    const realSealRaw = ZeroAccessWriter.prototype.sealRaw;
+                    const otherLease = new Date(Date.now() + 3_600_000);
+                    const sealRaw = vi.spyOn(ZeroAccessWriter.prototype, "sealRaw").mockImplementation(async function (this: any, ...args: any[]) {
+                        if (args[2] === message.uid) {
+                            const row = await ctx.findMessage(message.uid);
+                            await ctx.updateMessage(message.uid, { scheduledSendLeaseExpiresAt: otherLease, version: row.version + 1 });
+                        }
+                        return (realSealRaw as any).apply(this, args);
+                    } as any);
+                    try {
+                        const result = await request(ctx.app())
+                            .post(`${ctx.messagesUrl}/${message.uid}/send`)
+                            .set("Authorization", "jwt " + ctx.tokenFor(mailbox.ownerUserUid))
+                            .send(background ? { background: true } : {});
+                        expect(result.status).toBeLessThan(300);
+                        if (background) {
+                            await vi.waitFor(() => expect(sealRaw).toHaveBeenCalled(), { timeout: 10_000, interval: 50 });
+                            await ctx.runScheduledSend();
+                        }
+                    } finally {
+                        sealRaw.mockRestore();
+                    }
+
+                    const unfiled = await ctx.findMessage(message.uid);
+                    expect(unfiled.zeroAccess ?? null).toBeNull();
+                    expect(new Date(unfiled.scheduledSendLeaseExpiresAt).getTime()).toBe(otherLease.getTime());
+                    expect(blobs().filter(([key]) => key.startsWith("sanitized/"))).toEqual([]);
+                }, 20_000);
+            }
+
+            it("gives up filing a send, as relayed, when concurrent writes keep winning the filing's version check", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const { message } = await draft(mailbox);
+                const realUpdate = RepoUtils.prototype.update;
+                let raced: number = 0;
+                const update = vi.spyOn(RepoUtils.prototype, "update").mockImplementation(async function (this: any, obj: any, ...rest: any[]) {
+                    if (obj?.uid === message.uid && obj?.sentByServerAt) {
+                        raced++;
+                        const row = await ctx.findMessage(message.uid);
+                        await ctx.updateMessage(message.uid, { version: row.version + 1 });
+                    }
+                    return realUpdate.call(this, obj, ...rest);
+                } as any);
+                try {
+                    const result = await request(ctx.app())
+                        .post(`${ctx.messagesUrl}/${message.uid}/send`)
+                        .set("Authorization", "jwt " + ctx.tokenFor(mailbox.ownerUserUid))
+                        .send({});
+                    expect(result.status).toBe(409);
+                } finally {
+                    update.mockRestore();
+                }
+                expect(raced).toBe(3);
+                // Recorded as relayed, so the job only finishes the filing.
+                expect((await ctx.findMessage(message.uid)).scheduledSendRelayedAt).toBeTruthy();
+            });
 
             it("refuses to send a draft still stored sealed, which it can't relay", async () => {
                 const recipient = await makeKey();

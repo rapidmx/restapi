@@ -98,6 +98,8 @@ describe("redactEventForReader()", () => {
             guestsCanModify: true,
             guestsCanInviteOthers: false,
             guestsCanSeeGuestList: false,
+            sealedFields: { title: "sealed-title", location: "sealed-location" },
+            sealedContent: { cms: "sealed-content" },
             visibility,
         });
 
@@ -134,6 +136,9 @@ describe("redactEventForReader()", () => {
                 "guestsCanModify",
                 "guestsCanInviteOthers",
                 "guestsCanSeeGuestList",
+                // A READ delegate holds a zero-access member wrap that would open these.
+                "sealedFields",
+                "sealedContent",
             ]) {
                 expect(field in redacted).toBe(false);
             }
@@ -151,6 +156,7 @@ describe("redactEventForReader()", () => {
             expect(event.attendees).toHaveLength(1);
             expect(event.redacted).toBeUndefined();
             expect(event.location).toBe("CEO office");
+            expect(event.sealedFields).toEqual({ title: "sealed-title", location: "sealed-location" });
         }
     });
 });
