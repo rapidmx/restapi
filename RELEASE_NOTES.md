@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.35.0
+
 ### Added
 
 - **OpenPGP as a second end-to-end format** (`specs/end-to-end_encryption.md` *OpenPGP Interoperability*) - for exchanging encrypted mail with Proton Mail, Thunderbird, GnuPG and other OpenPGP users. S/MIME stays RapidMX's own format and is still preferred whenever a recipient has an S/MIME certificate.

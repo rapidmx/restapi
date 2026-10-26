@@ -7,6 +7,215 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-10-26
+
+### Added
+- Added EncryptionPolicy.allowOpenPgp (mail:encryption:openpgp_allowed, on by default), refusing OpenPGP enrollment and leaving OpenPGP keys out of public discovery while off
+- Added BaseWkdRoute, the OpenPGP Web Key Directory serving a mailbox's newest active OpenPGP certificate over the direct and advanced methods
+
+### Changed
+- Adopt OpenPGP as a second end-to-end format for interoperability with OpenPGP users in the E2E spec, keeping S/MIME RapidMX's own and preferred format
+- Store an OpenPGP certificate as one PublicKey of type openpgp and useType encrypt, checked and sanitized from the certificate itself with OpenPGP.js
+- Pin, supersede, record conflicts and keep previous keys per key slot (use and format), so a contact's S/MIME and OpenPGP keys never replace each other
+- Replace a pinned OpenPGP key automatically only when it is retired and certified its successor
+- Enroll a mailbox's self-certified OpenPGP key through POST /:id/keyvault/keys with type openpgp, marking its wrapped secret key with type openpgp
+- Trust and resolve a contact's OpenPGP key through /:id/keys/trust and /:id/keys/resolve with type openpgp
+- Publish OpenPGP certificates on the RapidMX discovery endpoint, listing active keys first
+- Keep the RapidMX-Key header and the receipt key announcement to S/MIME certificates
+- Treat an inline OpenPGP message as encrypted on delivery
+- Look up the OpenPGP key of an address whose domain isn't a RapidMX peer in its domain's Web Key Directory, with the discovery client's SSRF guards
+- Announce a mailbox's OpenPGP certificate in an Autocrypt header on outgoing mail, next to RapidMX-Key
+- Pin the OpenPGP key of an inbound Autocrypt header that aligned, passing DKIM oversigns
+- Check the openpgpkey.<domain> CNAME in a domain's DNS setup
+- Relay a message only to its envelopeRecipients when it has them, so a mixed S/MIME and OpenPGP send delivers each copy to its own recipients
+- Specify v4 OpenPGP keys as the default a mailbox is given, with v6 keys still accepted everywhere, and test both versions
+- Report when each week becomes compactable and the size of its pending entries in the search index manifest, so clients can stagger compaction by platform and phones can decline large weeks
+- Choose an end-to-end format per recipient from the contact's own preferred format, the format the address advertises in discovery and the RapidMX-Key header's _prefer-format, or the format it was last seen using in authenticated mail, falling back to S/MIME
+- Let a mailbox owner advertise a preferred format, publishing OpenPGP only while there is an active OpenPGP key
+- Test oversized OpenPGP keys against the byte cap with an armored key that fits the text cap
+- Drop an unnecessary type assertion in the SQL contact route test
+- Specify which data types zero-access encryption covers - mail, calendar, contacts and tasks - what stays readable to the server and why, contact email addresses included, and how defaults follow the owner's ActiveSync and Outlook clients
+- Let a mailbox owner choose the data types zero-access covers, deciding undecided ones from the clients that sync the mailbox when zero-access is activated, never taking protection away from mail
+- Record the ActiveSync and Outlook clients that sync a mailbox and when its zero-access keys were exported, for those defaults
+- Seal calendar, contact and task fields one by one to the mailbox's zero-access key on every write, ignoring a placeholder sent back unchanged
+- Seal task titles and notes when zero-access covers tasks, and refuse filtering or sorting tasks by them
+- Seal a contact's details when zero-access covers contacts - names, company, job title, notes, phone numbers, postal addresses, categories and email labels - keeping every email address readable and showing the first in place of the name
+- Store a protected contact's photo sealed and serve it as opaque bytes for the client to open
+- Share the zero-access sealing of REST writes between the task and contact routes
+- Seal calendar event titles, locations and descriptions when zero-access encryption protects the calendar
+- Send a protected event's invitations at save time from the request's invitationContent, never from the stored placeholders
+- Extract MeetingInviteSender from MeetingSchedulingJob and export it with sendProtectedInvitations for other writers
+- Skip protected events' invitations in MeetingSchedulingJob, sending cancellations with the placeholder title
+- Name replies and change requests about a protected event by the invitationContent the client sends
+- File inbound invitations sealed into a protected calendar when the mail itself isn't zero-access
+- Flag a protected event's reminder so the client opens the event for its real title
+- Document protected-event invitations and their device limits in the search spec
+- Backfill calendar events, contacts and tasks per data type once zero-access encryption protects that type
+- Store a protected contact's existing photo again sealed and remove its readable copy
+- State in the escrow release that offline tooling opens the sealed fields of events, contacts and tasks
+- Mark keyed CalendarEventAttendeeLinks, whose meeting opens only with the key a save supplies after #
+- Append each attendee's meeting link key from invitationContent.meetingLinkSecrets while sending, never storing it
+- Send a keyed meeting's invitations only at save time, and skip them in MeetingSchedulingJob
+- Give save-time invitations each attendee's own video link by building the sender with the attendee-link repository
+- Document meetings with per-meeting keys in the search spec
+- Cover MeetingInviteSender's guards, the event description placeholders and the backfill budget in isolated tests
+- Answer a calendar save that sends a protected event's invitations with the version the claim wrote, and notify it, so the next save isn't refused as stale
+- Claim and never mail the save-time invitations of an event its organizer sends encrypted
+- Let a create defer its protected invitations to the save that follows with invitationContent defer
+- Send a keyed meeting link to no mailbox here whose copy would be stored readable, nor to an unknown address of this server's domains
+- Seal the content of an invitation answered from a zero-access message as inbound delivery files it, and keep a sealed event's content sealed when a newer revision is applied
+- Apply only the time and new guests of a change request to an event of a protected calendar or with sealed content
+- Answer 503 for a zero-access delivery deferred by a pending erasure instead of acknowledging and losing it
+- Refuse to process an inline ingest entry another request still holds under a live lease
+- Share the scan and attachment text extraction of one delivery between its zero-access recipients
+- Skip a stored transport rule that can't be evaluated, quarantine a message the rules can't read, answer 503 when the rules can't be loaded, and convert deeply nested HTML within bounds
+- Leave a zero-access message's delivery and feedback reports out of the mail event stream and mark the event zeroAccess
+- File a delivery failure notice sealed for a zero-access mailbox
+- Keep a sealed imported message whole on a retried import instead of deleting and importing it again
+- Index a message dated outside years 1000-9999 into the current week, and leave a stored week that isn't an ISO week out of the manifest
+- Apply an emptied protected field from a REST client as a clear, keeping the placeholder echo rule for devices
+- Seal a moved record for its destination mailbox, and refuse moving a record with sealed content to another mailbox
+- Mark a message the backfill can't seal only when its body is gone or can't be parsed, retrying passing failures
+- Seal a contact whose photo blob is gone without it, retry a photo that fails for a while, and mark a record whose sealed write is refused
+- Read the zero-access policy once per backfill run and a mailbox's folders only when it has mail to seal
+- Treat a plain delete of a model with no soft delete as a purge, so deleting an attachment checks the legal hold, deletes its blob and refunds its quota
+- Erase a mailbox's CalendarEventAttendeeLinks with it, leftover data included
+- Strike matter export attestations off as they are recorded, and stop once another replica took the request over, so a long list isn't attested twice
+- Lowercase a message's text once for all transport rules instead of once per rule
+- Take over a stale store lock atomically and release only a lock this call still holds
+- Read a shared mailbox's member certificates in a few queries and its access list once per request
+- Let only an expired or superseded OpenPGP key vouch for its successor, by a certification made before it was retired
+- Fold a header this server writes when it is longer than 998 characters, write RapidMX-Key keydata in runs, and leave out an Autocrypt key longer than peers read
+- Record the address a conflicting key was checked against, so a conflict on an alias's contact can be accepted
+- Select messages whose encrypted column is NULL for the zero-access backfill, so mail stored on SQL before Message.encrypted existed is sealed too
+- Drop the sealed copies of an event that a newer invitation revision replaces, so clients don't open the old title and location over the new ones
+- Seal an invitation answered from a zero-access message into sealedContent whenever field sealing left its content readable, also on a copy sealed field by field earlier
+- Seal every protected field a record still holds readable on its first protected write, whatever the write carries, a move into a protected mailbox included
+- Store a contact's readable photo sealed with its first protected write, and backfill contacts whose fields are sealed but whose photo isn't
+- Clear a moved record's zeroAccessBackfillError so the backfill selects it in its new mailbox
+- Apply an emptied sealed field as a clear only when the request names it in clearedFields, so a client that couldn't open the record wipes nothing it sends back
+- Send a sealed Sent Items copy back to the search index, so the readable draft's document is replaced with its metadata
+- Parse with skipHtmlToText in sealRaw, and seal a message mailparser can't read whole instead of leaving it readable
+- File the unknown-recipient notice of a zero-access sender sealed and inline, writing no readable ingest blob
+- Relay a message the transport rules quarantine to no external distribution list member
+- Build the calendar route's and MeetingSchedulingJob's MeetingInviteSender unnamed, so neither is handed the other's host
+- Send a keyed meeting link to nobody from a sender that can't tell whose copy may carry its key
+- Document clearedFields and complete first protected writes in the search spec
+- Name a reply or change request about an event filed from a zero-access invitation by the client's invitationContent, and without it send no SUMMARY rather than the placeholder title
+- Never take a sealed event's placeholder title for a guest's requested title change
+- Leave a guest's change request to a sealed or keyed meeting a proposal instead of moving a meeting whose guests the scheduling job can't invite
+- Send a sealed or keyed meeting's updated invitations when the organizer accepts a proposed time with invitationContent, and refuse the accept without it
+- Flag the reminder of an event filed from a zero-access invitation as protected
+- Merge a re-published OpenPGP certificate with the pinned fingerprint into the pinned copy, taking in an extended expiry, new subkeys and revocations, from discovery, key headers, trust and resolve
+- Record the primary address a locally discovered key of an alias or plus-tagged address was checked against, so its conflict can be accepted
+- Keep the revoked certificates a Web Key Directory serves for an address, so a pinned key its holder revoked is marked revoked
+- List a mailbox's retired keys most recently retired first in discovery, so a peer keeping eight keys still sees the revocation of the key it pins
+- Refuse to change the sender, recipients, subject or Message-ID of a message the server sent, so a recall goes where and as it was sent
+- Force the sender of mail outside Drafts to one the mailbox can send as when an update changes it
+- Document the change request, proposal and OpenPGP refresh rules in the specs
+- Keep every sealed field's placeholder in step with the record as stored, and treat a sent-back stored column as an echo, so a contact's sealed name is never resealed as an old first address
+- Send a message the zero-access backfill seals back to the search index with its retries reset, so one whose indexing retries ran out loses its readable document
+- Refuse a server-side mailbox import into a mailbox whose mail is zero-access, which would spool the archive readable in the blob store
+- Read an HTML body's text for transport rules without a depth or width limit, so a bodyContains rule can't be evaded by nesting or padding the HTML
+- Record the relay's sanitized render when filing a sent message fails, and delete one no row names when a send's claim lapsed, so no readable render is orphaned
+- Keep an event's title and its sealed copy when a newer invitation revision names no title, sealing a title still readable, and clear a revision's missing location on SQL
+- Never write LOCATION in a REPLY or a plain COUNTER, so an attendee's keyed meeting link can't reach the organizer's mailbox
+- Invite for a meeting from what it held readable when an update without invitationContent is its first protected write
+- Clear the location of a calendar copy answered with a newer revision that names none, so SQL keeps no readable location
+- Document the import refusal and replies without LOCATION in the search spec
+- Take an inbound key header's effective date from its bottom-most Date and never later than its receipt, and record no observed format for a message with more than one Content-Type, so a future-dated or replayed message can't freeze a contact's preference or format
+- Clamp a discovered preference's lastSeen to the time it was observed, and treat a stored lastSeen or observed format dated far ahead of the clock as none, so a preference frozen earlier is superseded
+- Strip a merged OpenPGP certificate to the user IDs, subkeys, revocations and direct signatures its primary key signed, so no copy can grow the pinned certificate with third-party certifications, foreign subkeys or forged revocations
+- Date a revoked OpenPGP certificate by a revocation that verifies, not whichever is listed first
+- Create no contact from a Web Key Directory answer that lists only revoked certificates, so a lookup of such an address answers 404 again
+- Send a zero-access message's recall as Recall naming its sent date, and its read and delivery receipts as Read receipt and Delivery receipt, never with the placeholder subject
+- Document effective dates, OpenPGP merge filtering and the subjects of notices about zero-access mail in the specs
+- Seal one occurrence detached from a series filed from a zero-access invitation into its own sealed content, to the series' key, whatever the calendar's setting, and refuse it (409) when that key is gone, so a drag, resize or single-occurrence edit never stores its opened title, location or description readable
+- Index any message still readable in a zero-access mailbox as metadata only, under the placeholder subject, so a draft assembled for sending never has its subject, body or attachment text indexed whatever clears its stamp
+- Re-check a message's extracted attachment text only when its document read it, so a sealed message with an attachment keeps its search stamp
+- Never extract the text of an attachment of a message stored zero-access sealed
+- Look up a sent message's thread inside the step that records the relay's sanitized render, and only best effort, so a database error after the relay never orphans the render
+- Take the relay's sanitized render before the conversation lookup in ScheduledSendJob, and look up the thread best effort
+- Bound member key wraps per zero-access key and the vault by a larger total, so wraps kept across rotations never block the active key's, and check the bound when an ownerless mailbox's key is provisioned
+- Refuse (409) to give an owner to an ownerless mailbox that has zero-access keys, which only its member and escrow wraps open
+- Release a matter scope's zero-access escrow wraps whether or not the mailbox has an owner now
+- Keep the sealed content of an event filed from a zero-access invitation when a client writes back its placeholders, give a detached occurrence written that way the series' content, and refuse a location or description change sent with the placeholder title
+- Treat an event whose content is sealed whole as sealed when inviting: the scheduling job leaves it pending, and a save invites from the content the client opened, never from the placeholder title
+- Send a private or confidential event's reminder as its busy block, flagged protected, so a read-only calendar subscriber never receives its title or location
+- Keep the title's per-field sealed copy when an answered zero-access revision without SUMMARY puts the event's content in sealed content
+- Document metadata-only indexing, the member wrap bound, the owner refusal, escrow release and sealed-content event writes in the search spec
+- Read comment text and the text of a style or script inside svg or math, as it is and as HTML once more, after the rest of an HTML body's text, so a bodyContains rule sees what a browser shows past a --!> or bogus CDATA comment or out of foreign content
+- Name a zero-access message in its recall notice by the time the server relayed it, not the draft's creation date its sentDate still holds
+- Strip an observed OpenPGP copy to what its primary key signed before merging it, so a forged later-dated subkey binding or self-certification can't displace the pin's and strip its encryption subkey
+- Name the primary address in an alias-domain key discovery answer only when it lists keys, so a mailbox without keys answers exactly as a local part with no mailbox
+- Document the transport-rule text, recall date, OpenPGP pre-merge stripping and discovery address rules in the specs
+- Send a message back to the search index when a send moves it into Outbox, queued, scheduled or claimed, as any folder move is, so a readable document it had from before its mailbox turned zero-access is replaced by metadata at once rather than when the sealed Sent copy is filed
+- Document the Outbox re-index of a send in the search spec
+- Give an owner back to an ownerless mailbox whose zero-access keys are all in its vault under a master key, refusing (409) only while a key has nothing but member and escrow wraps
+- Index soft-deleted sealed mail as metadata in what is left of each search batch, so a readable document that outlived its message's deletion or a failed backfill removal is replaced and retried until it is
+- Write a backfill draft seal's index entry only after its version-checked update wins, so a losing seal never removes the entry another replica or a compose save wrote
+- Refuse an owner's zero-access rotation before issuing its certificate when the members' wraps of the new key wouldn't fit in the vault, so the current key stays active
+- Keep a draft's attachment rows and blobs when the backfill seals it, dropping only their extracted text
+- Seal an Outbox message whose send failed for good as a draft, and one relayed but never filed as sent mail, leaving a send that can still go ahead alone
+- Retry a send's version-checked filing into Sent Items against a fresh read while its claim stands, so a search index stamp landing during sealing no longer fails a delivered send
+- Keep the source after a plaintext start tag literally for transport rule matching, as a browser shows it
+- Name a sealed booking by the invitation's SUMMARY in a resource's automatic reply, or by none, never by its placeholder
+- Put off an attachment of a sealed message instead of stamping it with empty text, so it is extracted once its draft is stored readable
+- Leave the sealed copies of a private event's details out of its busy block
+- Document the round 5 zero-access fixes in the search spec
+- Raise a sealed-content event's sequence only for a scheduling change the server can see or a higher sequence its client sends, never for the placeholder location every opened save differs from, so an attendee's copy keeps applying the organizer's revisions and an organizer's meeting no longer re-invites on every save
+- Show the schedule around an invitation as the caller may see each calendar, a busy window without a title where they can't read it and Busy for a private or confidential event without UPDATE
+- Give an occurrence detached from a series whose sealed content names no title the series' sealed title too
+- Drop an unauthenticated sender's Autocrypt header from a relayed copy whose From is rewritten to the list or the forwarding mailbox
+- Delete a truncate's soft-deleted matches too and pass only what was removed to the purge hooks, the search index and the audit, so a ?deleted=true truncate no longer destroys restorable messages' attachments and search documents
+- Delete a lazily re-sanitized blob again when the message, read afresh, no longer names it or is sealed, so sealing or erasure racing the rewrite leaves no readable copy
+- Restore the mocks after each invitation schedule test, so a failed calendar read no longer leaks into later tests
+- Document the relay Autocrypt rule and the sealed-content sequence rule in the specs
+- Drop an event's per-field sealed title when its sealed content is resealed with a title, so a rename or an answered titled revision no longer leaves the old title to be opened over the new one
+- Record, export and release a sealed draft body replaced under a legal hold, accepting the draft's own mailbox's sealed draft keys as retained bodies
+- Delete the sealed blob a zero-access filing stored when writing its index entry fails
+- Protect mail:jobs:zero_access_backfill from plugin settings, and test that every core job's mail:jobs namespace is protected
+- Clear the SQL key discovery tests' verified domains after the file, so the next file can create mailboxes at example.com
+- Record in the notes that activesync already cleans up a Sent Items copy whose filing fails
+- Leave out of an invitation card's schedule the busy windows of calendars the caller can't read unless the owner's free/busy visibility shows them that mailbox
+- Test that an organizer-owned sealed-content meeting re-invites for a description change only when its client raises the sequence, and note that web-client must raise it
+- Write no RapidMX-Key or Autocrypt header for a sender address that isn't ASCII, which could only go out as an unfoldable, unparseable encoded word
+- Extract attachments never looked at before failed or sealed-deferred ones, so recurring sealed-draft rows can't fill every batch
+- Delete a re-sanitized blob the message no longer names only when no other row names it, serve the reader its HTML when the check fails, and redo a missing sanitized blob from the raw message on read
+- Delete a sealed blob on a failed zero-access filing only under a key fresh to that call, never the message's own za/<mailbox>/<uid> that a concurrent filing may name, and take an index entry another filing created meanwhile as written
+- Put a sealed draft's attachment off for as long as it is old, up to a day, so an abandoned sealed draft is looked at about once a day rather than every ten minutes
+- Clear the extracted text of every attachment row of a draft the backfill seals with a version-bumping write, and store no text for an attachment whose message was sealed while it was extracted
+- Serve a former owner's wrapped keys and master key wraps to no FULL holder of an ownerless mailbox
+- Seal a soft-deleted Outbox message whatever its schedule says unless a send still holds it, and clear the schedule of every Outbox message the backfill seals
+- Cover mayViewFreeBusy() with a caller who owns mailboxes and the loader's swallowed fallback delete failure, which the first CI run left below the coverage threshold
+- Record in the notes that web-client now raises the sequence for a sealed meeting's description change
+- Clean the rspamd learn request's Deliver-To header to printable ASCII as a scan's Rcpt is, so reports from an internationalized mailbox are learned instead of failing in fetch
+- Store a send's threading headers only after its claim, and have ScheduledSendJob apply them to what it relays, so a send never rewrites a draft body a concurrent sealing save or the backfill already deleted
+- Clear each attachment row's extracted text with a version-checked write before discardPlaintext() purges it, deleting the text a late extraction stamped
+- Seal a delivery failure notice under a key fresh to its filing and delete only that key when filing fails, never the shared index entry
+- Ask for headers-only bounces of an invitation carrying a meeting key, and send one through a transport that can't only when the organizer's mail would seal the bounce
+- Show an unreadable calendar on an invitation card only as free/busy does: merged busy windows of live calendars, without free or declined events or row uids
+- Normalize and sanitize an update's description before sealing it into an event's sealed content
+- Refuse an OpenPGP key too large for peers at enrollment, and leave any key a peer would refuse out of the key discovery response
+- Count a body blob the store says is gone as no space in the quota recalc, so one lost blob can't keep the figure from coming down
+- Delete a purged message's sanitized HTML again after erasure or retention removes its row, so a re-sanitize that wrote it back mid-purge leaves nothing
+- Record the round 7 review fixes in the notes
+- Keep a soft-deleted scheduled Outbox message readable and scheduled in a zero-access mailbox, so restoring it resumes the send, until deleted_scheduled_send_days (30) after the later of its scheduled time and its deletion, then seal it and clear its schedule
+- Force the fixed follow-redirects, nodemailer, source-map-js, handlebars, brace-expansion and undici through resolutions, raise sanitize-html, nodemailer and vite, and ignore only node-forge's unfixed advisory 1240912 in the audit until acme-client or node-forge ships a fix
+- Answer "not there" from LocalFsBlobStore.exists() only for ENOENT or ENOTDIR and rethrow any other filesystem error, as S3BlobStore does for anything but a 404, so a permission or I/O fault no longer lowers a mailbox's quota figure or gives up on sealing a body
+- Count a body or contact photo the blob store says isn't there as gone only once it has been missing for a while, 6 hours in MailboxQuotaRecalcJob and a day in ZeroAccessBackfillJob, so a blob volume that failed to mount neither drops quota figures nor leaves zero-access mail unsealed for good
+- Seal a soft-deleted Outbox message that was already relayed at once rather than after deleted_scheduled_send_days, keeping its filing retry's schedule so a restore still files it into Sent Items
+- Find or create the Inbox before sealing a zero-access delivery failure notice, so an Inbox failure can't orphan the notice's sealed blob
+- Describe this release's changes in the release notes
+
+### Removed
+- Removed RapidMX-Key and Autocrypt headers a message already carries before announcing the mailbox's own keys
+- Removed ZeroAccessParseError, which sealRaw no longer throws
+- Removed a sealed message's readable search document when its metadata re-index runs out of retries, and keep retrying while that removal fails
+- Removed the search document of a soft-deleted message the zero-access backfill seals, which the search indexer never revisits
+- Removed the index entry a backfill draft seal replaced when its version-checked update loses, unless the draft was filed as its Sent Items copy or left Drafts to be sent
+- Removed a failed seal's blob under the message's own key when the caller minted its uid for that one filing (freshMessageUid)
+
 ## [0.34.0] - 2026-10-23
 
 ### Added
@@ -1461,7 +1670,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.34.0...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.35.0...HEAD
+[0.35.0]: https://github.com/rapidmx/restapi/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/rapidmx/restapi/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/rapidmx/restapi/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/rapidmx/restapi/compare/v0.31.0...v0.32.0
