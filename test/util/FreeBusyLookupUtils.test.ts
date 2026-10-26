@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError } from "@rapidrest/core";
+import { ACLAction } from "@rapidrest/service-core";
 import {
     FREE_BUSY_MAX_ADDRESSES,
     FREE_BUSY_MAX_WINDOW_MS,
@@ -11,6 +12,7 @@ import {
     assertFreeBusyVisibility,
     effectiveFreeBusyVisibility,
     isFreeBusyVisibility,
+    mayViewFreeBusy,
     parseFreeBusyRequest,
 } from "../../src/util/FreeBusyLookupUtils.js";
 
@@ -51,6 +53,29 @@ describe("FreeBusyLookupUtils Tests", () => {
         it("Takes the domain of an address lowercased, after the last @.", () => {
             expect(addressDomain("Ada@Corp.Test")).toBe("corp.test");
             expect(addressDomain("  ada@corp.test ")).toBe("corp.test");
+        });
+    });
+
+    describe("mayViewFreeBusy()", () => {
+        const target = { uid: "mbx-target", primarySmtpAddress: "ada@corp.test" } as any;
+        /** A caller owning `owned`, holding `grants` (uid:action), over a target mailbox with one calendar folder. */
+        const ctx = (owned: any[], grants: string[] = []) => ({
+            caller: { uid: "Caller" } as any,
+            mailboxRepo: { find: vi.fn(async () => owned) } as any,
+            folderRepo: { find: vi.fn(async () => [{ uid: "cal-1" }, { uid: "cal-gone", deleted: true }]) } as any,
+            hasAccess: vi.fn(async (uid: string, action: string) => grants.includes(`${uid}:${action}`)),
+        });
+
+        it("Applies the free/busy lookup's rule: own mailbox, the owner's visibility, the caller's domain, and shared access.", async () => {
+            expect(await mayViewFreeBusy(ctx([target]), { ...target, freeBusyVisibility: "nobody" })).toBe(true);
+            expect(await mayViewFreeBusy(ctx([]), { ...target, freeBusyVisibility: "everyone" })).toBe(true);
+            expect(await mayViewFreeBusy(ctx([{ uid: "mine", primarySmtpAddress: "me@corp.test" }]), target)).toBe(true);
+            expect(await mayViewFreeBusy(ctx([{ uid: "mine", primarySmtpAddress: "me@else.test" }]), target)).toBe(false);
+            expect(await mayViewFreeBusy(ctx([{ uid: "mine", primarySmtpAddress: "me@corp.test" }]), { ...target, freeBusyVisibility: "shared" })).toBe(false);
+            expect(await mayViewFreeBusy(ctx([], ["cal-1:freebusy"]), { ...target, freeBusyVisibility: "shared" })).toBe(true);
+            expect(await mayViewFreeBusy(ctx([], [`cal-gone:${ACLAction.READ}`]), { ...target, freeBusyVisibility: "shared" })).toBe(false);
+            expect(await mayViewFreeBusy(ctx([], [`cal-1:${ACLAction.READ}`]), { ...target, freeBusyVisibility: "nobody" })).toBe(false);
+            expect(await mayViewFreeBusy(ctx([], [`mbx-target:${ACLAction.FULL}`]), { ...target, freeBusyVisibility: "nobody" })).toBe(true);
         });
     });
 

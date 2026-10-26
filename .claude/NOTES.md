@@ -4904,7 +4904,8 @@ Batch: zero-access owner change, backfill, search index, sends, key vault, trans
   - a failing `discard` deletes outright;
   - a missing blob is redone, not written back for a message that dropped it, and fails when it can't be redone or the store can't tell.
 
-  Sanitized content suite (both backends): a rule copy keeps the shared blob when the original drops it mid-rebuild and still serves it, and a missing blob is redone on read.
+  Sanitized content suite (both backends): a rule copy keeps the shared blob when the original drops it mid-rebuild and still serves it, and a missing blob is redone on read. `FreeBusyLookupUtils` unit: `mayViewFreeBusy()` for own, `everyone`, same and other domain, `shared` via a calendar folder (a deleted one doesn't count), and `nobody` with and without `FULL`.
+- **CI.** The first run (7c23ede) passed every test but missed the 100% line/function threshold: `mayViewFreeBusy()`'s owned-mailbox mapping (no route test caller owns a mailbox) and the fallback delete's swallowed failure in `SanitizedBodyLoader`. Covered by the unit test above, and by the `SanitizedBody` test now failing both deletes.
 - **Verification.** `yarn build`, plus the changed and covering files run locally one at a time: `SanitizedBody`, `MailSendUtils`, `FreeBusyLookupUtils`, the AttachmentExtractionJob registry, mongo and SQL files, `MessageSanitizedContent` (mongo and SQL), and `CalendarEventRoute` (mongo and SQL; these carry the invite and dialog suites). The full suite was left to CI.
 
 ## 2026-10-26: Review round 6 fixes (zero-access filing, backfill, key vault, extraction; review ids 601-605, 607-611)

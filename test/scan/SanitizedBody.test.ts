@@ -218,7 +218,8 @@ describe("SanitizedBodyLoader", () => {
 
             const other = { ...message, uid: "msg-2", sanitizedHtmlBlobKey: "sanitized/msg-2", stillNamed: async () => false };
             await blobs.put(other.sanitizedHtmlBlobKey, Buffer.from(OLD));
-            vi.spyOn(blobs, "delete").mockRejectedValueOnce(new Error("store down"));
+            // Both the delete without a reference check and the one after it fail.
+            vi.spyOn(blobs, "delete").mockRejectedValueOnce(new Error("store down")).mockRejectedValueOnce(new Error("store down"));
             expect(await loader.load(other)).toBe(CLEAN(OLD));
             const third = { ...message, uid: "msg-3", sanitizedHtmlBlobKey: "sanitized/msg-3", stillNamed: async () => Promise.reject(new Error("down")) };
             await blobs.put(third.sanitizedHtmlBlobKey, Buffer.from(OLD));
