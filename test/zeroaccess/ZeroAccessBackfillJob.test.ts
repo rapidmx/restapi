@@ -219,6 +219,33 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
         expect(instance.messageRepo.update.mock.calls.map((call: any[]) => call[0].uid)).toEqual(["failed", "lapsed", "unfiled"]);
     });
 
+    it("seals a soft-deleted Outbox message whatever its schedule says, clearing the schedule, unless a send still holds it (round 6, #604, #610)", async () => {
+        const future = new Date(Date.now() + 60_000);
+        const past = new Date(Date.now() - 60_000);
+        const { instance } = job({ messages: [message("inbox-mail")] });
+        instance.folderRepo.find.mockResolvedValue([{ uid: "outbox", type: "outbox" }]);
+        instance.messageRepo.findOne = vi.fn().mockResolvedValue(undefined);
+        instance.messageRepo.find = vi.fn(async (query: any) =>
+            query.deleted
+                ? [
+                      message("deleted-scheduled", { folderUid: "outbox", deleted: true, scheduledSendTime: future }),
+                      message("deleted-relayed", { folderUid: "outbox", deleted: true, scheduledSendTime: past, scheduledSendRelayedAt: past }),
+                      message("deleted-in-flight", { folderUid: "outbox", deleted: true, scheduledSendTime: null, scheduledSendLeaseExpiresAt: future }),
+                  ]
+                : [message("inbox-mail")],
+        );
+        await instance.run();
+        expect(instance.zeroAccessWriter.sealDraft.mock.calls.map((call: any[]) => call[2])).toEqual(["deleted-scheduled"]);
+        expect(instance.zeroAccessWriter.sealRaw.mock.calls.map((call: any[]) => call[2])).toEqual(["inbox-mail", "deleted-relayed"]);
+        const patches = Object.fromEntries(instance.messageRepo.update.mock.calls.map((call: any[]) => [call[0].uid, call[0]]));
+        expect(Object.keys(patches)).toEqual(["inbox-mail", "deleted-scheduled", "deleted-relayed"]);
+        for (const uid of ["deleted-scheduled", "deleted-relayed"]) {
+            expect(patches[uid]).toMatchObject({ scheduledSendTime: null, scheduledSendAttempts: null, scheduledSendLeaseExpiresAt: null });
+        }
+        // Only an Outbox row's schedule is touched.
+        expect("scheduledSendTime" in patches["inbox-mail"]).toBe(false);
+    });
+
     it("keeps a message sealed, and logs it, when its readable copies can't all be removed", async () => {
         const { instance, logger } = job({ messages: [message("m1", { receivedDate: undefined, sentDate: new Date("2026-01-01") })] });
         instance.zeroAccessWriter.discardPlaintext.mockRejectedValue(new Error("store down"));

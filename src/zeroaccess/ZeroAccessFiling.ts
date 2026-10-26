@@ -80,7 +80,11 @@ export class ZeroAccessFiling {
 
     /** Writes `messageUid`'s index entry from `document` unless it already exists - or, with `replace` (a draft saved again), in
      * place of the existing one. It goes in the week of `receivedAt` (`isoWeekId()`), or of now for a date no week can be named for -
-     * one outside years 1000-9999, such as an imported message's odd `Date` header. */
+     * one outside years 1000-9999, such as an imported message's odd `Date` header.
+     *
+     * A create refused because another filing of the same message wrote the entry since it was looked for (two replicas sealing one
+     * message, a compose save and the backfill's deferred write of a draft's) is not a failure: the entry is there, which is all a first
+     * filing needs, and a draft's next save or send replaces it. Only an error with no entry behind it is thrown. */
     public async index(
         repo: RepoUtils<any>,
         entryClass: new (fields: Partial<ZeroAccessIndexEntry>) => ZeroAccessIndexEntry,
@@ -99,9 +103,16 @@ export class ZeroAccessFiling {
         const sealed: string = await sealIndexDocument({ ...document, messageUid }, this.target.certDer);
         const year: number = receivedAt.getUTCFullYear();
         const at: Date = year >= 1000 && year <= 9999 ? receivedAt : new Date();
-        await repo.create(
-            new entryClass({ uid, mailboxUid: this.mailboxUid, messageUid, weekId: isoWeekId(at), receivedAt: at, keyFingerprint: this.keyFingerprint, sealed }),
-            { ignoreACL: true },
-        );
+        try {
+            await repo.create(
+                new entryClass({ uid, mailboxUid: this.mailboxUid, messageUid, weekId: isoWeekId(at), receivedAt: at, keyFingerprint: this.keyFingerprint, sealed }),
+                { ignoreACL: true },
+            );
+        } catch (err) {
+            if (await repo.findOne(uid, { ignoreACL: true, skipCache: true }).catch(() => undefined)) {
+                return;
+            }
+            throw err;
+        }
     }
 }

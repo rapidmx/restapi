@@ -27,7 +27,8 @@ export const ZERO_ACCESS_DRAFT_MESSAGE =
 
 /** Where `seal()` stores the sealed message and how it treats an existing index entry - the defaults are a message filed once. */
 export interface ZeroAccessSealOptions {
-    /** The blob key to store the sealed message under, instead of `zeroAccessBlobKey(mailboxUid, messageUid)`. */
+    /** The blob key to store the sealed message under, instead of `zeroAccessBlobKey(mailboxUid, messageUid)`: a key fresh to this call
+     * (`sealDraft()`'s), which no other filing can share - so a failed seal removes the blob it stored there. */
     blobKey?: string;
     /** Replace the message's index entry when it has one, instead of keeping it. */
     replaceIndexEntry?: boolean;
@@ -40,6 +41,8 @@ export interface ZeroAccessSealOptions {
 const PREVIEW_MAX_LENGTH = 500;
 /** How much of a body is indexed - `ScanPipeline`'s `BODY_TEXT_MAX_LENGTH`. */
 const BODY_TEXT_MAX_LENGTH = 1_000_000;
+/** How many times `discardDraftPlaintext()` tries to clear an attachment row's extracted text that keeps changing under it. */
+const DROP_TEXT_ATTEMPTS = 3;
 
 /** The plaintext a filing knows about the message it seals - see `ZeroAccessWriter.seal()`. */
 export interface ZeroAccessSealInput {
@@ -165,9 +168,12 @@ export class ZeroAccessWriter {
             return sealed;
         } catch (err) {
             // Nothing will name a blob whose filing failed (the caller files no row), and it is no plaintext copy the caller could
-            // clean up: remove it here, unless an earlier attempt stored it and a row may already name it. Best effort - the error
-            // that failed the filing is the one reported.
-            if (filing.storedSealedBlob) {
+            // clean up: remove it here - only under a key fresh to this call (`options.blobKey`, a draft save's), and only when this
+            // call stored it. The message's own `zeroAccessBlobKey()` is shared by every filing of it: another one running at the same
+            // time (a second replica's backfill, a send taken over) may have stored the same key and be about to name it in its row,
+            // so a sealed copy left there is reused by the next attempt instead. Best effort - the error that failed the filing is the
+            // one reported.
+            if (options.blobKey !== undefined && filing.storedSealedBlob) {
                 try {
                     await blobStore.delete(bodyBlobKey);
                 } catch {
@@ -202,32 +208,42 @@ export class ZeroAccessWriter {
      * `discardPlaintext()` for a draft just sealed (`sealDraft()`): removes `blobKeys` (its former body, sanitized HTML), but keeps its
      * attachment rows and their blobs, which are the draft's working attachments - readable until it is sent, as a sealed save keeps them.
      * Only their extracted text goes, a derivative nothing indexes while the draft is sealed: each row's `extractedTextBlobKey` is cleared
-     * (version-checked; a row changed meanwhile keeps it) and its blob removed. `AttachmentExtractionJob` puts such a row off while the
-     * draft stays sealed, and extracts it again once the draft is readable.
+     * and its blob removed (`dropExtractedText()`). `AttachmentExtractionJob` puts such a row off while the draft stays sealed, and
+     * extracts it again once the draft is readable.
      */
     public async discardDraftPlaintext(repos: MessageBlobRepos, messageUid: string, blobKeys: (string | null | undefined)[]): Promise<void> {
         const keys: (string | null | undefined)[] = [...blobKeys];
         if (repos.attachmentRepo) {
             for await (const page of findPagesByUid<any>(repos.attachmentRepo, { messageUid })) {
                 for (const attachment of page) {
-                    if (!attachment.extractedTextBlobKey) {
-                        continue;
-                    }
-                    try {
-                        await repos.attachmentRepo.update(
-                            { uid: attachment.uid, version: attachment.version, extractedTextBlobKey: null } as any,
-                            asEntity(repos.attachmentRepo, attachment),
-                            { ignoreACL: true },
-                        );
-                    } catch {
-                        // Changed meanwhile: it keeps its text.
-                        continue;
-                    }
-                    keys.push(attachment.extractedTextBlobKey);
+                    keys.push(await ZeroAccessWriter.dropExtractedText(repos.attachmentRepo, attachment));
                 }
             }
         }
         await deleteBlobsIfUnreferenced(this.blobStore!, messageBlobReferenceSources(repos), keys);
+    }
+
+    /**
+     * Clears an attachment row's `extractedTextBlobKey` with a version-checked write, and returns the text blob it named, if any. Every row
+     * is written, one without text too: the write moves its version on, so an extraction that read it before the draft was sealed loses
+     * its own version-checked stamp (and deletes the text it would have stored). When the row changed meanwhile - that stamp landed first -
+     * it is read again and cleared once more, `DROP_TEXT_ATTEMPTS` times at most; a row that can't be read again, or is gone, is left.
+     */
+    private static async dropExtractedText(attachmentRepo: RepoUtils<any>, attachment: any): Promise<string | undefined> {
+        let current: any = attachment;
+        for (let attempt = 0; current && attempt < DROP_TEXT_ATTEMPTS; attempt++) {
+            try {
+                await attachmentRepo.update(
+                    { uid: current.uid, version: current.version, extractedTextBlobKey: null } as any,
+                    asEntity(attachmentRepo, current),
+                    { ignoreACL: true },
+                );
+                return current.extractedTextBlobKey ?? undefined;
+            } catch {
+                current = await attachmentRepo.findOne(current.uid, { ignoreACL: true, skipCache: true }).catch(() => undefined);
+            }
+        }
+        return undefined;
     }
 
     /** Removes an index entry `seal()` wrote, for a caller whose filing failed after it (best effort is the caller's to decide). */

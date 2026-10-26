@@ -545,14 +545,17 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     /**
      * Who may read a mailbox's key vault - its wrapped private keys and master key wraps, which an offline guess at the owner's password
      * would open: only the mailbox's owner, like every write (`requireMailboxOwner()`); for a shared mailbox with no owner, a holder of
-     * FULL. A delegate with only READ is no reader of it.
+     * FULL. A delegate with only READ is no reader of it. Whether the reader is the owner: a FULL holder of an ownerless mailbox is given
+     * none of those secrets (`get()`) - only a former owner's master key could have written them, and its members open the mailbox's
+     * zero-access key through their own member wraps.
      */
-    private async requireVaultReader(mailbox: M, user: JWTUser | undefined): Promise<void> {
+    private async requireVaultReader(mailbox: M, user: JWTUser | undefined): Promise<boolean> {
         if (mailbox.ownerUserUid) {
             this.requireMailboxOwner(mailbox, user);
-            return;
+            return true;
         }
         await this.requireMailboxAccess(mailbox, user, ACLAction.FULL);
+        return false;
     }
 
     /** Returned as an entity instance (`asEntity()`): every vault write below passes it as `existing` to
@@ -588,7 +591,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
     @Get("/:id/keyvault")
     public async get(@Param("id") mailboxId: string, @AuthUser user?: JWTUser): Promise<PublicKeyVault> {
         const mailbox: M = await this.requireMailbox(mailboxId);
-        await this.requireVaultReader(mailbox, user);
+        const owner: boolean = await this.requireVaultReader(mailbox, user);
 
         const existing: K | undefined = await this.findKeyVault(mailboxId);
         // Audit-logged like every mutating endpoint below, not just those - this is the one operation that
@@ -600,7 +603,12 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             { action: AuditAction.KEY_VAULT_READ, targetType: "KeyVault", targetUid: existing?.uid ?? mailbox.uid, mailboxUid: mailbox.uid },
             { user },
         );
-        return existing ? toPublicKeyVault(existing, mailbox) : { ...EMPTY_KEY_VAULT, zeroAccessKeys: mailbox.zeroAccessKeys ?? [] };
+        // A FULL holder of an ownerless mailbox gets neither the wrapped private keys nor the master key wraps: on such a vault they can only
+        // be a former owner's (`enrollKey()` and `addMasterKeyWrap()` are owner-only), kept server-side so the mailbox can be given back
+        // (`BaseMailboxRoute.masterKeyHoldsZeroAccessKeys()`), and their password wrap is open to an offline guess at that owner's password.
+        return existing && owner
+            ? toPublicKeyVault(existing, mailbox)
+            : { ...EMPTY_KEY_VAULT, masterKeyGeneration: generationOf(existing), zeroAccessKeys: mailbox.zeroAccessKeys ?? [] };
     }
 
     /**

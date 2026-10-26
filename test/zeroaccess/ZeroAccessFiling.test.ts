@@ -51,4 +51,28 @@ describe("ZeroAccessFiling", () => {
         expect(repo.findOne).toHaveBeenCalledWith(zeroAccessIndexEntryUid("m1"), { ignoreACL: true });
         expect(repo.create).not.toHaveBeenCalled();
     });
+
+    it("takes an entry another filing of the message wrote meanwhile as written, and throws only when there is none (round 6, #601, #611)", async () => {
+        const za = await testZeroAccessKey();
+        const filing = new ZeroAccessFiling({ key: za.key, certDer: Buffer.from(za.key.publicKey, "base64") }, {} as any, "mbx");
+        const entry = class { constructor(fields: any) { Object.assign(this, fields); } } as any;
+        const raced = new Error("IDENTIFIER_EXISTS");
+
+        // A first filing and a draft's replacing write both lose a create race to an entry that is now there.
+        for (const replace of [false, true]) {
+            const repo: any = {
+                findOne: vi.fn().mockResolvedValueOnce(undefined).mockResolvedValueOnce({ uid: "winner" }),
+                create: vi.fn().mockRejectedValue(raced),
+                delete: vi.fn(),
+            };
+            await expect(filing.index(repo, entry, "m1", new Date(), {} as any, replace)).resolves.toBeUndefined();
+            expect(repo.findOne).toHaveBeenLastCalledWith(zeroAccessIndexEntryUid("m1"), { ignoreACL: true, skipCache: true });
+        }
+
+        // No entry behind the error, or no way to tell: the create's own error is thrown.
+        const missing: any = { findOne: vi.fn().mockResolvedValue(undefined), create: vi.fn().mockRejectedValue(raced) };
+        await expect(filing.index(missing, entry, "m1", new Date(), {} as any)).rejects.toBe(raced);
+        const unreadable: any = { findOne: vi.fn().mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("db down")), create: vi.fn().mockRejectedValue(raced) };
+        await expect(filing.index(unreadable, entry, "m1", new Date(), {} as any)).rejects.toBe(raced);
+    });
 });

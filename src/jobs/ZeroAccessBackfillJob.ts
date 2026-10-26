@@ -48,8 +48,9 @@ const RECORD_TYPES: readonly ZeroAccessDataType[] = ["calendar", "contacts", "ta
  *
  * Messages in Outbox are left alone while their send can still go ahead - due, scheduled or waiting out a retry (`scheduledSendTime`), or
  * claimed (a live `scheduledSendLeaseExpiresAt`) - since they are relayed from the readable copy and `ScheduledSendJob` seals the Sent
- * Items copy. One whose send failed for good, or that was relayed but never filed, is nothing left to send: it is sealed, as a draft
- * when it was never relayed (reopened and sent again like any sealed draft) and as sent mail when it was. Mail the sender encrypted end
+ * Items copy. One whose send failed for good, that was relayed but never filed, or that was soft-deleted (never sent, whatever its
+ * schedule says) is nothing left to send: it is sealed, as a draft when it was never relayed (reopened and sent again like any sealed
+ * draft) and as sent mail when it was, and its schedule is cleared. Mail the sender encrypted end
  * to end is left alone. Turning zero-access off never decrypts anything (the server can't): this job only ever seals.
  *
  * Calendar events, contacts and tasks are sealed the same way, per data type, once that type is protected for the mailbox (`specs/search.md`
@@ -364,7 +365,7 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
             attempted++;
             // An Outbox message never relayed is a draft whose send failed: sealed as one, so it can be reopened and sent again.
             const isDraft: boolean = drafts.has(message.folderUid) || (inOutbox && !(message as any).scheduledSendRelayedAt);
-            if (!(await this.sealMessage(mailbox, message, isDraft))) {
+            if (!(await this.sealMessage(mailbox, message, isDraft, inOutbox))) {
                 // Zero-access stopped being active for this mailbox meanwhile: leave the rest for when it is again.
                 break;
             }
@@ -372,14 +373,23 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
         return attempted;
     }
 
-    /** Whether an Outbox message's send can still go ahead: it is due, scheduled or waiting out a retry, or a send holds a live claim. */
+    /**
+     * Whether an Outbox message's send can still go ahead: it is due, scheduled or waiting out a retry, or a send holds a live claim. A
+     * soft-deleted one is never sent (`ScheduledSendJob` doesn't select it), whatever its `scheduledSendTime` says, so only a live claim -
+     * a delete that landed while it was being relayed - keeps it from being sealed.
+     */
     private static sendPending(message: Message, now: number): boolean {
         const lease: any = (message as any).scheduledSendLeaseExpiresAt;
-        return !!message.scheduledSendTime || (!!lease && new Date(lease).getTime() > now);
+        const claimed: boolean = !!lease && new Date(lease).getTime() > now;
+        return claimed || ((message as any).deleted !== true && !!message.scheduledSendTime);
     }
 
-    /** Seals one message, as a draft when `isDraft`; `false` when zero-access is no longer active for its mailbox (nothing was changed). */
-    private async sealMessage(mailbox: X, message: M, isDraft: boolean): Promise<boolean> {
+    /**
+     * Seals one message, as a draft when `isDraft`; `false` when zero-access is no longer active for its mailbox (nothing was changed). An
+     * Outbox message (`inOutbox`) also loses its schedule and lapsed claim: sealed, it is nothing `ScheduledSendJob` could relay - one
+     * soft-deleted while scheduled would otherwise come back due when restored.
+     */
+    private async sealMessage(mailbox: X, message: M, isDraft: boolean, inOutbox: boolean = false): Promise<boolean> {
         let raw: Buffer;
         try {
             raw = await this.blobStore!.get(message.bodyBlobKey);
@@ -417,6 +427,7 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
                     bodyBlobKey: sealed.bodyBlobKey,
                     sanitizedHtmlBlobKey: null,
                     zeroAccess: sealed.zeroAccess,
+                    ...(inOutbox ? { scheduledSendTime: null, scheduledSendAttempts: null, scheduledSendLeaseExpiresAt: null } : {}),
                     // Indexed again, now as metadata only: the server-side search document still holds the readable text. Retries
                     // included (`SEARCH_REINDEX`): a message whose indexing retries had run out is otherwise never selected again.
                     ...SEARCH_REINDEX,

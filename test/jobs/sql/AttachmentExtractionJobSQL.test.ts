@@ -532,5 +532,77 @@ describe("AttachmentExtractionJobSQL Tests (real DB + DI)", () => {
             const updated = await findAttachment(attachment.uid);
             expect(await blobStore.exists(updated!.extractedTextBlobKey!)).toBe(true);
         });
+
+        it("Takes attachments never attempted ahead of any number of sealed drafts' uploads due again, which only fill what is left (round 6, #602, #608).", async () => {
+            (job as any).batchSize = 2;
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const sealed = await createMessage({ subject: "[...]", zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" } });
+            const monthAgo = Date.now() - 30 * 86_400_000;
+            const deferred: any[] = [];
+            for (let i = 0; i < 3; i++) {
+                deferred.push(
+                    await createAttachment({
+                        messageUid: sealed.uid,
+                        dateCreated: new Date(monthAgo + i * 1000),
+                        extractionAttempts: 0,
+                        extractionNextAttemptAt: new Date(Date.now() - 60_000 + i * 1000),
+                    }),
+                );
+            }
+            const blobKey = `attachments/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("fresh mail text"));
+            const fresh = await createAttachment({ messageUid: (await createMessage()).uid, blobKey });
+
+            await job.run();
+
+            expect((await findAttachment(fresh.uid))!.extractedTextBlobKey).toContain("attachment-text/");
+            // The one slot left went to the upload due soonest: put off again, for a day as it is a month old.
+            const [first, ...rest] = await Promise.all(deferred.map(async (row) => await findAttachment(row.uid)));
+            const nextAttempt = new Date(first!.extractionNextAttemptAt!).getTime();
+            expect(nextAttempt).toBeGreaterThan(Date.now() + 86_000_000);
+            expect(nextAttempt).toBeLessThanOrEqual(Date.now() + 86_400_000);
+            for (const row of rest) {
+                expect(new Date(row!.extractionNextAttemptAt!).getTime()).toBeLessThan(Date.now());
+            }
+        });
+
+        it("Puts a sealed draft's upload off for about as long as it is old (round 6, #602, #608).", async () => {
+            const sealed = await createMessage({ subject: "[...]", zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" } });
+            const attachment = await createAttachment({ messageUid: sealed.uid, dateCreated: new Date(Date.now() - 2 * 3_600_000) });
+
+            await job.run();
+
+            const nextAttempt = new Date((await findAttachment(attachment.uid))!.extractionNextAttemptAt!).getTime();
+            expect(nextAttempt).toBeGreaterThan(Date.now() + 7_000_000);
+            expect(nextAttempt).toBeLessThan(Date.now() + 7_400_000);
+        });
+
+        it("Doesn't store the text of an attachment whose message is sealed while it is extracted, and puts it off instead (round 6, #605).", async () => {
+            const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+            const blobKey = `attachments/${uuid.v4()}`;
+            await blobStore.put(blobKey, Buffer.from("CANARY text extracted as the draft is sealed"));
+            const message = await createMessage();
+            const attachment = await createAttachment({ messageUid: message.uid, mimeType: "text/plain", blobKey });
+            const registry: any = (job as any).extractorRegistry;
+            const extract = registry.extract.bind(registry);
+            const extractSpy = vi.spyOn(registry, "extract").mockImplementation(async (...args: any[]) => {
+                const text = await extract(...args);
+                // The backfill seals the draft while its attachment is extracted.
+                await messageRepo.update({ uid: message.uid }, { zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" } });
+                return text;
+            });
+            const putSpy = vi.spyOn(blobStore, "put");
+            try {
+                await job.run();
+                expect(putSpy.mock.calls.filter((call: any[]) => String(call[0]).startsWith("attachment-text/"))).toHaveLength(0);
+            } finally {
+                extractSpy.mockRestore();
+                putSpy.mockRestore();
+            }
+
+            const row = await findAttachment(attachment.uid);
+            expect(row!.extractedTextBlobKey ?? null).toBeNull();
+            expect(row!.extractionAttempts).toBe(0);
+        });
     });
 });

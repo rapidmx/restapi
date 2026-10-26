@@ -77,6 +77,10 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
     @Config("mail:jobs:attachment_extraction:zero_access_defer_seconds", 600)
     private zeroAccessDeferSeconds: number = 600;
 
+    /** The longest an attachment of a message stored zero-access sealed is put off at a time - see `deferWhileSealed()`. */
+    @Config("mail:jobs:attachment_extraction:zero_access_defer_max_seconds", 86_400)
+    private zeroAccessDeferMaxSeconds: number = 86_400;
+
     /** The same ceiling `ExtractorRegistry` applies to an attachment's size: one declared larger is never downloaded just to be refused. */
     @Config("mail:search:extraction:max_bytes", 25 * 1024 * 1024)
     private maxExtractBytes: number = 25 * 1024 * 1024;
@@ -243,6 +247,12 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
             !this.extractorRegistry!.supports(mimeType)
                 ? undefined
                 : await this.extractorRegistry!.extract(mimeType, await this.blobStore!.get(attachment.blobKey));
+        if (text !== undefined && (await this.sealedSince(attachment))) {
+            // Sealed while it was extracted (the backfill sealing a draft): its text is not stored. The backfill's clean-up
+            // (`ZeroAccessWriter.discardDraftPlaintext()`) also bumps the row's version, so a stamp that got past this check loses.
+            await this.deferWhileSealed(attachment);
+            return;
+        }
 
         const extractedTextBlobKey = `attachment-text/${crypto.randomUUID()}`;
         await this.blobStore!.put(extractedTextBlobKey, Buffer.from(text ?? "", "utf-8"), {
@@ -275,20 +285,32 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
         }
     }
 
+    /** Whether the attachment's message, read again after a (possibly long) extraction, is now stored zero-access sealed. */
+    private async sealedSince(attachment: A): Promise<boolean> {
+        const current: M | undefined = await this.messageRepo!.findOne(attachment.messageUid, { ignoreACL: true, includeDeleted: true, skipCache: true });
+        return !!current && !current.encrypted && !!(current as any).zeroAccess;
+    }
+
     /**
-     * Puts off an attachment of a message stored zero-access sealed for `zero_access_defer_seconds`, without extracting or stamping it:
-     * an empty stamp would keep it from ever being extracted, and a sealed draft's uploads are the rows its message is sent with once
-     * it is saved readable (zero-access turned off meanwhile), whose attachment text must then be indexed. Not a failed attempt: the
-     * bookkeeping is reset (`extractionAttempts` 0, so the candidate query's backoff branch applies), and a successful extraction later
-     * clears it. The rows of a sealed draft that is sent are removed when its sealed Sent copy is filed.
+     * Puts off an attachment of a message stored zero-access sealed, without extracting or stamping it: an empty stamp would keep it from
+     * ever being extracted, and a sealed draft's uploads are the rows its message is sent with once it is saved readable (zero-access
+     * turned off meanwhile), whose attachment text must then be indexed. Not a failed attempt: the bookkeeping is reset
+     * (`extractionAttempts` 0, so the backoff query applies), and a successful extraction later clears it. The rows of a sealed draft that
+     * is sent are removed when its sealed Sent copy is filed.
+     *
+     * Put off for as long as the attachment is old - at least `zero_access_defer_seconds`, at most `zero_access_defer_max_seconds` - so a
+     * draft being worked on is looked at again soon and one long abandoned about once a day, not every few minutes for ever.
      */
     private async deferWhileSealed(attachment: A): Promise<void> {
+        // A row without a (valid) creation date counts as new.
+        const ageSeconds: number = (Date.now() - new Date((attachment as any).dateCreated).getTime()) / 1000 || 0;
+        const delaySeconds: number = Math.min(Math.max(this.zeroAccessDeferSeconds, ageSeconds), Math.max(this.zeroAccessDeferSeconds, this.zeroAccessDeferMaxSeconds));
         await this.attachmentRepo!.update(
             {
                 uid: attachment.uid,
                 version: (attachment as any).version,
                 extractionAttempts: 0,
-                extractionNextAttemptAt: new Date(Date.now() + this.zeroAccessDeferSeconds * 1000),
+                extractionNextAttemptAt: new Date(Date.now() + delaySeconds * 1000),
                 extractionError: null,
             } as any,
             asEntity(this.attachmentRepo!, attachment),

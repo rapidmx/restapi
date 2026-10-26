@@ -92,7 +92,7 @@ describe("ZeroAccessWriter", () => {
         expect(await writer().allowed()).toBe(true);
     });
 
-    it("removes the sealed blob it stored when writing the index entry fails, but never one an earlier attempt stored (round 5, #536)", async () => {
+    it("removes a draft's fresh sealed blob when writing the index entry fails, but never the message's own key (round 5, #536; round 6, #601)", async () => {
         const mailbox = { uid: "mbx", ownerUserUid: "u", zeroAccessKeys: [await zeroAccessKey()] };
         const blobs = new Map<string, Buffer>();
         const blobStore = {
@@ -100,23 +100,82 @@ describe("ZeroAccessWriter", () => {
             put: async (k: string, v: Buffer) => void blobs.set(k, v),
             delete: vi.fn(async (k: string) => void blobs.delete(k)),
         };
-        const index = { findOne: vi.fn().mockResolvedValue(undefined), create: vi.fn().mockRejectedValue(new Error("db down")) };
+        const index = { findOne: vi.fn().mockResolvedValue(undefined), create: vi.fn().mockRejectedValue(new Error("db down")), delete: vi.fn() };
         const w = writer({ blobStore, extractorRegistry: undefined }, { index });
 
-        await expect(w.sealRaw(mailbox, Buffer.from("Subject: hi\r\n\r\nbody"), "m1", new Date())).rejects.toThrow("db down");
-        expect(blobs.has("za/mbx/m1")).toBe(false);
+        // A draft save's key is its own: removed.
+        await expect(w.sealDraft(mailbox, Buffer.from("Subject: hi\r\n\r\nbody"), "d1", new Date())).rejects.toThrow("db down");
+        expect(blobStore.delete).toHaveBeenCalledWith(expect.stringMatching(/^za\/mbx\/drafts\//));
+        expect(blobs.size).toBe(0);
 
-        // A retried filing finds the blob already stored, which a row may name: it is left.
-        blobs.set("za/mbx/m1", Buffer.from("earlier"));
+        // `za/<mailbox>/<uid>` is shared by every filing of the message - one running at the same time may name it: left, even when
+        // this call stored it, and reused by the next attempt.
         blobStore.delete.mockClear();
         await expect(w.sealRaw(mailbox, Buffer.from("Subject: hi\r\n\r\nbody"), "m1", new Date())).rejects.toThrow("db down");
         expect(blobStore.delete).not.toHaveBeenCalled();
-        expect(blobs.get("za/mbx/m1")?.toString()).toBe("earlier");
+        expect(blobs.has("za/mbx/m1")).toBe(true);
 
         // A failed removal still reports the filing's own error.
-        blobs.clear();
         blobStore.delete.mockRejectedValueOnce(new Error("blob store down"));
-        await expect(w.sealRaw(mailbox, Buffer.from("Subject: hi\r\n\r\nbody"), "m2", new Date())).rejects.toThrow("db down");
+        await expect(w.sealDraft(mailbox, Buffer.from("Subject: hi\r\n\r\nbody"), "d2", new Date())).rejects.toThrow("db down");
+    });
+
+    it("never deletes the sealed blob two filings of the same message stored at the same time, and both succeed (round 6, #601, #607)", async () => {
+        const mailbox = { uid: "mbx", ownerUserUid: "u", zeroAccessKeys: [await zeroAccessKey()] };
+        const blobs = new Map<string, Buffer>();
+        // Both filings look for the blob before either stores it, and for the index entry before either writes it.
+        let looked = 0;
+        let release: () => void = () => undefined;
+        const bothLooked = new Promise<void>((resolve) => (release = resolve));
+        const barrier = async () => {
+            if (++looked === 2) {
+                release();
+            }
+            await bothLooked;
+        };
+        const blobStore = {
+            exists: vi.fn(async (k: string) => {
+                const found = blobs.has(k);
+                await barrier();
+                return found;
+            }),
+            put: async (k: string, v: Buffer) => void blobs.set(k, v),
+            delete: vi.fn(async (k: string) => void blobs.delete(k)),
+        };
+        const entries = new Map<string, any>();
+        let lookedForEntry = 0;
+        let releaseEntry: () => void = () => undefined;
+        const bothLookedForEntry = new Promise<void>((resolve) => (releaseEntry = resolve));
+        const index = {
+            findOne: vi.fn(async (uid: string, options: any) => {
+                const found = entries.get(uid);
+                if (!options?.skipCache) {
+                    if (++lookedForEntry === 2) {
+                        releaseEntry();
+                    }
+                    await bothLookedForEntry;
+                }
+                return found;
+            }),
+            create: vi.fn(async (e: any) => {
+                if (entries.has(e.uid)) {
+                    throw Object.assign(new Error("IDENTIFIER_EXISTS"), { status: 409 });
+                }
+                entries.set(e.uid, e);
+            }),
+            delete: vi.fn(),
+        };
+        const w = writer({ blobStore, extractorRegistry: undefined }, { index });
+        const raw = Buffer.from("Subject: hi\r\n\r\nbody");
+
+        const [a, b] = await Promise.all([w.sealRaw(mailbox, raw, "m1", new Date()), w.sealRaw(mailbox, raw, "m1", new Date())]);
+
+        expect(a!.bodyBlobKey).toBe("za/mbx/m1");
+        expect(b!.bodyBlobKey).toBe("za/mbx/m1");
+        expect(index.create).toHaveBeenCalledTimes(2);
+        expect(entries.size).toBe(1);
+        expect(blobStore.delete).not.toHaveBeenCalled();
+        expect(blobs.has("za/mbx/m1")).toBe(true);
     });
 
     it("leaves a deferred index entry's blob to the caller", async () => {
@@ -194,18 +253,36 @@ describe("ZeroAccessWriter", () => {
         expect([...entries.values()][0].sealed).not.toBe(firstEntry.sealed);
     });
 
-    it("discards a sealed draft's replaced body and its attachments' extracted text, keeping the attachment rows, and a row changed meanwhile its text", async () => {
+    it("discards a sealed draft's replaced body and its attachments' extracted text, keeping the attachment rows (round 6, #605)", async () => {
         const blobStore = { delete: vi.fn() };
         const w = writer({ blobStore });
         const rows = [
             { uid: "a1", version: 1, blobKey: "attachments/a1", extractedTextBlobKey: "attachment-text/a1" },
+            // Changed every time it is read: left with its text after three tries.
             { uid: "a2", version: 1, blobKey: "attachments/a2", extractedTextBlobKey: "attachment-text/a2" },
+            // No text yet: written all the same, so an extraction that read it before the seal loses its stamp.
             { uid: "a3", version: 1, blobKey: "attachments/a3" },
+            // That extraction's stamp landed first: read again and its text cleared.
+            { uid: "a4", version: 1, blobKey: "attachments/a4" },
+            // Gone, or can't be read again: left.
+            { uid: "a5", version: 1, blobKey: "attachments/a5" },
         ];
+        let a2Version = 1;
+        let a4Stamped = false;
         const attachmentRepo = {
             find: vi.fn(async (query: any) => (query.uid ? [] : rows)),
+            findOne: vi.fn(async (uid: string) => {
+                if (uid === "a2") {
+                    return { ...rows[1], version: ++a2Version };
+                }
+                if (uid === "a4") {
+                    return { uid: "a4", version: 2, blobKey: "attachments/a4", extractedTextBlobKey: "attachment-text/a4-late" };
+                }
+                throw new Error("db down");
+            }),
             update: vi.fn(async (patch: any) => {
-                if (patch.uid === "a2") {
+                if (patch.uid === "a2" || patch.uid === "a5" || (patch.uid === "a4" && !a4Stamped)) {
+                    a4Stamped ||= patch.uid === "a4";
                     throw new Error("version");
                 }
                 return patch;
@@ -218,9 +295,16 @@ describe("ZeroAccessWriter", () => {
         expect(attachmentRepo.update.mock.calls.map((call: any[]) => call[0])).toEqual([
             { uid: "a1", version: 1, extractedTextBlobKey: null },
             { uid: "a2", version: 1, extractedTextBlobKey: null },
+            { uid: "a2", version: 2, extractedTextBlobKey: null },
+            { uid: "a2", version: 3, extractedTextBlobKey: null },
+            { uid: "a3", version: 1, extractedTextBlobKey: null },
+            { uid: "a4", version: 1, extractedTextBlobKey: null },
+            { uid: "a4", version: 2, extractedTextBlobKey: null },
+            { uid: "a5", version: 1, extractedTextBlobKey: null },
         ]);
+        expect(attachmentRepo.findOne).toHaveBeenCalledWith("a4", { ignoreACL: true, skipCache: true });
         const deleted = blobStore.delete.mock.calls.map((call: any[]) => call[0]);
-        expect(deleted).toEqual(expect.arrayContaining(["bodies/d1", "attachment-text/a1"]));
+        expect(deleted).toEqual(expect.arrayContaining(["bodies/d1", "attachment-text/a1", "attachment-text/a4-late"]));
         expect(deleted).not.toContain("attachment-text/a2");
         expect(deleted).not.toContain("attachments/a1");
     });

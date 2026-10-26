@@ -440,6 +440,52 @@ export function sharedZeroAccessKeySuite(ctx: SharedZeroAccessKeySuiteContext): 
             expect(refused.status).toBe(409);
         });
 
+        it("serves a former owner's wrapped keys and master key wraps to no FULL holder of the ownerless mailbox, only to the owner it is given back to (round 6, #603)", async () => {
+            const owner = await user();
+            const mailbox = await ctx.createMailbox({ ownerUserUid: owner.uid });
+            await ctx.setAcl(mailbox.uid, [{ userOrRoleId: owner.uid, actions: [ACLAction.FULL] }]);
+            const enrolled = await request(ctx.app())
+                .post(`${ctx.baseUrl}/${mailbox.uid}/keyvault/keys`)
+                .set("Authorization", as(owner.uid))
+                .send({
+                    useType: "zero-access",
+                    csr: await generateTestCsr(mailbox.primarySmtpAddress),
+                    wrappedKey: { ciphertext: "ct", nonce: "n", algorithm: "AES-256-GCM" },
+                    masterKeyWraps: [{ method: "password", ciphertext: "mkct", nonce: "mkn", salt: "salt", kdf: "argon2id", schemeVersion: 1, createdAt: Date.now() }],
+                });
+            expect(enrolled.status).toBe(200);
+            const admin = "jwt " + ctx.adminToken();
+            const setOwner = async (ownerUserUid: string | null) => {
+                const changed = await request(ctx.app())
+                    .put(`${ctx.baseUrl}/${mailbox.uid}`)
+                    .set("Authorization", admin)
+                    .send({ uid: mailbox.uid, version: (await ctx.findMailbox(mailbox.uid)).version, ownerUserUid });
+                expect(changed.status).toBe(200);
+            };
+
+            // Made a team mailbox: the team has FULL, the former owner's vault stays.
+            await setOwner(null);
+            const member = await user();
+            await ctx.setAcl(mailbox.uid, [{ userOrRoleId: member.uid, actions: [ACLAction.FULL] }]);
+            const read = await request(ctx.app()).get(`${ctx.baseUrl}/${mailbox.uid}/keyvault`).set("Authorization", as(member.uid));
+            expect(read.status).toBe(200);
+            expect(read.body.wrappedKeys).toEqual([]);
+            expect(read.body.masterKeyWraps).toEqual([]);
+            expect(read.body.masterKeyGeneration).toBe((await ctx.findKeyVault(mailbox.uid)).masterKeyGeneration ?? 0);
+            expect(read.body.zeroAccessKeys.map((key: any) => key.fingerprint)).toEqual((await ctx.findMailbox(mailbox.uid)).zeroAccessKeys.map((key: any) => key.fingerprint));
+            expect(JSON.stringify(read.body)).not.toContain("mkct");
+            const stored = await ctx.findKeyVault(mailbox.uid);
+            expect(stored.wrappedKeys).toHaveLength(1);
+            expect(stored.masterKeyWraps).toHaveLength(1);
+
+            // Given back: the owner reads the whole vault again.
+            await setOwner(owner.uid);
+            const restored = await request(ctx.app()).get(`${ctx.baseUrl}/${mailbox.uid}/keyvault`).set("Authorization", as(owner.uid));
+            expect(restored.status).toBe(200);
+            expect(restored.body.wrappedKeys).toHaveLength(1);
+            expect(restored.body.masterKeyWraps.map((wrap: any) => wrap.ciphertext)).toEqual(["mkct"]);
+        });
+
         it("escrows an ownerless mailbox's key to its escrow scope: required when provisioning, reported while missing, and added later", async () => {
             const manager = await user();
             const reader = await user();

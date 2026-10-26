@@ -813,6 +813,34 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
                 expect(JSON.stringify(send.body)).toContain("zero-access");
             });
 
+            it("seals a soft-deleted Outbox message whatever its schedule says, clearing it, but leaves one deleted mid-relay (round 6, #604, #610)", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const outbox = await ctx.createFolder(mailbox.uid, "outbox");
+                const later = new Date(Date.now() + 7 * 86_400_000);
+                // Scheduled for next week, then deleted: `ScheduledSendJob` never selects it again.
+                const scheduled = await stored(mailbox, outbox, { deleted: true, scheduledSendTime: later });
+                const relayed = await stored(mailbox, outbox, { deleted: true, scheduledSendTime: later, scheduledSendRelayedAt: new Date() });
+                const inFlight = (await stored(mailbox, outbox, { deleted: true, scheduledSendTime: null, scheduledSendLeaseExpiresAt: new Date(Date.now() + 600_000) })).message;
+
+                await ctx.runBackfill();
+
+                const scheduledRow = await ctx.findMessage(scheduled.message.uid);
+                expect(scheduledRow.zeroAccess.keyFingerprint).toBe(recipient.key.fingerprint);
+                expect(scheduledRow.bodyBlobKey).toMatch(new RegExp(`^za/${mailbox.uid}/drafts/`));
+                expect(scheduledRow.scheduledSendTime ?? null).toBeNull();
+                for (const key of [scheduled.bodyBlobKey, scheduled.sanitizedHtmlBlobKey]) {
+                    expect(await ctx.blobStore().exists(key), key).toBe(false);
+                }
+                const relayedRow = await ctx.findMessage(relayed.message.uid);
+                expect(relayedRow.bodyBlobKey).toBe(`za/${mailbox.uid}/${relayed.message.uid}`);
+                expect(relayedRow.scheduledSendTime ?? null).toBeNull();
+                for (const key of [relayed.bodyBlobKey, relayed.sanitizedHtmlBlobKey, relayed.attachmentBlobKey]) {
+                    expect(await ctx.blobStore().exists(key), key).toBe(false);
+                }
+                expect((await ctx.findMessage(inFlight.uid)).zeroAccess ?? undefined).toBeUndefined();
+            });
+
             it("removes the search document of restorable deleted mail it seals, which the search indexer never revisits", async () => {
                 const recipient = await makeKey();
                 const mailbox = await zeroAccessMailbox(recipient);
