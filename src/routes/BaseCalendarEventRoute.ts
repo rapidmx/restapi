@@ -253,6 +253,9 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
      * sends the fields it keeps along with the one it changes (the event dialog sends them all); one it leaves out is dropped, since the
      * server can't read the sealed value to keep it. A `sealedContent` from the client is ignored: only the server writes it.
      *
+     * Content naming a title drops the row's per-field `sealedFields` (only ever the title's copy on such a row), as
+     * `ScanQueueJob.supersededSealing()` does for a revision with a SUMMARY.
+     *
      * Returns what it sealed when that names a title - the plaintext an invitation for the revision is composed from - else `undefined`.
      */
     private async keepSealed(obj: any, existing: T): Promise<InvitationContent | undefined> {
@@ -279,6 +282,11 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         obj.location = null;
         obj.description = null;
         obj.descriptionHtml = null;
+        if (content.title && (existing as any).sealedFields?.title) {
+            // The title's per-field copy (kept by a revision that named none, `sealInvite()`/`ScanQueueJob.supersededSealing()`) is
+            // superseded by the one just sealed: left, a client opening both would show the old title over the new.
+            obj.sealedFields = null;
+        }
         return content.title ? content : undefined;
     }
 

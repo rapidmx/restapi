@@ -498,6 +498,24 @@ describe("RetentionEnforcementJobMongo Tests (real DB + DI)", () => {
             expect((await messageRepo.findOne({ uid: untouched.uid } as any))?.version).toBe(untouched.version);
         });
 
+        it("releases a sealed draft body kept for the hold too, but never deletes another mailbox's sealed draft named on the row (round 5, #535)", async () => {
+            const mailboxUid = uuid.v4();
+            const [sealed, foreign] = [`za/${mailboxUid}/drafts/${uuid.v4()}`, `za/${uuid.v4()}/drafts/${uuid.v4()}`];
+            const blobStore = await putBodies(sealed, foreign);
+            const draft = await createMessage({ mailboxUid, retainedBodyBlobKeys: [sealed, foreign] });
+            const matter = await createMatter({ custodianMailboxUids: [mailboxUid] });
+
+            await job.run();
+            expect(await blobStore.exists(sealed)).toBe(true);
+
+            await matterRepo.updateOne({ uid: matter.uid } as any, { $set: { closedAt: new Date() } } as any);
+            await job.run();
+
+            expect((await messageRepo.findOne({ uid: draft.uid } as any))?.retainedBodyBlobKeys ?? null).toBeNull();
+            expect(await blobStore.exists(sealed)).toBe(false);
+            expect(await blobStore.exists(foreign)).toBe(true);
+        });
+
         it("deletes them with a purged message, releases at most batch_size messages per run, and keeps the field when releasing fails", async () => {
             await retentionPolicyRepo.save(new RetentionPolicyMongo({ uid: "retention-policy", messageRetentionDays: 30 }));
             const [purgedBody, kept1, kept2] = [`bodies/${uuid.v4()}`, `bodies/${uuid.v4()}`, `bodies/${uuid.v4()}`];

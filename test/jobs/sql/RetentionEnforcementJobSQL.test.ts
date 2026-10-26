@@ -478,6 +478,24 @@ describe("RetentionEnforcementJobSQL Tests (real DB + DI)", () => {
             expect((await messageRepo.findOne({ where: { uid: untouched.uid } }))?.version).toBe(untouched.version);
         });
 
+        it("releases a sealed draft body kept for the hold too, but never deletes another mailbox's sealed draft named on the row (round 5, #535)", async () => {
+            const mailboxUid = uuid.v4();
+            const [sealed, foreign] = [`za/${mailboxUid}/drafts/${uuid.v4()}`, `za/${uuid.v4()}/drafts/${uuid.v4()}`];
+            const blobStore = await putBodies(sealed, foreign);
+            const draft = await createMessage({ mailboxUid, retainedBodyBlobKeys: [sealed, foreign] });
+            const matter = await createMatter({ custodianMailboxUids: [mailboxUid] });
+
+            await job.run();
+            expect(await blobStore.exists(sealed)).toBe(true);
+
+            await matterRepo.update({ uid: matter.uid }, { closedAt: new Date() });
+            await job.run();
+
+            expect(await retained(draft.uid)).toBeNull();
+            expect(await blobStore.exists(sealed)).toBe(false);
+            expect(await blobStore.exists(foreign)).toBe(true);
+        });
+
         it("deletes them with a purged message, releases at most batch_size messages per run, and keeps the field when releasing fails", async () => {
             await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", messageRetentionDays: 30 }));
             const purgedBody = `bodies/${uuid.v4()}`;

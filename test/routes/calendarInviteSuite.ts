@@ -586,6 +586,76 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
             expect(row.sealedFields).toEqual({ title: "c2VhbGVkIHRpdGxl" });
         });
 
+        describe("a copy whose title has a per-field sealed copy beside its sealed content (round 5, #521)", () => {
+            const combined = async () => {
+                const context = await setup();
+                const key = await keyOf(context.mailbox.uid);
+                const row = await ctx.createCalendarEvent(context.mailbox.uid, context.calendar.uid, {
+                    uid: nameBasedUuid(`itip:${context.mailbox.uid}:${eventUid}:master`),
+                    icalUid: eventUid,
+                    title: "[...]",
+                    sealedContent: { keyFingerprint: key.key.fingerprint, sealed: "eA==" },
+                    sealedFields: { title: "c2VhbGVkIHRpdGxl" },
+                    organizer: { address: "boss@boss.example.com", type: RecipientType.TO },
+                    attendees: [
+                        { address: context.me, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false },
+                    ],
+                    sequence: 0,
+                    inviteSequenceSent: 0,
+                });
+                return { ...context, row };
+            };
+
+            it("Drops the title's per-field copy when the reader renames the event, so the old title can't be opened over the new one", async () => {
+                const { mailbox, row } = await combined();
+
+                const result = await owner(request(ctx.app()).put(`${ctx.baseUrl}/${row.uid}`)).send({
+                    uid: row.uid,
+                    version: row.version,
+                    title: "CANARY Budget v2",
+                    location: "CANARY Room 4",
+                });
+
+                expect(result.status).toBe(200);
+                const [stored] = await ctx.findEvents(mailbox.uid);
+                expect(stored.sealedFields ?? null).toBeNull();
+                expect(stored.sealedContent.sealed).not.toBe("eA==");
+                expect(stored.title).toBe("[...]");
+                expect(JSON.stringify(stored)).not.toContain("CANARY");
+            });
+
+            it("Keeps the title's per-field copy for a save that seals nothing (a reminder change)", async () => {
+                const { mailbox, row } = await combined();
+
+                const result = await owner(request(ctx.app()).put(`${ctx.baseUrl}/${row.uid}`)).send({
+                    uid: row.uid,
+                    version: row.version,
+                    reminderMinutesBeforeStart: 15,
+                });
+
+                expect(result.status).toBe(200);
+                const [stored] = await ctx.findEvents(mailbox.uid);
+                expect(stored.sealedFields).toEqual({ title: "c2VhbGVkIHRpdGxl" });
+                expect(stored.sealedContent).toEqual(row.sealedContent);
+            });
+
+            it("Drops the title's per-field copy when an answered revision names a title", async () => {
+                const { mailbox, inbox, me } = await combined();
+                const message = await receiveSealed(mailbox.uid, inbox.uid);
+
+                const result = await owner(request(ctx.app()).post(inviteUrl(message.uid, "/respond"))).send({
+                    responseStatus: "accepted",
+                    ics: requestFor(me, { sequence: 1 }),
+                });
+
+                expect(result.status).toBe(200);
+                const [stored] = await ctx.findEvents(mailbox.uid);
+                expect(stored.sequence).toBe(1);
+                expect(stored.sealedFields ?? null).toBeNull();
+                expect(stored.sealedContent.sealed).not.toBe("eA==");
+            });
+        });
+
         it("Clears the readable location of a copy not sealed yet when a newer revision in a protected calendar names none", async () => {
             const { mailbox, inbox, calendar, me } = await setup();
             await ctx.addZeroAccessKey(mailbox.uid, { mail: false, calendar: true, contacts: false, tasks: false });

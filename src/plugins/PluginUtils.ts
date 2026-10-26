@@ -344,6 +344,7 @@ export const CORE_CONFIG_NAMESPACES: readonly string[] = [
     "mail:jobs:scan_queue",
     "mail:jobs:scheduled_send",
     "mail:jobs:search_index",
+    "mail:jobs:zero_access_backfill",
     "mail:compose",
     "mail:search",
     "mail:preferences",

@@ -4,6 +4,8 @@
 ///////////////////////////////////////////////////////////////////////////////
 import "reflect-metadata";
 import { createHash } from "crypto";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import nconf from "nconf";
 import { PluginManifest } from "../../src/models/types.js";
 import {
@@ -592,8 +594,22 @@ describe("isPluginSettingKeyAllowed", () => {
     it.each(["mail:eas:sync_window_size", "mail:eas:provision:password_enabled", "mail:jobs:eas_device_cleanup:device_ttl_days", "mail:autodiscover:public_url", "mail:booking:public_url", "mail:crm:public_url", "mail:crm:verp", "mail:videoconf:public_url", "mail:videoconf:turn:shared_secret", "mail:videoconf:relay:enabled"])("allows the shipped plugin setting %s", (key) => {
         expect(isPluginSettingKeyAllowed(key)).toBe(true);
     });
-    it.each(["mail:jobs:scan_queue:schedule", "mail:jobs:scheduled_send", "mail:jobs:search_index:batch_size"])("still refuses the core job setting %s", (key) => {
+    it.each(["mail:jobs:scan_queue:schedule", "mail:jobs:scheduled_send", "mail:jobs:search_index:batch_size", "mail:jobs:zero_access_backfill:schedule"])("still refuses the core job setting %s", (key) => {
         expect(isPluginSettingKeyAllowed(key)).toBe(false);
+    });
+    it("protects every core job's mail:jobs:<name> namespace that a @Config in src reads", () => {
+        const sources = (dir: string): string[] =>
+            readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+                entry.isDirectory() ? sources(join(dir, entry.name)) : entry.name.endsWith(".ts") ? [join(dir, entry.name)] : [],
+            );
+        const jobs = new Set<string>();
+        for (const file of sources(join(process.cwd(), "src"))) {
+            for (const match of readFileSync(file, "utf-8").matchAll(/@Config\("(mail:jobs:[a-z0-9_]+)/g)) {
+                jobs.add(match[1]);
+            }
+        }
+        expect(jobs.has("mail:jobs:zero_access_backfill")).toBe(true);
+        expect([...jobs].filter((namespace) => !CORE_CONFIG_NAMESPACES.includes(namespace))).toEqual([]);
     });
     it.each(["mail:crm:url", "mail:videoconf:url", "mail:booking:x", "authx", "my_plugin:key", "mail:transportx"])("allows %s", (key) => {
         expect(isPluginSettingKeyAllowed(key)).toBe(true);

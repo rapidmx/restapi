@@ -35,6 +35,17 @@ describe("DraftBodyRetentionUtils Tests", () => {
         expect(withRetainedBodyBlobKey(full, "bodies/0")).toHaveLength(MAX_RETAINED_BODY_BLOB_KEYS);
     });
 
+    it("accepts a sealed draft body key of the draft's own mailbox, never another mailbox's or one without a mailbox.", () => {
+        const draft = { mailboxUid: "mbx", retainedBodyBlobKeys: ["za/mbx/drafts/1", "za/other/drafts/2", "za/mbx/drafts/", "za/mbx/m1", "bodies/a"] };
+        expect(retainedBodyBlobKeysOf(draft)).toEqual(["za/mbx/drafts/1", "bodies/a"]);
+        expect(retainedBodyBlobKeysOf({ retainedBodyBlobKeys: draft.retainedBodyBlobKeys })).toEqual(["bodies/a"]);
+        expect(retainedBodyBlobKeysOf({ mailboxUid: "mbx/drafts", retainedBodyBlobKeys: ["za/mbx/drafts/drafts/1"] })).toEqual([]);
+        expect(withRetainedBodyBlobKey({ mailboxUid: "mbx", retainedBodyBlobKeys: ["bodies/1"] }, "za/mbx/drafts/2")).toEqual(["bodies/1", "za/mbx/drafts/2"]);
+        expect(withRetainedBodyBlobKey({ mailboxUid: "mbx", retainedBodyBlobKeys: ["bodies/1"] }, "za/other/drafts/2")).toEqual(["bodies/1"]);
+        expect(withRetainedBodyBlobKey({ mailboxUid: "mbx" }, "za/mbx/m1")).toEqual([]);
+        expect(withRetainedBodyBlobKey({}, "za/mbx/drafts/2")).toEqual([]);
+    });
+
     it("is exported from the util barrel.", () => {
         expect(util.withRetainedBodyBlobKey).toBe(withRetainedBodyBlobKey);
         expect(util.MAX_RETAINED_BODY_BLOB_KEYS).toBe(500);

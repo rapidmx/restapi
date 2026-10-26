@@ -136,31 +136,46 @@ export class ZeroAccessWriter {
         }
         const filing = new ZeroAccessFiling(target, this.blobStore, mailbox.uid);
         const bodyBlobKey: string = await filing.storeMessage(input.raw, input.messageUid, options.blobKey);
-        const zeroAccess: MessageZeroAccess = await filing.messageState({ subject: input.subject, preview: input.preview });
-        const { messageUid: _unused, ...document } = await buildIndexDocument(
-            {
-                messageUid: input.messageUid,
-                subject: input.subject,
-                bodyText: input.bodyText,
-                fromAddress: input.fromAddress,
-                fromDisplayName: input.fromDisplayName,
-                recipients: input.recipients,
-                attachments: input.attachments,
-                dateForSort: input.receivedAt,
-            },
-            async (mimeType, content) => this.extractorRegistry?.extract(mimeType, content),
-            { budgetMs: this.extractionBudgetMs, maxAttachmentBytes: this.extractionMaxBytes },
-        );
-        const indexEntryRepo: RepoUtils<any> = this.indexEntryRepo;
-        const writeIndex = async (): Promise<void> =>
-            await filing.index(indexEntryRepo, this.indexEntryClass, input.messageUid, input.receivedAt, document, options.replaceIndexEntry);
-        const sealed: ZeroAccessSealedFields = { subject: PROTECTED_SUBJECT, bodyPreview: "", bodyBlobKey, zeroAccess, indexEntryUid: zeroAccessIndexEntryUid(input.messageUid) };
-        if (options.deferIndex) {
-            sealed.writeIndex = writeIndex;
-        } else {
-            await writeIndex();
+        const blobStore: BlobStore = this.blobStore;
+        try {
+            const zeroAccess: MessageZeroAccess = await filing.messageState({ subject: input.subject, preview: input.preview });
+            const { messageUid: _unused, ...document } = await buildIndexDocument(
+                {
+                    messageUid: input.messageUid,
+                    subject: input.subject,
+                    bodyText: input.bodyText,
+                    fromAddress: input.fromAddress,
+                    fromDisplayName: input.fromDisplayName,
+                    recipients: input.recipients,
+                    attachments: input.attachments,
+                    dateForSort: input.receivedAt,
+                },
+                async (mimeType, content) => this.extractorRegistry?.extract(mimeType, content),
+                { budgetMs: this.extractionBudgetMs, maxAttachmentBytes: this.extractionMaxBytes },
+            );
+            const indexEntryRepo: RepoUtils<any> = this.indexEntryRepo;
+            const writeIndex = async (): Promise<void> =>
+                await filing.index(indexEntryRepo, this.indexEntryClass, input.messageUid, input.receivedAt, document, options.replaceIndexEntry);
+            const sealed: ZeroAccessSealedFields = { subject: PROTECTED_SUBJECT, bodyPreview: "", bodyBlobKey, zeroAccess, indexEntryUid: zeroAccessIndexEntryUid(input.messageUid) };
+            if (options.deferIndex) {
+                sealed.writeIndex = writeIndex;
+            } else {
+                await writeIndex();
+            }
+            return sealed;
+        } catch (err) {
+            // Nothing will name a blob whose filing failed (the caller files no row), and it is no plaintext copy the caller could
+            // clean up: remove it here, unless an earlier attempt stored it and a row may already name it. Best effort - the error
+            // that failed the filing is the one reported.
+            if (filing.storedSealedBlob) {
+                try {
+                    await blobStore.delete(bodyBlobKey);
+                } catch {
+                    // The filing's own error is the one to report.
+                }
+            }
+            throw err;
         }
-        return sealed;
     }
 
     /**

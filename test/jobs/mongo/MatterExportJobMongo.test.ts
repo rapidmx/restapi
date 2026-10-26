@@ -283,6 +283,10 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
         await blobStore.put(v2, Buffer.from("Subject: draft v2\r\n\r\nsecond"));
         await blobStore.put(outOfRange, Buffer.from("not in scope"));
         await blobStore.put("attachments/secret", Buffer.from("never exported"));
+        // A sealed draft body kept for the hold is exported like a readable one; another mailbox's sealed draft never is (round 5, #535).
+        const [sealed, foreign] = [`za/${mailbox.uid}/drafts/${uuid.v4()}`, `za/${uuid.v4()}/drafts/${uuid.v4()}`];
+        await blobStore.put(sealed, Buffer.from("Content-Type: application/pkcs7-mime\r\n\r\nsealed"));
+        await blobStore.put(foreign, Buffer.from("another mailbox's draft"));
         const draft = (sentDate: string, retainedBodyBlobKeys: string[]) =>
             messageRepo.save(
                 new MessageMongo({
@@ -301,7 +305,7 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
                     retainedBodyBlobKeys,
                 }),
             );
-        const inRange = await draft("2026-03-10", [v1, v2, gone, "attachments/secret"]);
+        const inRange = await draft("2026-03-10", [v1, v2, sealed, gone, "attachments/secret", foreign]);
         await draft("2026-04-10", [outOfRange]);
         const request = await createRequest({ matterId: matter.uid });
 
@@ -311,13 +315,14 @@ describe("MatterExportJobMongo Tests (real DB + DI)", () => {
         expect(updated!.status).toBe("ready");
         const lines = (await blobStore.get(updated!.blobKey!)).toString("utf-8").split("\n").map((line) => JSON.parse(line));
         const bodies = lines.filter((l) => l.entityType === "retainedDraftBody");
-        expect(bodies.map((l) => l.blobKey)).toEqual([v1, v2, gone]);
+        expect(bodies.map((l) => l.blobKey)).toEqual([v1, v2, sealed, gone]);
         expect(bodies.every((l) => l.messageUid === inRange.uid && l.mailboxUid === mailbox.uid)).toBe(true);
         expect(Buffer.from(bodies[0].content, "base64").toString("utf-8")).toBe("Subject: draft v1\r\n\r\nfirst");
         expect(bodies[1]).toEqual(expect.objectContaining({ contentType: "message/rfc822", encoding: "base64" }));
-        expect(bodies[2]).toEqual({ entityType: "retainedDraftBody", messageUid: inRange.uid, mailboxUid: mailbox.uid, blobKey: gone, missing: true });
+        expect(Buffer.from(bodies[2].content, "base64").toString("utf-8")).toContain("sealed");
+        expect(bodies[3]).toEqual({ entityType: "retainedDraftBody", messageUid: inRange.uid, mailboxUid: mailbox.uid, blobKey: gone, missing: true });
         // The retained keys are listed on the message line too.
-        expect(lines.find((l) => l.entityType === "message")?.retainedBodyBlobKeys).toEqual([v1, v2, gone, "attachments/secret"]);
+        expect(lines.find((l) => l.entityType === "message")?.retainedBodyBlobKeys).toEqual([v1, v2, sealed, gone, "attachments/secret", foreign]);
     });
 
     it("Skips a custodian mailbox that no longer exists, still exporting the rest.", async () => {

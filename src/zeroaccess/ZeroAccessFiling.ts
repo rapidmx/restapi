@@ -33,6 +33,7 @@ export function zeroAccessIndexEntryUid(messageUid: string): string {
  */
 export class ZeroAccessFiling {
     private sealedBlobKey?: string;
+    private storedBlob: boolean = false;
     private summary?: string;
 
     constructor(
@@ -53,10 +54,17 @@ export class ZeroAccessFiling {
             const key: string = blobKey ?? zeroAccessBlobKey(this.mailboxUid, messageUid);
             if (!(await this.blobStore.exists(key))) {
                 await this.blobStore.put(key, await sealMessage(raw, this.target.certDer), { contentType: "message/rfc822" });
+                this.storedBlob = true;
             }
             this.sealedBlobKey = key;
         }
         return this.sealedBlobKey;
+    }
+
+    /** Whether `storeMessage()` wrote the sealed blob itself, rather than finding it already stored by an earlier attempt that a
+     * row may name. Only a blob this filing wrote is its own to remove when the filing fails. */
+    public get storedSealedBlob(): boolean {
+        return this.storedBlob;
     }
 
     /** `Message.zeroAccess` for a message with this subject and preview (sealed once). */

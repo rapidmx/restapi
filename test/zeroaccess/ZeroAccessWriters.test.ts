@@ -92,6 +92,46 @@ describe("ZeroAccessWriter", () => {
         expect(await writer().allowed()).toBe(true);
     });
 
+    it("removes the sealed blob it stored when writing the index entry fails, but never one an earlier attempt stored (round 5, #536)", async () => {
+        const mailbox = { uid: "mbx", ownerUserUid: "u", zeroAccessKeys: [await zeroAccessKey()] };
+        const blobs = new Map<string, Buffer>();
+        const blobStore = {
+            exists: async (k: string) => blobs.has(k),
+            put: async (k: string, v: Buffer) => void blobs.set(k, v),
+            delete: vi.fn(async (k: string) => void blobs.delete(k)),
+        };
+        const index = { findOne: vi.fn().mockResolvedValue(undefined), create: vi.fn().mockRejectedValue(new Error("db down")) };
+        const w = writer({ blobStore, extractorRegistry: undefined }, { index });
+
+        await expect(w.sealRaw(mailbox, Buffer.from("Subject: hi\r\n\r\nbody"), "m1", new Date())).rejects.toThrow("db down");
+        expect(blobs.has("za/mbx/m1")).toBe(false);
+
+        // A retried filing finds the blob already stored, which a row may name: it is left.
+        blobs.set("za/mbx/m1", Buffer.from("earlier"));
+        blobStore.delete.mockClear();
+        await expect(w.sealRaw(mailbox, Buffer.from("Subject: hi\r\n\r\nbody"), "m1", new Date())).rejects.toThrow("db down");
+        expect(blobStore.delete).not.toHaveBeenCalled();
+        expect(blobs.get("za/mbx/m1")?.toString()).toBe("earlier");
+
+        // A failed removal still reports the filing's own error.
+        blobs.clear();
+        blobStore.delete.mockRejectedValueOnce(new Error("blob store down"));
+        await expect(w.sealRaw(mailbox, Buffer.from("Subject: hi\r\n\r\nbody"), "m2", new Date())).rejects.toThrow("db down");
+    });
+
+    it("leaves a deferred index entry's blob to the caller", async () => {
+        const mailbox = { uid: "mbx", ownerUserUid: "u", zeroAccessKeys: [await zeroAccessKey()] };
+        const blobs = new Map<string, Buffer>();
+        const blobStore = { exists: async (k: string) => blobs.has(k), put: async (k: string, v: Buffer) => void blobs.set(k, v), delete: vi.fn() };
+        const index = { findOne: vi.fn().mockResolvedValue(undefined), create: vi.fn().mockRejectedValue(new Error("db down")) };
+        const sealed = await writer({ blobStore, extractorRegistry: undefined }, { index }).sealRaw(mailbox, Buffer.from("Subject: hi\r\n\r\nbody"), "m1", new Date(), {
+            deferIndex: true,
+        });
+        await expect(sealed!.writeIndex!()).rejects.toThrow("db down");
+        expect(blobStore.delete).not.toHaveBeenCalled();
+        expect(blobs.has("za/mbx/m1")).toBe(true);
+    });
+
     it("seals nothing through seal() either for a mailbox without zero-access", async () => {
         expect(await writer().seal({ uid: "mbx", ownerUserUid: "u" }, { messageUid: "m1", raw: Buffer.from("x") } as any)).toBeUndefined();
     });
