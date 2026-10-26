@@ -812,6 +812,51 @@ describe("Route:MessageSQL Tests", () => {
             expect(stored).toContain("References: <root@example.com>");
         });
 
+        it("Persists them for a draft that carries its own Message-ID too, whose relayed bytes are otherwise the ones stored (round 7, #702).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const bodyBlobKey = `bodies/${uuid.v4()}`;
+            await blobStore.put(
+                bodyBlobKey,
+                Buffer.from("Message-ID: <own-id@example.com>\r\nFrom: owner@example.com\r\nTo: recipient@example.com\r\nSubject: Re: Hello\r\n\r\nReply body.\r\n"),
+            );
+            const draft = await createMessage(mailbox.uid, drafts.uid, { bodyBlobKey, subject: "Re: Hello", inReplyTo: "root@example.com", references: [] });
+
+            expect((await send(draft.uid)).status).toBe(200);
+
+            const stored: string = (await blobStore.get(bodyBlobKey)).toString();
+            expect(stored).toContain("In-Reply-To: <root@example.com>");
+            expect(stored).toContain("Message-ID: <own-id@example.com>");
+        });
+
+        it("Writes nothing onto the draft's body before its claim: a body a concurrent save sealed and deleted meanwhile isn't brought back readable (round 7, #702).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const drafts = await createFolder(mailbox.uid, FolderType.DRAFTS);
+            const draft = await draftReplying(mailbox.uid, drafts.uid, "Re: Hello", { inReplyTo: "root@example.com", references: [] });
+            const blobStore: InMemoryBlobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const get = blobStore.get.bind(blobStore);
+            let raced = false;
+            const spy = vi.spyOn(blobStore, "get").mockImplementation(async (key: string) => {
+                const raw: Buffer = await get(key);
+                if (key === draft.bodyBlobKey && !raced) {
+                    raced = true;
+                    // What a sealing autosave (or the zero-access backfill) does once its version-checked update has won: the row moves on,
+                    // and the readable body it replaced is deleted.
+                    await messageRepo.update({ uid: draft.uid }, { version: (draft as any).version + 1 });
+                    await blobStore.delete(key);
+                }
+                return raw;
+            });
+
+            const result = await send(draft.uid);
+            spy.mockRestore();
+
+            expect(raced).toBe(true);
+            expect(result.status).toBe(409);
+            expect(await blobStore.exists(draft.bodyBlobKey)).toBe(false);
+        });
+
         it("Joins the conversation of a parent that is itself a reply, three deep, with only a direct parent named.", async () => {
             const mailbox = await createMailbox(owner.uid);
             const inbox = await createFolder(mailbox.uid, FolderType.INBOX);

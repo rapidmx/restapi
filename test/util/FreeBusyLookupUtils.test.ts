@@ -12,6 +12,7 @@ import {
     assertFreeBusyVisibility,
     effectiveFreeBusyVisibility,
     isFreeBusyVisibility,
+    freeBusyCalendarFolders,
     mayViewFreeBusy,
     parseFreeBusyRequest,
 } from "../../src/util/FreeBusyLookupUtils.js";
@@ -76,6 +77,11 @@ describe("FreeBusyLookupUtils Tests", () => {
             expect(await mayViewFreeBusy(ctx([], [`cal-gone:${ACLAction.READ}`]), { ...target, freeBusyVisibility: "shared" })).toBe(false);
             expect(await mayViewFreeBusy(ctx([], [`cal-1:${ACLAction.READ}`]), { ...target, freeBusyVisibility: "nobody" })).toBe(false);
             expect(await mayViewFreeBusy(ctx([], [`mbx-target:${ACLAction.FULL}`]), { ...target, freeBusyVisibility: "nobody" })).toBe(true);
+        });
+
+        it("Names the live calendar folders free/busy reads when it may be seen, and none when it may not (round 7, #706).", async () => {
+            expect(await freeBusyCalendarFolders(ctx([]), { ...target, freeBusyVisibility: "everyone" })).toEqual(new Set(["cal-1"]));
+            expect(await freeBusyCalendarFolders(ctx([]), { ...target, freeBusyVisibility: "nobody" })).toBeUndefined();
         });
     });
 

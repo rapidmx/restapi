@@ -140,6 +140,12 @@ function parsePublicKey(raw: unknown): PublicKey | undefined {
     return key;
 }
 
+/** Whether a peer's `parseKeyDiscoveryResponse()` accepts `key` - one it doesn't makes the whole response malformed, so a mailbox's own
+ * response (`buildKeyDiscoveryResponse()`) leaves such a key out. */
+export function isPublishableKey(key: unknown): boolean {
+    return parsePublicKey(key) !== undefined;
+}
+
 /**
  * Strictly validates an untrusted `KeyDiscoveryResponse` (a remote peer's JSON body, or any other
  * attacker-influenced source) and returns a freshly built copy containing only the known fields - or

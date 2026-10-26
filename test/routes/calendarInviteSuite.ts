@@ -13,6 +13,7 @@ import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import * as uuid from "uuid";
 import { AttendeeResponseStatus, AttendeeRole, BusyStatus, CalendarEventStatus, FolderType, RecipientType } from "../../src/models/types.js";
 import { nameBasedUuid } from "../../src/util/UuidUtils.js";
+import { MAX_EVENT_DESCRIPTION_HTML_LENGTH } from "../../src/util/EventDescriptionUtils.js";
 import type { InMemoryBlobStore, RecordingMailTransport } from "../testDoubles.js";
 import { openSealedField, type TestZeroAccessKey } from "../zeroAccessTestKeys.js";
 
@@ -465,6 +466,23 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
                 const [kept] = await ctx.findEvents(mailbox.uid);
                 expect(kept.sequence).toBe(1);
                 expect(kept.reminderMinutesBeforeStart).toBe(30);
+            });
+
+            it("Checks, bounds and sanitizes the description it seals, as for any other event (round 7, #707)", async () => {
+                const { mailbox, row } = await acceptedMeeting();
+
+                expect((await save(row, { descriptionHtml: `<p>${"x".repeat(MAX_EVENT_DESCRIPTION_HTML_LENGTH)}</p>` })).status).toBe(400);
+                expect((await save(row, { description: 42 })).status).toBe(400);
+                const [unchanged] = await ctx.findEvents(mailbox.uid);
+                expect(unchanged.sealedContent).toEqual(row.sealedContent);
+
+                expect((await save(row, { descriptionHtml: '<p>Agenda<script>alert("x")</script></p>' })).status).toBe(200);
+                const [saved] = await ctx.findEvents(mailbox.uid);
+                const opened: any = await openSealedField(saved.sealedContent.sealed, keys.get(mailbox.uid)!);
+                expect(opened.descriptionHtml).toContain("Agenda");
+                expect(opened.descriptionHtml).not.toContain("script");
+                // The plain text derived from the HTML, as for a readable event.
+                expect(opened.description).toBe("Agenda");
             });
         });
 

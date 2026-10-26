@@ -23,7 +23,7 @@ import { normalizeAddress } from "../util/AddressUtils.js";
 import { findOrCreateWellKnownFolder } from "../util/FolderUtils.js";
 import { CorrespondentUtils, messageObservations } from "../util/CorrespondentUtils.js";
 import { DomainUtils } from "../util/DomainUtils.js";
-import { envelopeRecipientsOf, prepareOutboundMime, scanAndRelay, seedReceiptStatus } from "../util/MailSendUtils.js";
+import { applyThreadHeaders, envelopeRecipientsOf, prepareOutboundMime, scanAndRelay, seedReceiptStatus } from "../util/MailSendUtils.js";
 import { deriveMessageListFields } from "../util/MessageListUtils.js";
 import { checkOriginatorHeaders, extractHeader, prependHeaders } from "../util/MimeHeaderUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
@@ -475,9 +475,11 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                     return;
                 }
                 const envelopeTo: string[] = envelopeRecipientsOf(claimed);
-                // The receipt request and encryption-key announcement an immediate send adds (`prepareOutboundMime()`).
+                // The receipt request and encryption-key announcement an immediate send adds (`prepareOutboundMime()`), on top of the
+                // reply's threading headers (`applyThreadHeaders()`), which `BaseMessageRoute.send()` no longer writes onto the body before it
+                // queues the message. What is relayed differs from `raw` then, so it is stored once relayed, below.
                 const prepared = await prepareOutboundMime({
-                    raw,
+                    raw: applyThreadHeaders(raw, claimed),
                     message: claimed,
                     mailbox: sendingMailbox,
                     domainUtils: this.domainUtils,
@@ -576,13 +578,13 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                 // with what was actually relayed whenever `scanAndRelay()` had to inject a missing Message-ID.
                 await this.blobStore!.put(claimed.bodyBlobKey, relayedRaw, { contentType: "message/rfc822" });
             } else if (alreadyRelayed && messageId) {
-                // Finishing a previous run's filing: that run may have failed before persisting an injected
-                // Message-ID into the stored blob - re-apply the same header `scanAndRelay()` prepended.
+                // Finishing a previous run's filing (or an immediate send's): it may have failed before persisting the threading
+                // headers and an injected Message-ID into the stored blob - re-apply the ones the relay added.
                 const stored: Buffer = await this.blobStore!.get(claimed.bodyBlobKey);
-                if (!extractHeader(stored, "Message-ID")) {
-                    await this.blobStore!.put(claimed.bodyBlobKey, prependHeaders(stored, [{ name: "Message-ID", value: `<${messageId}>` }]), {
-                        contentType: "message/rfc822",
-                    });
+                const threaded: Buffer = applyThreadHeaders(stored, claimed);
+                const finished: Buffer = extractHeader(threaded, "Message-ID") ? threaded : prependHeaders(threaded, [{ name: "Message-ID", value: `<${messageId}>` }]);
+                if (finished !== stored) {
+                    await this.blobStore!.put(claimed.bodyBlobKey, finished, { contentType: "message/rfc822" });
                 }
             }
 

@@ -461,8 +461,14 @@ export function calendarEventDialogSuite(ctx: CalendarEventDialogSuiteContext): 
              * The owner's Inbox shared with `other` (`inboxActions`), an invitation in it, and two events around its time in the Calendar,
              * whose free/busy the owner shows to `visibility` (`other` owns no mailbox, so the default `domain` hides it from them).
              */
-            const invited = async (inboxActions: string[], calendarActions?: string[], visibility?: string) => {
+            const invited = async (
+                inboxActions: string[],
+                calendarActions?: string[],
+                visibility?: string,
+                more?: (mailbox: any, calendar: any, me: string) => Promise<void>,
+            ) => {
                 const { mailbox, calendar, me } = await setup();
+                await more?.(mailbox, calendar, me);
                 if (visibility) {
                     await ctx.setFreeBusyVisibility(mailbox.uid, visibility);
                 }
@@ -518,9 +524,49 @@ export function calendarEventDialogSuite(ctx: CalendarEventDialogSuiteContext): 
                 const shown = await other(request(ctx.app()).get(url));
 
                 expect(shown.status).toBe(200);
-                expect(titles(shown)).toEqual(["", ""]);
+                // The two events at the same time are one busy window, as free/busy gives them.
+                expect(titles(shown)).toEqual([""]);
                 expect(shown.body.schedule.every((entry: any) => entry.busy)).toBe(true);
                 expect(titles(await owner(request(ctx.app()).get(url)))).toEqual(["Team lunch", "Termination meeting"]);
+            });
+
+            it("Gives a grantee of the Inbox alone no more than free/busy does: merged windows, no free or declined event, no row uid (round 7, #706).", async () => {
+                const at = (fromHours: number, toHours: number) => ({
+                    startDate: new Date(start.getTime() + fromHours * HOUR),
+                    endDate: new Date(start.getTime() + toHours * HOUR),
+                });
+                const rows: any[] = [];
+                const url = await invited(["read", "list"], undefined, "everyone", async (mailbox, calendar, me) => {
+                    rows.push(await ctx.createCalendarEvent(mailbox.uid, calendar.uid, { title: "Interview elsewhere", busyStatus: "free", ...at(-8, -7) }));
+                    rows.push(
+                        await ctx.createCalendarEvent(mailbox.uid, calendar.uid, {
+                            title: "Declined offsite",
+                            organizer: { address: BOSS, displayName: "Boss", type: RecipientType.TO },
+                            attendees: [guest(me, { responseStatus: AttendeeResponseStatus.DECLINED })],
+                            ...at(-6, -5),
+                        }),
+                    );
+                    // Back to back with each other and with the two events `invited()` adds at -2h..-1h.
+                    rows.push(await ctx.createCalendarEvent(mailbox.uid, calendar.uid, { title: "Standup", ...at(-4, -3) }));
+                    rows.push(await ctx.createCalendarEvent(mailbox.uid, calendar.uid, { title: "Review prep", ...at(-3, -2) }));
+                });
+
+                const shown = await other(request(ctx.app()).get(url));
+
+                expect(shown.status).toBe(200);
+                expect(shown.body.schedule).toEqual([
+                    {
+                        uid: expect.any(String),
+                        title: "",
+                        startDate: at(-4, -1).startDate.toISOString(),
+                        endDate: at(-4, -1).endDate.toISOString(),
+                        allDay: false,
+                        busy: true,
+                        tentative: false,
+                    },
+                ]);
+                expect(rows.map((row) => row.uid)).not.toContain(shown.body.schedule[0].uid);
+                expect(titles(await owner(request(ctx.app()).get(url)))).toEqual(["Declined offsite", "Interview elsewhere", "Review prep", "Standup", "Team lunch", "Termination meeting"]);
             });
 
             it("Gives a grantee of the Inbox alone no busy windows when the owner's free/busy doesn't show them to that grantee.", async () => {
@@ -539,7 +585,7 @@ export function calendarEventDialogSuite(ctx: CalendarEventDialogSuiteContext): 
                 const shown = await other(request(ctx.app()).get(await invited(["read", "list"], ["freebusy"], "shared")));
 
                 expect(shown.status).toBe(200);
-                expect(titles(shown)).toEqual(["", ""]);
+                expect(titles(shown)).toEqual([""]);
             });
 
             it("Shows a confidential event to a reader of the calendar without UPDATE as a busy block, and in full with UPDATE.", async () => {

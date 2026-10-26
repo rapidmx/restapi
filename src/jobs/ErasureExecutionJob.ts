@@ -443,7 +443,10 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
                 // Including draft bodies kept for a (since released) legal hold - erasure never runs under a hold.
                 await deleteSharedBlobs(this.messageClass, row, row.bodyBlobKey, row.sanitizedHtmlBlobKey, ...retainedBodyBlobKeysOf(row));
             },
-            removeFromIndex("message"),
+            async (row: any) => {
+                await removeFromIndex("message")(row);
+                await this.deleteResanitizedBlob(blobSources, row);
+            },
         );
         purgedCount += await this.purgeEntityType(
             this.contactClass,
@@ -634,6 +637,20 @@ export abstract class ErasureExecutionJob<T extends DataSubjectErasureRequest, M
                 .map((row) => row.name)
                 .sort();
         return { unloaded: names(false), removed: names(true) };
+    }
+
+    /**
+     * Deletes a purged message's sanitized HTML again once its row is gone, unless another row still names it. A reader that read the row
+     * before it was deleted may have written that blob back from the raw message meanwhile (`SanitizedBodyLoader`'s missing-blob rebuild,
+     * whose own check after the write still finds the row while it exists): whichever of the two deletes comes last removes it. Best
+     * effort - logged, never a failure of the purge, whose row is already gone.
+     */
+    private async deleteResanitizedBlob(blobSources: BlobReferenceSource[], row: any): Promise<void> {
+        try {
+            await deleteBlobsIfUnreferenced(this.blobStore!, blobSources, [row.sanitizedHtmlBlobKey]);
+        } catch (err: any) {
+            this.logger?.warn(`ErasureExecutionJob: failed to delete the sanitized body of purged message ${row.uid} again: ${err.message}`);
+        }
     }
 
     /** Purges every `mailboxUid`-matching row of one entity type - see `purgeByCriteria()`. */

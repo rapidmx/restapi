@@ -290,6 +290,8 @@ export class MeetingInviteSender {
      * personalized link - a keyed one with the attendee's key, and not at all to an attendee whose copy would be stored on this server
      * readable (`host.mayCarryMeetingKey`) - (their own `LOCATION`, and a line naming it in the body) from this event's `CalendarEventAttendeeLink`
      * rows - see this class's doc comment for why that lookup is generic and knows nothing of whichever plugin wrote those rows.
+     * A keyed copy asks for a headers-only bounce, so a bounce never brings the key back to the organizer's mailbox; through a
+     * transport that can't ask (`MailTransport.headersOnlyDsn`) it goes only when the organizer's copy of a bounce may carry it.
      * Every fallback here is graceful and per-attendee: a lookup that fails outright, one that returns nothing, and one that
      * returns rows for only some attendees all end in the same place - an attendee with no matching row gets the event's own
      * plain stored `location` and today's plain invite text, exactly what the shared path would have mailed them.
@@ -333,11 +335,22 @@ export class MeetingInviteSender {
         const organizerAddress: string = normalizeAddress(event.organizer.address);
 
         // Each attendee's own relay, through `sendOrThrow()` exactly like the shared path's fan-out - a transport
-        // that reports its one recipient as rejected still counts as a failure.
-        const relay = {
+        // that reports its one recipient as rejected still counts as a failure. A copy carrying a meeting key asks for a headers-only
+        // bounce (`dsnReturn`): it goes out from the organizer's own address, and a bounce returning the whole message (a mistyped or
+        // refused guest) would store the key in the organizer's mailbox, readable unless their mail is sealed.
+        const relay = (keyed: boolean) => ({
             name: this.mailTransport!.name,
-            send: async (outbound: OutboundMessage): Promise<TransportResult> => await sendOrThrow(this.mailTransport!, outbound),
-        };
+            send: async (outbound: OutboundMessage): Promise<TransportResult> =>
+                await sendOrThrow(this.mailTransport!, keyed ? { ...outbound, dsnReturn: "headers" } : outbound),
+        });
+        // A transport that can't ask for that sends a keyed copy only when the organizer's own copy of a bounce may carry the key -
+        // their mail is sealed, or they are elsewhere (`mayCarryMeetingKey`, which a keyed copy got this far only with). Asked once, and
+        // only for a keyed copy.
+        let bounceMayCarryKey: Promise<boolean> | undefined;
+        const keyedCopyMaySend = (): Promise<boolean> =>
+            this.mailTransport!.headersOnlyDsn === true
+                ? Promise.resolve(true)
+                : (bounceMayCarryKey ??= this.host!.mayCarryMeetingKey!(organizerAddress));
         // Identical for every copy - only the location and the body's link line differ per attendee.
         const from = organizer.displayName ? { name: organizer.displayName, address: event.organizer.address } : event.organizer.address;
         for (const to of recipients) {
@@ -355,6 +368,12 @@ export class MeetingInviteSender {
                 if (stored?.keyed && !(await this.host?.mayCarryMeetingKey?.(attendee))) {
                     this.logger?.warn(
                         `MeetingSchedulingJob: not sending the ${what} for event ${event.uid} to ${to}: their copy would be stored here readable, with their meeting link's key.`,
+                    );
+                    continue;
+                }
+                if (stored?.keyed && !(await keyedCopyMaySend())) {
+                    this.logger?.warn(
+                        `MeetingSchedulingJob: not sending the ${what} for event ${event.uid} to ${to}: a bounce of it would store their meeting link's key readable in the organizer's mailbox.`,
                     );
                     continue;
                 }
@@ -382,7 +401,7 @@ export class MeetingInviteSender {
                 })
                     .compile()
                     .build();
-                await scanAndRelay(composed, event.organizer.address, [to], this.scanPipeline!, relay, this.blobStore!);
+                await scanAndRelay(composed, event.organizer.address, [to], this.scanPipeline!, relay(!!stored?.keyed), this.blobStore!);
             } catch (err: any) {
                 this.logger?.warn(`MeetingSchedulingJob: failed to send ${what} for event ${event.uid} to ${to}: ${err.message}`);
             }

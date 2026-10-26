@@ -6,7 +6,7 @@ import { ModelUtils, type RepoUtils } from "@rapidrest/service-core";
 import type { EncryptionPreference, KeyDiscoveryResponse, KeyVault, Mailbox, PublicKey } from "../models/types.js";
 import { isOpenPgpKey } from "./OpenPgpKeyUtils.js";
 import { normalizeAddress, stripPlusTag } from "./AddressUtils.js";
-import { parseKeyDiscoveryAddress } from "./KeyDiscoveryClient.js";
+import { isPublishableKey, parseKeyDiscoveryAddress } from "./KeyDiscoveryClient.js";
 
 /** The all-defaults response served for a mailbox that either doesn't exist, or exists but has published
  * nothing - `specs/end-to-end_encryption.md` requires these to be byte-for-byte indistinguishable, since the public
@@ -52,7 +52,9 @@ export async function buildKeyDiscoveryResponse(
         return NOT_PUBLISHED_RESPONSE;
     }
     const escrow: boolean = !!vaults[0]?.masterKeyWraps.some((w) => w.method === "escrow");
-    const published: PublicKey[] = (mailbox.keys ?? []).filter((key) => includeOpenPgp || !isOpenPgpKey(key));
+    // A key no peer would accept (an OpenPGP certificate enrolled before enrollment bounded its size) is left out: listed, it would make
+    // the whole answer malformed to every peer, and hide the mailbox's other keys with it.
+    const published: PublicKey[] = (mailbox.keys ?? []).filter((key) => (includeOpenPgp || !isOpenPgpKey(key)) && isPublishableKey(key));
     const active = (key: PublicKey): boolean => key.revokedAt === undefined && key.notAfter > now;
     const retiredAt = (key: PublicKey): number => key.revokedAt ?? key.notAfter;
     const retired: PublicKey[] = published

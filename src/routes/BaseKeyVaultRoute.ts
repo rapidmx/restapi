@@ -44,6 +44,7 @@ import { activeZeroAccessKey, settleZeroAccessTypes } from "../util/ZeroAccessUt
 import { canonicalUserUid, zeroAccessMembers } from "../zeroaccess/ZeroAccessResolver.js";
 import { isSealedToCertificate } from "../zeroaccess/ZeroAccessSealer.js";
 import { isOpenPgpKey, OPENPGP_KEY_TYPE, parseOpenPgpContactKey } from "../util/OpenPgpKeyUtils.js";
+import { MAX_PUBLIC_KEY_BASE64_LENGTH } from "../util/KeyDiscoveryClient.js";
 import { OPENPGP_ALLOWED_CONFIG, OpenPgpPolicy } from "../util/OpenPgpPolicy.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Transactional } = DatabaseDecorators;
@@ -668,6 +669,15 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
                 throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "OpenPGP keys are disabled on this server.");
             }
             publicKey = await parseOpenPgpContactKey(body.publicKey, mailbox.primarySmtpAddress);
+            // Published as it is (discovery, `Autocrypt`), so no larger than a peer accepts: one key over the bound makes every discovery
+            // answer for the mailbox malformed to its peers, its S/MIME keys' included - and an enrolled key is never removed.
+            if (publicKey.publicKey.length > MAX_PUBLIC_KEY_BASE64_LENGTH) {
+                throw new ApiError(
+                    ApiErrors.INVALID_REQUEST,
+                    400,
+                    "This OpenPGP key is too large to publish; export it without third-party certifications or photo IDs and enroll it again.",
+                );
+            }
             fingerprint = publicKey.fingerprint;
         } else if (body.useType === "encrypt") {
             if (!body.csr) {

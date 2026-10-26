@@ -467,6 +467,65 @@ describe("ErasureExecutionJobSQL Tests (real DB + DI)", () => {
         expect(entries).toHaveLength(0);
     });
 
+    it.each([false, true])(
+        "Deletes a purged message's sanitized HTML again once its row is gone, so a re-sanitize that wrote it back mid-purge leaves nothing (round 7, #710; that delete failing: %s).",
+        async (secondDeleteFails) => {
+            const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const mailbox = await createMailbox();
+            const folder = await folderRepo.save(new FolderSQL({ mailboxUid: mailbox.uid, name: "Inbox" }));
+            const bodyBlobKey = `bodies/${uuid.v4()}`;
+            const sanitizedHtmlBlobKey = `sanitized/${uuid.v4()}`;
+            await blobStore.put(bodyBlobKey, Buffer.from("Subject: hi\r\n\r\n<p>html</p>"));
+            await blobStore.put(sanitizedHtmlBlobKey, Buffer.from("<p>html</p>"));
+            await messageRepo.save(
+                new MessageSQL({
+                    mailboxUid: mailbox.uid,
+                    folderUid: folder.uid,
+                    messageId: `${uuid.v4()}@example.com`,
+                    subject: "Rendered",
+                    from: { address: "alice@example.com", type: RecipientType.TO },
+                    recipients: [],
+                    sentDate: new Date(),
+                    receivedDate: new Date(),
+                    bodyBlobKey,
+                    sanitizedHtmlBlobKey,
+                    flags: { read: false, flagged: false, answered: false, forwarded: false },
+                    references: [],
+                    hasAttachments: false,
+                }),
+            );
+            const request = await createRequest({ mailboxUid: mailbox.uid });
+            const warn = vi.spyOn((job as any).logger, "warn");
+            const remove = blobStore.delete.bind(blobStore);
+            let deletes = 0;
+            const spy = vi.spyOn(blobStore, "delete").mockImplementation(async (key: string) => {
+                if (key !== sanitizedHtmlBlobKey) {
+                    return await remove(key);
+                }
+                deletes++;
+                if (deletes === 2 && secondDeleteFails) {
+                    throw new Error("store down");
+                }
+                await remove(key);
+                if (deletes === 1) {
+                    // A reader's missing-blob rebuild, landing after the blob went and before the row does.
+                    await blobStore.put(sanitizedHtmlBlobKey, Buffer.from("<p>html again</p>"));
+                }
+            });
+
+            await job.run();
+            spy.mockRestore();
+
+            expect(deletes).toBe(2);
+            expect((await requestRepo.findOne({ where: { uid: request.uid } }))!.status).toBe("completed");
+            expect(await blobStore.exists(sanitizedHtmlBlobKey)).toBe(secondDeleteFails);
+            if (secondDeleteFails) {
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("failed to delete the sanitized body of purged message"));
+            }
+            warn.mockRestore();
+        },
+    );
+
     it("Skips deleting a sanitizedHtmlBlobKey/extractedTextBlobKey that was never set.", async () => {
         const mailbox = await createMailbox();
         const folder = await folderRepo.save(new FolderSQL({ mailboxUid: mailbox.uid, name: "Inbox" }));

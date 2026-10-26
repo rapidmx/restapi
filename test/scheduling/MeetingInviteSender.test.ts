@@ -8,6 +8,12 @@ import { describe, expect, it, vi } from "vitest";
 import { CalendarEventStatus } from "../../src/models/types.js";
 import { invitationsPending, MeetingInviteSender, meetingLinkSecretsOf, protectedInvitationsPending } from "../../src/scheduling/MeetingInviteSender.js";
 
+// No scan here: a copy goes straight to the relay `sendPerAttendee()` hands over, which is what these tests look at.
+vi.mock("../../src/util/MailSendUtils.js", async (importOriginal) => ({
+    ...(await importOriginal<any>()),
+    scanAndRelay: vi.fn(async (raw: Buffer, envelopeFrom: string, envelopeTo: string[], _scan: unknown, relay: any) => await relay.send({ raw, envelopeFrom, envelopeTo })),
+}));
+
 const KEY = "k=" + "A".repeat(20);
 
 function event(fields: any = {}): any {
@@ -122,5 +128,48 @@ describe("MeetingInviteSender (isolated)", () => {
         await instance.sendToAttendees(event({ videoMeetingUid: "vm" }), { addresses: new Set(["owner@example.com"]) }, "request", { "other@example.org": KEY });
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("no key for their meeting link"));
         expect(transport.send).not.toHaveBeenCalled();
+    });
+
+    it("asks for a headers-only bounce of a keyed copy, and without a transport that can, sends one only when the organizer's mail would seal it (round 7, #705)", async () => {
+        const link = { attendeeAddress: "bob@example.org", url: "https://meet.example/j/1", keyed: true };
+        const build = (headersOnlyDsn: boolean | undefined, organizerSeals: boolean) => {
+            const logger = { warn: vi.fn(), error: vi.fn() };
+            const linkRepo = { count: vi.fn(), find: vi.fn().mockResolvedValue([link]) };
+            const mayCarryMeetingKey = vi.fn(async (address: string) => address === "bob@example.org" || organizerSeals);
+            const instance = new MeetingInviteSender(undefined, linkRepo as any, { logger, mayCarryMeetingKey });
+            const transport = { name: "test", headersOnlyDsn, send: vi.fn(async (outbound: any) => ({ accepted: outbound.envelopeTo, rejected: [] })) };
+            Object.assign(instance as any, { mailTransport: transport, scanPipeline: {}, blobStore: {} });
+            return { instance, logger, transport, mayCarryMeetingKey };
+        };
+        const send = async (built: ReturnType<typeof build>) =>
+            await built.instance.sendToAttendees(event({ videoMeetingUid: "vm" }), { addresses: new Set(["owner@example.com"]) }, "request", { "bob@example.org": KEY });
+
+        // Postfix: `-R hdrs`, whatever the organizer's mailbox stores.
+        const postfix = build(true, false);
+        await send(postfix);
+        expect(postfix.transport.send).toHaveBeenCalledTimes(1);
+        expect(postfix.transport.send.mock.calls[0][0]).toMatchObject({ envelopeFrom: "owner@example.com", envelopeTo: ["bob@example.org"], dsnReturn: "headers" });
+        expect(postfix.mayCarryMeetingKey).not.toHaveBeenCalledWith("owner@example.com");
+
+        // A transport that can't ask for it: not sent to an organizer whose mail is stored readable...
+        const readable = build(undefined, false);
+        await send(readable);
+        expect(readable.mayCarryMeetingKey).toHaveBeenCalledWith("owner@example.com");
+        expect(readable.logger.warn).toHaveBeenCalledWith(expect.stringContaining("a bounce of it would store their meeting link's key"));
+        expect(readable.transport.send).not.toHaveBeenCalled();
+
+        // ...and sent to one whose mail is sealed, still asking.
+        const sealed = build(undefined, true);
+        await send(sealed);
+        expect(sealed.transport.send).toHaveBeenCalledTimes(1);
+        expect(sealed.transport.send.mock.calls[0][0].dsnReturn).toBe("headers");
+
+        // An unkeyed link asks for nothing.
+        const plain = build(undefined, false);
+        (plain.instance as any).attendeeLinkRepo.find.mockResolvedValue([{ ...link, keyed: false }]);
+        await send(plain);
+        expect(plain.transport.send).toHaveBeenCalledTimes(1);
+        expect(plain.transport.send.mock.calls[0][0]).not.toHaveProperty("dsnReturn");
+        expect(plain.mayCarryMeetingKey).not.toHaveBeenCalled();
     });
 });

@@ -1321,8 +1321,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // webmail compose UI, or an EAS/MAPI "send" handler, before this endpoint is called) — this route's
         // job is scanning and relay, not MIME composition. Its originator headers are checked before a scheduled send
         // is queued too - `ScheduledSendJob` relays these same bytes.
-        let raw: Buffer = await this.blobStore.get(message.bodyBlobKey);
-        await this.assertSenderAllowed(sendingMailbox, message, raw);
+        const storedRaw: Buffer = await this.blobStore.get(message.bodyBlobKey);
+        await this.assertSenderAllowed(sendingMailbox, message, storedRaw);
 
         // The reply's own RFC 5322 threading headers, from the `inReplyTo`/`references` the draft records (a
         // compose client sets them when it opens a reply; `SERVER_MANAGED_MESSAGE_FIELDS` deliberately doesn't
@@ -1332,14 +1332,12 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         // conversation, and so does this mailbox's own Sent Items copy. MIME that already carries threading
         // headers (a client that composed its own, `assemble-raw` included) is left exactly as it is.
         //
-        // Persisted onto the draft's body blob here - before the claim, and before a scheduled send is queued -
-        // so these are the bytes `ScheduledSendJob` later relays and the bytes a client reading the message's
-        // raw source sees.
-        const threadedRaw: Buffer = applyThreadHeaders(raw, message);
-        if (threadedRaw !== raw) {
-            await this.blobStore.put(message.bodyBlobKey, threadedRaw, { contentType: "message/rfc822" });
-            raw = threadedRaw;
-        }
+        // Applied in memory only, and stored once the claim below has won (`fileSentMessage()`): written over the draft's body before its
+        // version-checked claim, it could bring back a key a concurrent writer that won first (a sealing autosave, the zero-access
+        // backfill) had just deleted, as plaintext no row names. A scheduled or background send stores nothing here either:
+        // `ScheduledSendJob` applies the same headers to what it relays and stores them with it.
+        const threadedRaw: Buffer = applyThreadHeaders(storedRaw, message);
+        let raw: Buffer = threadedRaw;
 
         // "Do not deliver before" (`PR_DEFERRED_SEND_TIME`) - a future `scheduledSendTime` defers relay instead of
         // sending now. The message sits in the mailbox's Outbox folder until `ScheduledSendJob` relays it; moving it
@@ -1447,7 +1445,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             // The Sent Items copy joins the conversation the message it replies to is already in, rather than
             // starting one keyed on whichever ancestor its own headers happen to name - see `resolveConversationId()`.
             conversationId = await this.threadConversationId(message.mailboxUid, references, inReplyTo, messageId);
-            return await this.fileSentMessage(message, claimed, user, raw, relayedRaw, attachesReceiptRequest, envelopeTo, {
+            return await this.fileSentMessage(message, claimed, user, raw, relayedRaw, threadedRaw !== storedRaw ? threadedRaw : undefined, attachesReceiptRequest, envelopeTo, {
                 messageId,
                 conversationId,
                 inReplyTo,
@@ -1531,6 +1529,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         user: JWTUser | undefined,
         raw: Buffer,
         relayedRaw: Buffer,
+        threadedRaw: Buffer | undefined,
         attachesReceiptRequest: boolean,
         envelopeTo: string[],
         relay: {
@@ -1561,6 +1560,10 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             // bytes so a later read (and any future `recall()` of this very message) sees the same header it
             // was actually relayed with.
             await this.blobStore!.put(message.bodyBlobKey, relayedRaw, { contentType: "message/rfc822" });
+        } else if (threadedRaw) {
+            // The threading headers `send()` added, stored only now that its claim holds the row: no writer that could delete this key
+            // (a sealing save, the backfill) can win against the claim.
+            await this.blobStore!.put(message.bodyBlobKey, threadedRaw, { contentType: "message/rfc822" });
         }
 
         const folderRepo: RecoverableRepoUtils<any> = this.folderRepo!;

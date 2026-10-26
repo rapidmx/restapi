@@ -118,6 +118,17 @@ describe("ZeroAccessWriter", () => {
         // A failed removal still reports the filing's own error.
         blobStore.delete.mockRejectedValueOnce(new Error("blob store down"));
         await expect(w.sealDraft(mailbox, Buffer.from("Subject: hi\r\n\r\nbody"), "d2", new Date())).rejects.toThrow("db down");
+
+        // A uid minted for this one filing (an EAS or MAPI send's Sent Items copy): no other filing can name its key, so it goes
+        // (round 7, #701) - unless an earlier attempt stored it, which this call didn't write.
+        blobStore.delete.mockClear();
+        await expect(w.sealRaw(mailbox, Buffer.from("Subject: hi\r\n\r\nbody"), "fresh-1", new Date(), { freshMessageUid: true })).rejects.toThrow("db down");
+        expect(blobStore.delete).toHaveBeenCalledWith("za/mbx/fresh-1");
+        expect(blobs.has("za/mbx/fresh-1")).toBe(false);
+        blobStore.delete.mockClear();
+        await expect(w.sealRaw(mailbox, Buffer.from("Subject: hi\r\n\r\nbody"), "m1", new Date(), { freshMessageUid: true })).rejects.toThrow("db down");
+        expect(blobStore.delete).not.toHaveBeenCalled();
+        expect(blobs.has("za/mbx/m1")).toBe(true);
     });
 
     it("never deletes the sealed blob two filings of the same message stored at the same time, and both succeed (round 6, #601, #607)", async () => {
@@ -307,6 +318,43 @@ describe("ZeroAccessWriter", () => {
         expect(deleted).toEqual(expect.arrayContaining(["bodies/d1", "attachment-text/a1", "attachment-text/a4-late"]));
         expect(deleted).not.toContain("attachment-text/a2");
         expect(deleted).not.toContain("attachments/a1");
+    });
+
+    it("purges a sealed message's attachment rows only after clearing their text with a version-checked write, so a stamp landing meanwhile is deleted too (round 7, #703)", async () => {
+        const blobStore = { delete: vi.fn() };
+        const w = writer({ blobStore });
+        const rows = [
+            { uid: "a1", version: 1, blobKey: "attachments/a1", extractedTextBlobKey: "attachment-text/a1" },
+            // The extraction's stamp lands after the page was read: the write loses, the row is read again, and its text goes too.
+            { uid: "a2", version: 1, blobKey: "attachments/a2" },
+        ];
+        let a2Stamped = false;
+        const attachmentRepo = {
+            find: vi.fn(async (query: any) => (query.uid ? [] : rows)),
+            findOne: vi.fn(async () => ({ uid: "a2", version: 2, blobKey: "attachments/a2", extractedTextBlobKey: "attachment-text/a2-late" })),
+            update: vi.fn(async (patch: any) => {
+                if (patch.uid === "a2" && !a2Stamped) {
+                    a2Stamped = true;
+                    throw new Error("version");
+                }
+                return patch;
+            }),
+            delete: vi.fn(),
+            count: vi.fn().mockResolvedValue(0),
+        };
+        await w.discardPlaintext({ attachmentRepo } as any, "m1", ["bodies/m1"]);
+        expect(attachmentRepo.update.mock.calls.map((call: any[]) => call[0])).toEqual([
+            { uid: "a1", version: 1, extractedTextBlobKey: null },
+            { uid: "a2", version: 1, extractedTextBlobKey: null },
+            { uid: "a2", version: 2, extractedTextBlobKey: null },
+        ]);
+        // Each row is purged after its write.
+        expect(attachmentRepo.delete.mock.calls.map((call: any[]) => call[0])).toEqual(["a1", "a2"]);
+        expect(attachmentRepo.update.mock.invocationCallOrder[0]).toBeLessThan(attachmentRepo.delete.mock.invocationCallOrder[0]);
+        const deleted = blobStore.delete.mock.calls.map((call: any[]) => call[0]);
+        expect(deleted).toEqual(
+            expect.arrayContaining(["bodies/m1", "attachments/a1", "attachment-text/a1", "attachments/a2", "attachment-text/a2-late"]),
+        );
     });
 
     it("discards plaintext blobs without an attachment repo too", async () => {

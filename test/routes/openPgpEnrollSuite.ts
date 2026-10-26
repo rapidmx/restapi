@@ -8,6 +8,7 @@ import { request } from "@rapidrest/service-core/test";
 import * as uuid from "uuid";
 import { generateTestCsr } from "../testDoubles.js";
 import { openPgpKey } from "../openPgpTestKeys.js";
+import { MAX_PUBLIC_KEY_BASE64_LENGTH } from "../../src/util/KeyDiscoveryClient.js";
 
 export interface OpenPgpEnrollSuiteContext {
     app: () => any;
@@ -68,6 +69,20 @@ export function openPgpEnrollSuite(ctx: OpenPgpEnrollSuiteContext): void {
             await ctx.setOpenPgpAllowed(false);
             const refused = await enroll(mailbox, owner, { useType: "encrypt", type: "openpgp", publicKey: own.armored, wrappedKey });
             expect(refused.status).toBe(403);
+            expect((await ctx.findMailbox(mailbox.uid)).keys ?? []).toEqual([]);
+        });
+
+        it("refuses a key too large for a peer to accept from discovery, which would hide the mailbox's other keys (round 7, #708)", async () => {
+            const owner = uuid.v4();
+            const mailbox = await ctx.createMailbox({ ownerUserUid: owner });
+            const aliases: string[] = Array.from({ length: 40 }, (_unused, i) => `alias-${i}-${"x".repeat(40)}@example.org`);
+            const large = await openPgpKey(mailbox.primarySmtpAddress, { aliases });
+            expect(large.base64.length).toBeGreaterThan(MAX_PUBLIC_KEY_BASE64_LENGTH);
+
+            const refused = await enroll(mailbox, owner, { useType: "encrypt", type: "openpgp", publicKey: large.armored, wrappedKey });
+
+            expect(refused.status).toBe(400);
+            expect(refused.body.message).toContain("too large");
             expect((await ctx.findMailbox(mailbox.uid)).keys ?? []).toEqual([]);
         });
     });

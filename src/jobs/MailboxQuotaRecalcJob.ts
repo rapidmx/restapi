@@ -247,11 +247,22 @@ export abstract class MailboxQuotaRecalcJob<MB extends Mailbox, M extends Messag
         }
     }
 
-    /** One message's stored body size, `undefined` (logged) when the blob store can't say - see `recalcMailbox()`. */
+    /**
+     * One message's stored body size, `undefined` (logged) when the blob store can't say - see `recalcMailbox()`. A body the store says
+     * for certain is gone (`exists()` false: a purge that deleted the blob and failed before the row, a lost blob) takes no space, `0`:
+     * counted as unsized, one such row would keep the mailbox's figure from ever going down. A store that can't tell is not "gone".
+     */
     private async bodySize(message: M): Promise<number | undefined> {
+        if (!message.bodyBlobKey) {
+            return 0;
+        }
         try {
             return await this.blobStore!.size(message.bodyBlobKey);
         } catch (err: any) {
+            if (!(await this.blobStore!.exists(message.bodyBlobKey).catch(() => true))) {
+                this.logger?.warn(`MailboxQuotaRecalcJob: body blob ${message.bodyBlobKey} of message ${message.uid} is gone; counted as no space.`);
+                return 0;
+            }
             this.logger?.warn(`MailboxQuotaRecalcJob: failed to size body blob ${message.bodyBlobKey} for message ${message.uid}: ${err.message}`);
             return undefined;
         }

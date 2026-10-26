@@ -428,8 +428,8 @@ describe("fileDeliveryFailureNotice()", () => {
         await expect(fileDeliveryFailureNotice(sink, input())).rejects.toThrow("datastore down");
     });
 
-    it("Files the notice sealed for a zero-access mailbox, keeping no readable copy, and removes what it sealed when it can't be filed.", async () => {
-        const sealed = { subject: "[...]", bodyPreview: "", bodyBlobKey: "za/mailbox-1/n", zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" }, indexEntryUid: "ix" };
+    it("Files the notice sealed for a zero-access mailbox under a key fresh to the filing, keeping no readable copy, and removes only that key when it can't be filed.", async () => {
+        const sealed = { subject: "[...]", bodyPreview: "", bodyBlobKey: "za/mailbox-1/notices/n", zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" }, indexEntryUid: "ix" };
         const zeroAccessWriter = { sealRaw: vi.fn().mockResolvedValue(sealed), removeIndexEntry: vi.fn().mockResolvedValue(undefined) };
         const mailbox = { uid: "mailbox-1", zeroAccessKeys: [] } as any;
         const uid = deliveryFailureUid("mailbox-1", "send-partial:message-1");
@@ -437,15 +437,33 @@ describe("fileDeliveryFailureNotice()", () => {
 
         const message = await fileDeliveryFailureNotice({ ...sink, zeroAccessWriter }, input({ mailbox }));
 
-        expect(zeroAccessWriter.sealRaw).toHaveBeenCalledWith(mailbox, expect.any(Buffer), uid, expect.any(Date));
+        expect(zeroAccessWriter.sealRaw).toHaveBeenCalledWith(mailbox, expect.any(Buffer), uid, expect.any(Date), {
+            blobKey: expect.stringMatching(/^za\/mailbox-1\/notices\/[0-9a-f-]{36}$/),
+        });
         expect(zeroAccessWriter.sealRaw.mock.calls[0][1].toString()).toContain("Undeliverable: Q3 plan");
-        expect(message.fields).toMatchObject({ subject: "[...]", bodyPreview: "", bodyBlobKey: "za/mailbox-1/n", zeroAccess: sealed.zeroAccess });
+        expect(message.fields).toMatchObject({ subject: "[...]", bodyPreview: "", bodyBlobKey: "za/mailbox-1/notices/n", zeroAccess: sealed.zeroAccess });
         expect(await blobStore.exists(`notices/${uid}`)).toBe(false);
 
+        // Another filing's key each time: a concurrent filer of the same failure never names this one.
         messageRepo.create.mockRejectedValueOnce(new Error("datastore down"));
         await expect(fileDeliveryFailureNotice({ ...sink, zeroAccessWriter }, input({ mailbox }))).rejects.toThrow("datastore down");
-        expect(zeroAccessWriter.removeIndexEntry).toHaveBeenCalledWith("ix");
+        expect(zeroAccessWriter.sealRaw.mock.calls[1][4].blobKey).not.toBe(zeroAccessWriter.sealRaw.mock.calls[0][4].blobKey);
         expect(await blobStore.exists(sealed.bodyBlobKey)).toBe(false);
+        // The index entry is keyed by the notice's uid, which a concurrent filer shares: it stays.
+        expect(zeroAccessWriter.removeIndexEntry).not.toHaveBeenCalled();
+
+        // Lost to a concurrent filer: this filing's own copy goes as well, and nothing is filed.
+        await blobStore.put(sealed.bodyBlobKey, Buffer.from("sealed"));
+        messageRepo.findOne.mockResolvedValueOnce(undefined).mockResolvedValueOnce({ uid });
+        messageRepo.create.mockRejectedValueOnce(new Error("duplicate key"));
+        expect(await fileDeliveryFailureNotice({ ...sink, zeroAccessWriter }, input({ mailbox }))).toBeUndefined();
+        expect(await blobStore.exists(sealed.bodyBlobKey)).toBe(false);
+
+        // A store that can't delete it doesn't hide the create's error.
+        const failingDelete = vi.spyOn(blobStore, "delete").mockRejectedValueOnce(new Error("store down"));
+        messageRepo.create.mockRejectedValueOnce(new Error("datastore down"));
+        await expect(fileDeliveryFailureNotice({ ...sink, zeroAccessWriter }, input({ mailbox }))).rejects.toThrow("datastore down");
+        failingDelete.mockRestore();
 
         // Not active for the mailbox: filed readable as before.
         zeroAccessWriter.sealRaw.mockResolvedValueOnce(undefined);

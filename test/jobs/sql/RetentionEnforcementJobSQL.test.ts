@@ -254,6 +254,47 @@ describe("RetentionEnforcementJobSQL Tests (real DB + DI)", () => {
         expect(await blobStore.exists(extractedTextBlobKey)).toBe(false);
     });
 
+    it.each([false, true])(
+        "Deletes a purged message's sanitized HTML again once its row is gone, so a re-sanitize that wrote it back mid-purge leaves nothing (round 7, #710; that delete failing: %s).",
+        async (secondDeleteFails) => {
+            await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", messageRetentionDays: 30 }));
+            const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+            const bodyBlobKey = `bodies/${uuid.v4()}`;
+            const sanitizedHtmlBlobKey = `sanitized/${uuid.v4()}`;
+            await blobStore.put(bodyBlobKey, Buffer.from("raw"));
+            await blobStore.put(sanitizedHtmlBlobKey, Buffer.from("<p>html</p>"));
+            const old = await createMessage({ sentDate: new Date(Date.now() - 35 * DAY_MS), bodyBlobKey, sanitizedHtmlBlobKey, hasAttachments: false });
+            const warn = vi.spyOn((job as any).logger, "warn");
+            const remove = blobStore.delete.bind(blobStore);
+            let deletes = 0;
+            const spy = vi.spyOn(blobStore, "delete").mockImplementation(async (key: string) => {
+                if (key !== sanitizedHtmlBlobKey) {
+                    return await remove(key);
+                }
+                deletes++;
+                if (deletes === 2 && secondDeleteFails) {
+                    throw new Error("store down");
+                }
+                await remove(key);
+                if (deletes === 1) {
+                    // A reader's missing-blob rebuild, landing after the blob went and before the row does.
+                    await blobStore.put(sanitizedHtmlBlobKey, Buffer.from("<p>html again</p>"));
+                }
+            });
+
+            await job.run();
+            spy.mockRestore();
+
+            expect(deletes).toBe(2);
+            expect(await messageRepo.findOne({ where: { uid: old.uid } })).toBeFalsy();
+            expect(await blobStore.exists(sanitizedHtmlBlobKey)).toBe(secondDeleteFails);
+            if (secondDeleteFails) {
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("failed to delete the sanitized body of purged message"));
+            }
+            warn.mockRestore();
+        },
+    );
+
     it("Skips deleting a sanitizedHtmlBlobKey/extractedTextBlobKey that was never set, and still purges an attachment with no extractedTextBlobKey.", async () => {
         await retentionPolicyRepo.save(new RetentionPolicySQL({ uid: "retention-policy", messageRetentionDays: 30 }));
         const blobStore = objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;

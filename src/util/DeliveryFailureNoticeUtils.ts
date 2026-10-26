@@ -358,7 +358,12 @@ export async function fileDeliveryFailureNotice(sink: DeliveryNoticeSink, input:
     }
     const notice: DeliveryFailureNotice = await buildDeliveryFailureNotice(input);
     const now: Date = input.now ?? new Date();
-    const sealed: ZeroAccessSealedFields | undefined = input.mailbox ? await sink.zeroAccessWriter?.sealRaw(input.mailbox, notice.raw, uid, now) : undefined;
+    // Sealed under a key fresh to this filing, not the notice's own `zeroAccessBlobKey()`: the uid is derived, so a concurrent filer of the
+    // same failure shares that key, and neither could remove a sealed copy its filing failed to name without the risk of taking the one the
+    // other's row names. A fresh key is this filing's alone - `seal()` removes it when sealing fails, and the catch below when filing does.
+    const sealed: ZeroAccessSealedFields | undefined = input.mailbox
+        ? await sink.zeroAccessWriter?.sealRaw(input.mailbox, notice.raw, uid, now, { blobKey: `za/${input.mailbox.uid}/notices/${crypto.randomUUID()}` })
+        : undefined;
     const bodyBlobKey: string = sealed ? sealed.bodyBlobKey : `notices/${uid}`;
     if (!sealed) {
         await sink.blobStore.put(bodyBlobKey, notice.raw, { contentType: "message/rfc822" });
@@ -394,14 +399,15 @@ export async function fileDeliveryFailureNotice(sink: DeliveryNoticeSink, input:
             { ignoreACL: true },
         );
     } catch (err) {
-        // A concurrent filer of the same failure won the uid (and shares the sealed blob and index entry, both keyed by it).
+        if (sealed) {
+            // This filing's own sealed copy, which no row names: a concurrent filer's row names its own. Best effort - the create's error
+            // is the one reported. The index entry stays: keyed by the notice's uid, it is shared with a concurrent filer, whose row may be
+            // about to be created, and the next attempt reuses it.
+            await sink.blobStore.delete(sealed.bodyBlobKey).catch(() => undefined);
+        }
+        // A concurrent filer of the same failure won the uid.
         if (await sink.messageRepo.findOne(uid, { ignoreACL: true, includeDeleted: true })) {
             return undefined;
-        }
-        if (sealed) {
-            // Nothing is left pointing at a message that doesn't exist.
-            await sink.zeroAccessWriter!.removeIndexEntry(sealed.indexEntryUid);
-            await sink.blobStore.delete(sealed.bodyBlobKey);
         }
         throw err;
     }

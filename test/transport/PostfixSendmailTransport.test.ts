@@ -56,6 +56,18 @@ describe("PostfixSendmailTransport Tests", () => {
         expect(mockCreateTransport.mock.lastCall![0]).not.toHaveProperty("args");
     });
 
+    it("Asks for headers-only bounces (-R hdrs) for a message that needs them, naming its sender itself (round 7, #705).", async () => {
+        sendMail.mockResolvedValue({ accepted: ["b@x.com"], rejected: [], messageId: "<abc@x.com>" });
+        expect(transport.headersOnlyDsn).toBe(true);
+
+        const message = makeMessage({ dsnReturn: "headers" });
+        await transport.send(message);
+        expect(mockCreateTransport).toHaveBeenLastCalledWith(expect.objectContaining({ args: ["-f", message.envelopeFrom, "-R", "hdrs"] }));
+
+        await transport.send(makeMessage({ envelopeFrom: "", dsnReturn: "headers" }));
+        expect(mockCreateTransport).toHaveBeenLastCalledWith(expect.objectContaining({ args: ["-f", "<>", "-R", "hdrs"] }));
+    });
+
     it("Passes the envelope and raw source to sendMail.", async () => {
         sendMail.mockResolvedValue({ accepted: ["b@x.com"], rejected: [], messageId: "<abc@x.com>" });
         const message = makeMessage();

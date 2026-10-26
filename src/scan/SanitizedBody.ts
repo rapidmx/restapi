@@ -22,7 +22,9 @@ const { Config, Inject, Logger } = ObjectDecorators;
  * run per blob; in another: the same result) write the same bytes, and a blob store replaces atomically - a reader sees the old blob
  * or the new one, never a mix. The blob is only rewritten while it still exists, so a message erased meanwhile is not brought back, and
  * once rewritten it is deleted again unless the message still names it (`SanitizedBodySource.stillNamed`): zero-access sealing, a send's
- * discard and an erasure all change the row before they delete the blob, so whichever of the two deletes comes last removes it. That
+ * discard and a user's purge change (or delete) the row before they delete the blob, so whichever of the two deletes comes last removes
+ * it. An erasure (`ErasureExecutionJob`) and a retention purge (`RetentionEnforcementJob`) delete the blob first, so a failure leaves the
+ * row to retry, and delete it once more after the row is gone - the same "last delete wins" then holds. That
  * delete keeps a key another message still names (`SanitizedBodySource.discard` - a mail-filter-rule copy shares its original's), and
  * when the check itself fails the blob is deleted all the same - it may be plaintext of a message sealed meanwhile - but this reader is
  * still served what was rewritten.

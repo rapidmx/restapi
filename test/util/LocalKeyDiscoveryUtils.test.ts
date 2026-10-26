@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { buildKeyDiscoveryResponse, discoverLocalKeys, NOT_PUBLISHED_RESPONSE, type LocalKeyDiscovery } from "../../src/util/LocalKeyDiscoveryUtils.js";
 import { discoverAndMergeKeys } from "../../src/util/KeyringUtils.js";
+import { MAX_ISSUER_CERTIFICATE_BASE64_LENGTH, MAX_PUBLIC_KEY_BASE64_LENGTH, parseKeyDiscoveryResponse } from "../../src/util/KeyDiscoveryClient.js";
 import { issueCertificate, makeTestIssuer } from "./signerCertificates.js";
 import type { StaticDnsResolver } from "../testDoubles.js";
 
@@ -68,9 +69,23 @@ describe("LocalKeyDiscoveryUtils", () => {
             expect((await buildKeyDiscoveryResponse(vaults as any, box as any, false, now)).keys.map((k) => k.fingerprint)).toEqual(["current", "expired", "retired"]);
         });
 
+        it("leaves out a stored key no peer would accept, so the answer stays well formed and its other keys discoverable (round 7, #708)", async () => {
+            const vaults = fakeRepo([]);
+            const keys = [
+                { publicKey: "A".repeat(MAX_PUBLIC_KEY_BASE64_LENGTH + 4), type: "openpgp", useType: "encrypt", fingerprint: "huge", notBefore: 0, notAfter: 5_000 },
+                { publicKey: "b", type: "x509", useType: "encrypt", fingerprint: "smime", notBefore: 0, notAfter: 5_000, issuerCertificate: "C".repeat(MAX_ISSUER_CERTIFICATE_BASE64_LENGTH + 4) },
+                { publicKey: "d", type: "x509", useType: "encrypt", fingerprint: "current", notBefore: 0, notAfter: 5_000 },
+            ];
+
+            const response = await buildKeyDiscoveryResponse(vaults as any, { uid: "m", primarySmtpAddress: "bob@example.com", keys } as any, true, 1_000);
+
+            expect(response.keys.map((k) => k.fingerprint)).toEqual(["current"]);
+            expect(parseKeyDiscoveryResponse(response)?.keys.map((k) => k.fingerprint)).toEqual(["current"]);
+        });
+
         it("keeps the most recently retired key within what a peer reads, however many older ones are stored", async () => {
             const now = 1_000_000;
-            const key = (fingerprint: string, fields: Record<string, any> = {}) => ({ publicKey: fingerprint, type: "x509", useType: "encrypt", fingerprint, notBefore: 0, notAfter: now * 10, ...fields });
+            const key = (fingerprint: string, fields: Record<string, any> = {}) => ({ publicKey: Buffer.from(fingerprint).toString("base64"), type: "x509", useType: "encrypt", fingerprint, notBefore: 0, notAfter: now * 10, ...fields });
             const keys = [
                 ...Array.from({ length: 6 }, (_, i) => key(`old-${i}`, { revokedAt: 100 + i, revocationReason: "superseded" })),
                 key("expired", { notAfter: 50 }),

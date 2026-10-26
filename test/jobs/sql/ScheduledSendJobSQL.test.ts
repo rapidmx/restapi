@@ -209,6 +209,56 @@ describe("ScheduledSendJobSQL Tests (real DB + DI)", () => {
         expect(updated.flags.read).toBe(true);
     });
 
+    it("Relays a queued reply with the threading headers its draft records, and stores them with what it relayed (round 7, #702).", async () => {
+        const bodyBlobKey = await putBody("From: owner@example.com\r\nTo: recipient@example.com\r\nSubject: Re: Hello\r\n\r\nReply body.\r\n");
+        await createMessage({
+            bodyBlobKey,
+            inReplyTo: "parent@example.com",
+            references: ["root@example.com"],
+            scheduledSendTime: new Date(Date.now() - 60 * 1000),
+        });
+
+        await job.run();
+
+        const relayed: string = transport().sent[transport().sent.length - 1].raw.toString();
+        expect(relayed).toContain("In-Reply-To: <parent@example.com>");
+        expect(relayed).toContain("References: <root@example.com> <parent@example.com>");
+        const stored: string = (await blobStore().get(bodyBlobKey)).toString();
+        expect(stored).toContain("In-Reply-To: <parent@example.com>");
+        expect(stored).toContain("References: <root@example.com> <parent@example.com>");
+    });
+
+    it("When only finishing a previous filing, re-applies the threading headers the relay added, and leaves a blob that has them all as it is.", async () => {
+        const bodyBlobKey = await putBody();
+        await createMessage({
+            bodyBlobKey,
+            messageId: "relayed-thread@example.com",
+            inReplyTo: "parent@example.com",
+            references: [],
+            scheduledSendRelayedAt: new Date(Date.now() - 5 * 60 * 1000),
+            scheduledSendTime: new Date(Date.now() - 60 * 1000),
+        });
+        const completeRaw = "Message-ID: <complete@example.com>\r\nFrom: owner@example.com\r\nTo: recipient@example.com\r\nSubject: Hi\r\n\r\nHello there.\r\n";
+        const completeKey = await putBody(completeRaw);
+        await createMessage({
+            bodyBlobKey: completeKey,
+            messageId: "complete@example.com",
+            scheduledSendRelayedAt: new Date(Date.now() - 5 * 60 * 1000),
+            scheduledSendTime: new Date(Date.now() - 60 * 1000),
+        });
+        const put = vi.spyOn(blobStore(), "put");
+
+        await job.run();
+
+        expect(transport().sent.length).toBe(0);
+        const stored: string = (await blobStore().get(bodyBlobKey)).toString();
+        expect(stored).toMatch(/^Message-ID: <relayed-thread@example\.com>\r?\n/);
+        expect(stored).toContain("In-Reply-To: <parent@example.com>");
+        expect(put.mock.calls.some((call: any[]) => call[0] === completeKey)).toBe(false);
+        expect((await blobStore().get(completeKey)).toString()).toBe(completeRaw);
+        put.mockRestore();
+    });
+
     it("Files a scheduled reply into the conversation its parent is already in, resolved the same way an immediate send is.", async () => {
         // The parent this mailbox already holds - the scheduled reply names only its direct parent, so without the
         // mailbox lookup it would start a conversation of its own keyed on `second@example.com`.

@@ -301,6 +301,14 @@ export abstract class RetentionEnforcementJob<RP extends RetentionPolicy, M exte
             }
             // The search document (subject/body/attachment text) must not outlive the purged message.
             await removeFromSearchIndex(this.searchProvider, "message", message.uid, this.logger);
+            // Its sanitized HTML once more, now the row is gone: a reader that read the row before it was deleted may have written the blob
+            // back from the raw message meanwhile (`SanitizedBodyLoader`'s missing-blob rebuild, whose own check after the write still found
+            // the row) - whichever of the two deletes comes last removes it. Best effort: the message is purged.
+            try {
+                await deleteBlobsIfUnreferenced(this.blobStore!, blobSources, [(message as any).sanitizedHtmlBlobKey]);
+            } catch (err: any) {
+                this.logger?.warn(`RetentionEnforcementJob: failed to delete the sanitized body of purged message ${message.uid} again: ${err.message}`);
+            }
         };
 
         // A mailbox under any open hold is left out of the query altogether, so a held custodian's (possibly huge)

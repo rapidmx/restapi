@@ -51,11 +51,12 @@ import {
     GUEST_PERMISSION_FIELDS,
 } from "../util/CalendarEventUtils.js";
 import { normalizeEventDescription } from "../util/EventDescriptionUtils.js";
+import { computeBusyIntervals, mergeBusyIntervals } from "../util/FreeBusyUtils.js";
 import {
     FREE_BUSY_MAX_ATTEMPTS,
     FREE_BUSY_WINDOW_SECONDS,
     lookupFreeBusy,
-    mayViewFreeBusy,
+    freeBusyCalendarFolders,
     parseFreeBusyRequest,
     type FreeBusyResponse,
 } from "../util/FreeBusyLookupUtils.js";
@@ -209,11 +210,13 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         BaseCalendarEventRoute.assertParticipants(obj, existing);
         // Before `keepSealed()` would seal again to the key of the mailbox the event is leaving.
         ZeroAccessRouteSealing.refuseSealedMove(obj, existing);
+        // Before `keepSealed()` too, as on a create: what it seals (and composes the revision's invitations from) is the checked, bounded
+        // and sanitized description, never the request's own.
+        BaseCalendarEventRoute.normalizeDescriptionAndPolicy(obj, true);
         await this.keepSealedFromClient(obj, existing, false);
         if (typeof obj.icalUid === "string") {
             obj.icalUid = boundIndexedValue(obj.icalUid);
         }
-        BaseCalendarEventRoute.normalizeDescriptionAndPolicy(obj, true);
         // A request's invitation content is for composing invitations only, never stored (`takeInvitationContent()`).
         delete obj.invitationContent;
         if (GUEST_PERMISSION_FIELDS.some((field) => field in obj) && !(await this.isOrganizedByOwner(existing))) {
@@ -1267,8 +1270,9 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
      * gets a partial schedule, never a failure - it only decorates the card.
      *
      * Each event is shown as the caller may see it on its calendar: in a calendar they can't read (a grantee of the Inbox alone) only as
-     * a busy window without a title, and only when the mailbox's free/busy would show it to them (`mayViewFreeBusy()`, the owner's
-     * `freeBusyVisibility`) - otherwise not at all; a private or confidential one, to a reader without `UPDATE` on its calendar, as
+     * `POST /free-busy` would show it, and only when the mailbox's free/busy is shown to them at all (`freeBusyCalendarFolders()`, the
+     * owner's `freeBusyVisibility`) - merged busy windows without a title or a row's uid, from the live calendars only, leaving out free
+     * and declined events (`computeBusyIntervals()`, `mergeBusyIntervals()`); a private or confidential one, to a reader without `UPDATE` on its calendar, as
      * `BUSY_TITLE` (`redactReadRecords()`). The owner and delegates with `UPDATE` see every title.
      */
     private async loadSchedule(context: InviteContext): Promise<InviteScheduleEntry[]> {
@@ -1307,9 +1311,9 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                 return access.get(folderUid)!;
             };
             // Asked once, and only for a row in a calendar the caller can't read. `user` is set: `loadInvite()` found them access to the message.
-            let freeBusy: Promise<boolean> | undefined;
-            const showsFreeBusy = (): Promise<boolean> =>
-                (freeBusy ??= mayViewFreeBusy(
+            let freeBusy: Promise<ReadonlySet<string> | undefined> | undefined;
+            const freeBusyFolders = (): Promise<ReadonlySet<string> | undefined> =>
+                (freeBusy ??= freeBusyCalendarFolders(
                     {
                         caller: user!,
                         mailboxRepo: this.mailboxRepo!,
@@ -1319,15 +1323,20 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                     mailbox,
                 ));
             const entries: InviteScheduleEntry[] = [];
+            // The rows of calendars the caller can't read that free/busy counts, shown below as free/busy shows them.
+            const unreadable: CalendarEvent[] = [];
             for (const row of rows.values()) {
                 if (row.icalUid === own || row.status === CalendarEventStatus.CANCELLED) {
                     continue;
                 }
                 const seen: { read: boolean; details: boolean } = await accessTo(row.folderUid);
-                if (!seen.read && !(await showsFreeBusy())) {
+                if (!seen.read) {
+                    if ((await freeBusyFolders())?.has(row.folderUid)) {
+                        unreadable.push(row);
+                    }
                     continue;
                 }
-                const title: string = !seen.read ? "" : hidesDetailsFromReaders(row) && !seen.details ? BUSY_TITLE : (row.title ?? "");
+                const title: string = hidesDetailsFromReaders(row) && !seen.details ? BUSY_TITLE : (row.title ?? "");
                 const isMaster: boolean = !!row.recurrenceRule && !row.recurrenceId;
                 const exclude: Date[] | undefined = isMaster
                     ? [
@@ -1352,6 +1361,19 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                         tentative: row.busyStatus === BusyStatus.TENTATIVE || mine?.responseStatus === AttendeeResponseStatus.NEEDS_ACTION || mine?.responseStatus === AttendeeResponseStatus.TENTATIVE,
                     });
                 }
+            }
+            // No more than `POST /free-busy` gives: merged busy windows, without the free or declined events, their boundaries or uids.
+            // An entry's uid only has to be unique in the schedule (a client keys it), and windows never overlap.
+            for (const window of mergeBusyIntervals(computeBusyIntervals(unreadable, windowStart, windowEnd, mailboxAddressSet(mailbox)), windowStart, windowEnd)) {
+                entries.push({
+                    uid: `busy:${window.start.toISOString()}`,
+                    title: "",
+                    startDate: window.start.toISOString(),
+                    endDate: window.end.toISOString(),
+                    allDay: false,
+                    busy: true,
+                    tentative: window.tentative,
+                });
             }
             return entries.sort((a, b) => a.startDate.localeCompare(b.startDate)).slice(0, 200);
         } catch (err: any) {

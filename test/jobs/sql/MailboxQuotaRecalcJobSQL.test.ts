@@ -302,13 +302,36 @@ describe("MailboxQuotaRecalcJobSQL Tests (real DB + DI)", () => {
         await createMessage(small.uid, { bodyBlobKey: `body/${uuid.v4()}` });
         await job.run();
         expect((await mailboxRepo.findOne({ where: { uid: small.uid } }))!.usedBytes).toBe(350);
-        expect((await mailboxRepo.findOne({ where: { uid: mailbox.uid } }))!.usedBytes).toBe(5000);
+        // Once the store answers, the body that was never stored is known to be gone, and the figure comes down to what is stored.
+        expect((await mailboxRepo.findOne({ where: { uid: mailbox.uid } }))!.usedBytes).toBe(350);
     });
 
-    it("Sums the rest when one body blob fails to size (the figure can still only go up).", async () => {
+    it("Counts a body the blob store says is gone as no space, so one lost blob can't keep the figure from coming down; a store that can't tell still can't lower it (round 7, #709).", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const mailbox = await createMailbox({ usedBytes: 5000 });
+        const bodyKey = `body/${uuid.v4()}`;
+        await blobStore.put(bodyKey, Buffer.alloc(300));
+        await createMessage(mailbox.uid, { bodyBlobKey: bodyKey });
+        // Its blob deleted by a purge that failed before the row, or lost.
+        await createMessage(mailbox.uid, { bodyBlobKey: `body/${uuid.v4()}` });
+        // No body at all.
+        await createMessage(mailbox.uid, { bodyBlobKey: "" });
+        const existsSpy = vi.spyOn(blobStore, "exists").mockRejectedValue(new Error("simulated S3 outage"));
+
+        await job.run();
+
+        expect((await mailboxRepo.findOne({ where: { uid: mailbox.uid } }))!.usedBytes).toBe(5000);
+        existsSpy.mockRestore();
+
+        await job.run();
+
+        expect((await mailboxRepo.findOne({ where: { uid: mailbox.uid } }))!.usedBytes).toBe(300);
+    });
+
+    it("Sums the rest when one body blob is gone, counting it as no space.", async () => {
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
         const mailbox = await createMailbox({ usedBytes: 0 });
-        // No blob was ever put at this key, so `blobStore.size()` rejects with a real "no blob" error.
+        // No blob was ever put at this key, so `blobStore.size()` rejects with a real "no blob" error and `exists()` says it is gone.
         await createMessage(mailbox.uid, { bodyBlobKey: `body/${uuid.v4()}`, hasAttachments: false });
         const bodyKey2 = `body/${uuid.v4()}`;
         await blobStore.put(bodyKey2, Buffer.alloc(300));

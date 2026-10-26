@@ -9,6 +9,13 @@ export interface OutboundMessage {
     raw: Buffer;
     envelopeFrom: string;
     envelopeTo: string[];
+    /**
+     * What a delivery status notification for this message may return (RFC 3461 `RET`): `"headers"` - only its headers, never its body.
+     * For a message whose body must not come back to the envelope sender's mailbox, where a bounce would be stored: an invitation carrying
+     * an attendee's meeting key (`MeetingInviteSender`). A transport that can't ask for it says so (`MailTransport.headersOnlyDsn`), and
+     * such a message is not given to it.
+     */
+    dsnReturn?: "headers";
 }
 
 /**
@@ -75,6 +82,10 @@ export interface TransportResult {
 export interface MailTransport {
     /** A short, unique name for this transport implementation (e.g. `"postfix-sendmail"`). */
     readonly name: string;
+
+    /** Whether `send()` honors `OutboundMessage.dsnReturn` - a bounce it (or the MTA it hands to) generates returns only the headers.
+     * Absent: it doesn't, and a message that needs it is not sent through it. */
+    readonly headersOnlyDsn?: boolean;
 
     send(message: OutboundMessage): Promise<TransportResult>;
 }

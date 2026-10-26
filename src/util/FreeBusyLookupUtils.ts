@@ -227,14 +227,27 @@ export async function lookupFreeBusy(ctx: FreeBusyLookupContext, request: FreeBu
  * windows some other way (the schedule on an invitation card) to a caller who may not read the calendars they come from.
  */
 export async function mayViewFreeBusy(ctx: Pick<FreeBusyLookupContext, "caller" | "mailboxRepo" | "folderRepo" | "hasAccess">, mailbox: Mailbox): Promise<boolean> {
+    return (await freeBusyCalendarFolders(ctx, mailbox)) !== undefined;
+}
+
+/**
+ * The calendar folders whose events make up `mailbox`'s free/busy (those not deleted, as `lookupFreeBusy()` reads), or `undefined` when
+ * the caller may not see its free/busy (`mayViewFreeBusy()`). A route showing busy windows some other way keeps only events in these.
+ */
+export async function freeBusyCalendarFolders(
+    ctx: Pick<FreeBusyLookupContext, "caller" | "mailboxRepo" | "folderRepo" | "hasAccess">,
+    mailbox: Mailbox,
+): Promise<ReadonlySet<string> | undefined> {
     const owned: Mailbox[] = await ownedMailboxes(ctx);
-    return await mayView(
+    const folders: string[] = await calendarFolderUids(ctx, mailbox.uid);
+    const visible: boolean = await mayView(
         ctx,
         mailbox,
-        await calendarFolderUids(ctx, mailbox.uid),
+        folders,
         new Set(owned.map((row) => row.uid)),
         new Set(owned.map((row) => addressDomain(row.primarySmtpAddress))),
     );
+    return visible ? new Set(folders) : undefined;
 }
 
 /** The mailboxes the caller owns (at most 100). */

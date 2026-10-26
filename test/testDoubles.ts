@@ -198,6 +198,8 @@ export class AlwaysCleanAvScanProvider implements AvScanProvider {
  */
 export class RecordingMailTransport implements MailTransport {
     public readonly name: string = "recording";
+    /** As Postfix's (`sendmail -R hdrs`): what was asked for is recorded on `sent`'s `dsnReturn`. */
+    public readonly headersOnlyDsn: boolean = true;
     public sent: OutboundMessage[] = [];
 
     /** While set, `send()` waits for it before doing anything. */

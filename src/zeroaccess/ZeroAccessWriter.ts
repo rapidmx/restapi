@@ -30,6 +30,11 @@ export interface ZeroAccessSealOptions {
     /** The blob key to store the sealed message under, instead of `zeroAccessBlobKey(mailboxUid, messageUid)`: a key fresh to this call
      * (`sealDraft()`'s), which no other filing can share - so a failed seal removes the blob it stored there. */
     blobKey?: string;
+    /** The message uid was minted fresh for this one filing, which never retries under it (an EAS or MAPI send's Sent Items copy, an
+     * import): no other filing can share its `zeroAccessBlobKey()`, so a failed seal removes the blob it stored there too, as it does one
+     * under `blobKey`. Never for a uid another filing may use (the backfill, a send's filing that `ScheduledSendJob` may take over, a
+     * delivery failure notice's derived uid). */
+    freshMessageUid?: boolean;
     /** Replace the message's index entry when it has one, instead of keeping it. */
     replaceIndexEntry?: boolean;
     /** Don't write the index entry: the caller writes it with the returned `writeIndex()` once its own write of the row has won, so a
@@ -168,12 +173,12 @@ export class ZeroAccessWriter {
             return sealed;
         } catch (err) {
             // Nothing will name a blob whose filing failed (the caller files no row), and it is no plaintext copy the caller could
-            // clean up: remove it here - only under a key fresh to this call (`options.blobKey`, a draft save's), and only when this
-            // call stored it. The message's own `zeroAccessBlobKey()` is shared by every filing of it: another one running at the same
-            // time (a second replica's backfill, a send taken over) may have stored the same key and be about to name it in its row,
-            // so a sealed copy left there is reused by the next attempt instead. Best effort - the error that failed the filing is the
-            // one reported.
-            if (options.blobKey !== undefined && filing.storedSealedBlob) {
+            // clean up: remove it here - only under a key fresh to this call (`options.blobKey`, a draft save's, or the message's own
+            // key when its uid is fresh to this filing, `options.freshMessageUid`), and only when this call stored it. Otherwise the
+            // message's own `zeroAccessBlobKey()` is shared by every filing of it: another one running at the same time (a second
+            // replica's backfill, a send taken over) may have stored the same key and be about to name it in its row, so a sealed copy
+            // left there is reused by the next attempt instead. Best effort - the error that failed the filing is the one reported.
+            if ((options.blobKey !== undefined || options.freshMessageUid === true) && filing.storedSealedBlob) {
                 try {
                     await blobStore.delete(bodyBlobKey);
                 } catch {
@@ -196,7 +201,10 @@ export class ZeroAccessWriter {
         if (repos.attachmentRepo) {
             for await (const page of findPagesByUid<any>(repos.attachmentRepo, { messageUid })) {
                 for (const attachment of page) {
-                    keys.push(attachment.blobKey, attachment.extractedTextBlobKey);
+                    // The row's extracted text is cleared with a version-checked write first (`dropExtractedText()`), which returns the
+                    // text a stamp that landed since the page was read names: the purge checks no version, so that stamp's blob would
+                    // otherwise go unnamed with the row. A stamp after the write loses its own version check and deletes its text.
+                    keys.push(attachment.blobKey, attachment.extractedTextBlobKey, await ZeroAccessWriter.dropExtractedText(repos.attachmentRepo, attachment));
                     await repos.attachmentRepo.delete(attachment.uid, { ignoreACL: true, purge: true });
                 }
             }
@@ -225,7 +233,7 @@ export class ZeroAccessWriter {
 
     /**
      * Clears an attachment row's `extractedTextBlobKey` with a version-checked write, and returns the text blob it named, if any. Every row
-     * is written, one without text too: the write moves its version on, so an extraction that read it before the draft was sealed loses
+     * is written, one without text too: the write moves its version on, so an extraction that read it before the message was sealed loses
      * its own version-checked stamp (and deletes the text it would have stored). When the row changed meanwhile - that stamp landed first -
      * it is read again and cleared once more, `DROP_TEXT_ATTEMPTS` times at most; a row that can't be read again, or is gone, is left.
      */

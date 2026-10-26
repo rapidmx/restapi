@@ -71,15 +71,23 @@ export class PostfixSendmailTransport implements MailTransport {
         };
     }
 
+    /** `sendmail -R hdrs` asks Postfix for headers-only bounces (RFC 3461 `RET=HDRS`), which it also passes on to a next hop that
+     * speaks DSN. A remote server that accepts the message without DSN and bounces it later decides for itself what it returns. */
+    public readonly headersOnlyDsn: boolean = true;
+
     public async send(message: OutboundMessage): Promise<TransportResult> {
+        // The null sender (`<>`, which bounces and notices go out with so they can't bounce again - RFC 5321 section 4.5.5) is an empty
+        // envelope address, for which nodemailer adds no `-f` at all and Postfix then makes the sender the unix user that ran it. Its own
+        // arguments for the case say it outright. Given arguments replace nodemailer's own `-f`, so a message with a sender that needs any
+        // (`dsnReturn`) names it itself.
+        const sender: string[] = message.envelopeFrom ? ["-f", message.envelopeFrom] : ["-f", "<>"];
+        const args: string[] | undefined =
+            message.dsnReturn === "headers" ? [...sender, "-R", "hdrs"] : message.envelopeFrom ? undefined : sender;
         const transport = nodemailer.createTransport({
             sendmail: true,
             path: this.sendmailPath,
             newline: "unix",
-            // The null sender (`<>`, which bounces and notices go out with so they can't bounce again - RFC 5321 section 4.5.5) is
-            // an empty envelope address, for which nodemailer adds no `-f` at all and Postfix then makes the sender the unix user
-            // that ran it. Its own arguments for the case say it outright; they are used only when there is no sender.
-            ...(message.envelopeFrom ? {} : { args: ["-f", "<>"] }),
+            ...(args ? { args } : {}),
         });
         const capture: SendmailCapture = { stderr: "" };
         this.captureSendmail(transport, capture);
