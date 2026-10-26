@@ -211,9 +211,17 @@ export abstract class AttachmentExtractionJob<A extends Attachment, M extends Me
         // The MIME type is matched by its bare, lower-cased `type/subtype`: a stored `Content-Type` can carry parameters
         // (`application/pdf; name=a.pdf`) or odd casing, which the registry's exact-match lookup would never find. An attachment
         // whose declared size already exceeds what the registry would take is not downloaded at all.
+        //
+        // An attachment of a message stored zero-access sealed - a sealed draft's upload, readable until the draft is sent - is skipped
+        // the same way: its text would be one more readable copy of a zero-access mailbox's content, which nothing indexes
+        // (`SearchIndexJob` indexes such a message as metadata only), and the sealed copy the send files carries the attachment itself.
         const mimeType: string = (attachment.mimeType ?? "").split(";")[0].trim().toLowerCase();
         const text: string | undefined =
-            !message || message.encrypted || (attachment.sizeBytes ?? 0) > this.maxExtractBytes || !this.extractorRegistry!.supports(mimeType)
+            !message ||
+            message.encrypted ||
+            (message as any).zeroAccess ||
+            (attachment.sizeBytes ?? 0) > this.maxExtractBytes ||
+            !this.extractorRegistry!.supports(mimeType)
                 ? undefined
                 : await this.extractorRegistry!.extract(mimeType, await this.blobStore!.get(attachment.blobKey));
 

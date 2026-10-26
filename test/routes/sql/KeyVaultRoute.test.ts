@@ -1163,6 +1163,7 @@ describe("Route:KeyVaultSQL Tests", () => {
         app: () => server.getApplication(),
         baseUrl,
         tokenFor: (uid) => JWTUtils.createTokenSync(config.get("auth"), { uid, roles: [], elevated: Date.now() } as any),
+        adminToken: () => JWTUtils.createTokenSync(config.get("auth"), { ...admin, elevated: Date.now() }),
         createMailbox: async (data?: any) =>
             mailboxRepo.save(
                 new MailboxSQL({
@@ -1188,6 +1189,9 @@ describe("Route:KeyVaultSQL Tests", () => {
         },
         setEscrowWraps: async (mailboxUid: string, wraps: any[]) => {
             await keyVaultRepo.update({ mailboxUid }, { zeroAccessEscrowWraps: wraps });
+        },
+        setMemberWraps: async (mailboxUid: string, wraps: any[]) => {
+            await keyVaultRepo.update({ mailboxUid }, { memberKeyWraps: wraps });
         },
         createEscrowScope: (certificate: string, fingerprint: string) =>
             escrowScopeRepo.save(

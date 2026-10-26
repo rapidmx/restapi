@@ -11,10 +11,10 @@ import { gunzipSync } from "node:zlib";
 import * as asn1js from "asn1js";
 import * as pkijs from "pkijs";
 import * as x509 from "@peculiar/x509";
-import { ACLAction } from "@rapidrest/service-core";
+import { ACLAction, RepoUtils } from "@rapidrest/service-core";
 import { request } from "@rapidrest/service-core/test";
 import { IngestStatus, TransportRuleActionType, type ZeroAccessKey } from "../../src/models/types.js";
-import type { InMemoryBlobStore } from "../testDoubles.js";
+import type { InMemoryBlobStore, NoopSearchProvider } from "../testDoubles.js";
 import { isoWeekId } from "../../src/zeroaccess/ZeroAccessSealer.js";
 import { MailEventStream } from "../../src/events/MailEventStream.js";
 import { postfixDsn } from "../fixtures/postfixDsn.js";
@@ -29,6 +29,8 @@ export interface ZeroAccessDeliverySuiteContext {
     baseUrl: string;
     secret: string;
     blobStore: () => InMemoryBlobStore;
+    /** The registered search provider test double. */
+    searchProvider: () => NoopSearchProvider;
     createMailbox: (data?: any) => Promise<any>;
     updateMailbox: (uid: string, fields: any) => Promise<void>;
     /** Saves the singleton `EncryptionPolicy` with `allowZeroAccess` (`undefined` leaves the row out entirely). */
@@ -749,6 +751,26 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
                 }
             });
 
+            it("removes the search document of restorable deleted mail it seals, which the search indexer never revisits", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const inbox = await ctx.createFolder(mailbox.uid, "inbox");
+                const deleted = (await stored(mailbox, inbox, { deleted: true })).message;
+                const live = (await stored(mailbox, inbox)).message;
+                // Both indexed readable while they were live.
+                for (const message of [deleted, live]) {
+                    await ctx.searchProvider().index({ entityType: "message", entityUid: message.uid, mailboxUid: mailbox.uid, subject: CANARY_SUBJECT, body: CANARY_BODY } as any);
+                }
+
+                await ctx.runBackfill();
+
+                expect((await ctx.findMessage(deleted.uid)).zeroAccess.keyFingerprint).toBe(recipient.key.fingerprint);
+                expect(ctx.searchProvider().indexed.has(`message:${deleted.uid}`)).toBe(false);
+                // A live one is sent back to the indexer instead, which replaces its document with metadata.
+                expect(ctx.searchProvider().indexed.has(`message:${live.uid}`)).toBe(true);
+                expect((await ctx.findMessage(live.uid)).searchIndexedAt ?? null).toBeNull();
+            });
+
             it("seals a message stored before Message.encrypted existed, whose column holds nothing", async () => {
                 const recipient = await makeKey();
                 const mailbox = await zeroAccessMailbox(recipient);
@@ -964,6 +986,55 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
                     expect(content.toString("latin1"), key).not.toContain(CANARY_BODY);
                 }
             });
+
+            for (const background of [false, true]) {
+                it(`files a ${background ? "background" : "immediate"} reply sealed, with no render left behind, when looking up its thread fails after the relay`, async () => {
+                    const recipient = await makeKey();
+                    const mailbox = await zeroAccessMailbox(recipient);
+                    const { message, bodyBlobKey } = await draft(mailbox);
+                    await ctx
+                        .blobStore()
+                        .put(
+                            bodyBlobKey,
+                            Buffer.from(
+                                `From: ${mailbox.primarySmtpAddress}\r\nTo: carol@example.org\r\nSubject: Re: ${CANARY_SUBJECT}\r\nIn-Reply-To: <parent@example.org>\r\nReferences: <parent@example.org>\r\nContent-Type: text/html\r\n\r\n<p>${CANARY_BODY}</p>\r\n`,
+                            ),
+                        );
+                    await ctx.updateMessage(message.uid, { inReplyTo: "parent@example.org", references: ["parent@example.org"] });
+                    // The ancestor lookup (`findThreadConversationId()`) fails: the database dropped the connection right after the relay.
+                    const realFind = RepoUtils.prototype.find;
+                    let failed: number = 0;
+                    const find = vi.spyOn(RepoUtils.prototype, "find").mockImplementation(async function (this: any, query: any, ...rest: any[]) {
+                        if (query && typeof query === "object" && "messageId" in query && "mailboxUid" in query) {
+                            failed++;
+                            throw new Error("connection reset");
+                        }
+                        return realFind.call(this, query, ...rest);
+                    } as any);
+                    try {
+                        const result = await request(ctx.app())
+                            .post(`${ctx.messagesUrl}/${message.uid}/send`)
+                            .set("Authorization", "jwt " + ctx.tokenFor(mailbox.ownerUserUid))
+                            .send(background ? { background: true } : {});
+                        expect(result.status).toBeLessThan(300);
+                        if (background) {
+                            await vi.waitFor(async () => expect((await ctx.findMessage(message.uid)).zeroAccess).toBeTruthy(), { timeout: 10_000, interval: 50 });
+                        }
+                    } finally {
+                        find.mockRestore();
+                    }
+
+                    expect(failed).toBeGreaterThan(0);
+                    const filed = await ctx.findMessage(message.uid);
+                    expect(filed.zeroAccess.keyFingerprint).toBe(recipient.key.fingerprint);
+                    // The headers' own conversation, since the thread couldn't be looked up.
+                    expect(filed.conversationId).toBeTruthy();
+                    expect(blobs().filter(([key]) => key.startsWith("sanitized/"))).toEqual([]);
+                    for (const [key, content] of blobs()) {
+                        expect(content.toString("latin1"), key).not.toContain(CANARY_BODY);
+                    }
+                }, 20_000);
+            }
 
             it("refuses to send a draft still stored sealed, which it can't relay", async () => {
                 const recipient = await makeKey();

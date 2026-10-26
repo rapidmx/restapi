@@ -1276,7 +1276,7 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
                 changed = unsetIfEmpty(obj[field]) !== unsetIfEmpty((existing as any)?.[field]);
             }
             if (changed && field === "ownerUserUid" && isTrusted) {
-                await this.assertOwnerChangeAllowed(id, obj.ownerUserUid, user);
+                await this.assertOwnerChangeAllowed(id, obj.ownerUserUid, user, existing);
             }
             if (changed && !isTrusted) {
                 throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, `'${field}' can only be changed by a trusted administrator.`);
@@ -1288,14 +1288,26 @@ export abstract class BaseMailboxRoute<T extends Mailbox> extends CRUDRoute<T> {
      * An owner change hands the new owner every folder and message of the mailbox and the owner-only key vault, and takes them from the old
      * one: the same kind of grant `BaseMailboxAccessRoute` refuses an administrator on an owned mailbox. So it needs an administrator
      * (trusted AND elevated), and that administrator can't make themselves the owner of a mailbox they hold no grant on.
+     *
+     * A mailbox without an owner that has zero-access keys can't be given one (`409`, `specs/search.md` §3 *Shared Mailboxes*): its keys'
+     * only copies are its members' wraps and its escrow wraps, which an owner - who opens a mailbox's keys with their master key and is no
+     * member - never reads, so the new owner, and escrow through the owner's master key, could open none of its mail, while new mail went
+     * on being sealed to those keys.
      */
-    private async assertOwnerChangeAllowed(id: string, nextOwner: unknown, user: JWTUser | undefined): Promise<void> {
+    private async assertOwnerChangeAllowed(id: string, nextOwner: unknown, user: JWTUser | undefined, existing: T | undefined): Promise<void> {
         assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         if (typeof nextOwner === "string" && sameUserUid(nextOwner, user!.uid) && !(await this.hasMailAccess(user, id, ACLAction.UPDATE))) {
             throw new ApiError(
                 ApiErrors.AUTH_PERMISSION_FAILURE,
                 403,
                 "An administrator can't make themselves the owner of a mailbox they hold no grant on.",
+            );
+        }
+        if (nextOwner && existing && !existing.ownerUserUid && (existing.zeroAccessKeys ?? []).length > 0) {
+            throw new ApiError(
+                ApiErrors.IDENTIFIER_EXISTS,
+                409,
+                "This shared mailbox's zero-access keys are held only by its members and escrow, so it can't be given an owner while it has them.",
             );
         }
     }

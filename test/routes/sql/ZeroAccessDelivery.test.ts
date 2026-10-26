@@ -19,7 +19,7 @@ import { QuarantineEntrySQL } from "../../../src/models/sql/QuarantineEntrySQL.j
 import { ScanResultSQL } from "../../../src/models/sql/ScanResultSQL.js";
 import { TransportRuleSQL } from "../../../src/models/sql/TransportRuleSQL.js";
 import { ZeroAccessIndexEntrySQL } from "../../../src/models/sql/ZeroAccessIndexEntrySQL.js";
-import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
+import { InMemoryBlobStore, NoopSearchProvider, registerTestDoubles } from "../../testDoubles.js";
 import { zeroAccessDeliverySuite } from "../zeroAccessDeliverySuite.js";
 import { zeroAccessIndexSuite } from "../zeroAccessIndexSuite.js";
 import { ZeroAccessBackfillJobSQL } from "../../../src/jobs/sql/ZeroAccessBackfillJobSQL.js";
@@ -81,6 +81,7 @@ describe("Zero-access delivery (SQL)", () => {
         baseUrl: "/sql/internal/mta",
         secret: config.get("mail:transport:ingest:secret"),
         blobStore: () => objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!,
+        searchProvider: () => objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!,
         createMailbox: async (data?: any) =>
             repo(MailboxSQL).save(
                 new MailboxSQL({

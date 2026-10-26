@@ -73,7 +73,7 @@ import {
     SealedEventContent,
     RecipientType,
 } from "../models/types.js";
-import { hasSealedFields } from "../zeroaccess/ZeroAccessFieldSealer.js";
+import { hasSealedFields, isSealedEvent } from "../zeroaccess/ZeroAccessFieldSealer.js";
 import { ZeroAccessRouteSealing } from "../zeroaccess/ZeroAccessRouteSealing.js";
 import { type InvitationContent, invitationsPending, MeetingInviteSender, type MeetingLinkSecrets, meetingLinkSecretsOf } from "../scheduling/MeetingInviteSender.js";
 const { Config, Init, Inject } = ObjectDecorators;
@@ -207,7 +207,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         BaseCalendarEventRoute.assertParticipants(obj, existing);
         // Before `keepSealed()` would seal again to the key of the mailbox the event is leaving.
         ZeroAccessRouteSealing.refuseSealedMove(obj, existing);
-        await this.keepSealed(obj, existing);
+        await this.keepSealedFromClient(obj, existing, false);
         if (typeof obj.icalUid === "string") {
             obj.icalUid = boundIndexedValue(obj.icalUid);
         }
@@ -251,12 +251,14 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
      * request - is sealed again to the same zero-access key, and the row keeps the placeholders: the plaintext is never stored. An edit
      * sends the fields it keeps along with the one it changes (the event dialog sends them all); one it leaves out is dropped, since the
      * server can't read the sealed value to keep it. A `sealedContent` from the client is ignored: only the server writes it.
+     *
+     * Returns what it sealed when that names a title - the plaintext an invitation for the revision is composed from - else `undefined`.
      */
-    private async keepSealed(obj: any, existing: T): Promise<void> {
+    private async keepSealed(obj: any, existing: T): Promise<InvitationContent | undefined> {
         delete obj.sealedContent;
         const sealed: SealedEventContent | undefined = (existing as any).sealedContent ?? undefined;
         if (!sealed || !SEALED_EVENT_FIELDS.some((field) => obj[field] !== undefined)) {
-            return;
+            return undefined;
         }
         const mailbox: Mailbox | undefined = await this.mailboxRepo!.findOne(existing.mailboxUid, { ignoreACL: true });
         const target: ZeroAccessTarget | undefined = mailbox ? zeroAccessTargetFor(mailbox, sealed.keyFingerprint) : undefined;
@@ -265,22 +267,56 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             throw new ApiError(ApiErrors.INVALID_REQUEST, 409, "This event's details are sealed to a key this mailbox no longer has, so they can't be changed.");
         }
         const text = (value: unknown): string | undefined => (typeof value === "string" && value.length > 0 ? value : undefined);
-        obj.sealedContent = {
-            keyFingerprint: target.key.fingerprint,
-            sealed: await sealEventFields(
-                {
-                    title: typeof obj.title === "string" && obj.title !== PROTECTED_SUBJECT ? obj.title : "",
-                    location: text(obj.location),
-                    description: text(obj.description),
-                    descriptionHtml: text(obj.descriptionHtml),
-                },
-                target.certDer,
-            ),
+        const content = {
+            title: typeof obj.title === "string" && obj.title !== PROTECTED_SUBJECT ? obj.title : "",
+            location: text(obj.location),
+            description: text(obj.description),
+            descriptionHtml: text(obj.descriptionHtml),
         };
+        obj.sealedContent = { keyFingerprint: target.key.fingerprint, sealed: await sealEventFields(content, target.certDer) };
         obj.title = PROTECTED_SUBJECT;
         obj.location = null;
         obj.description = null;
         obj.descriptionHtml = null;
+        return content.title ? content : undefined;
+    }
+
+    /**
+     * `keepSealed()` for a client's create or update body - `existing` the row it updates, or (`creating`) the series an occurrence is
+     * detached from - with the echo rule field sealing applies (`sealFieldsOnWrite()`): a client that couldn't open the content (no keys, or
+     * locked) sends back what it was shown, the placeholder title and no location or description, and that is no change. Resealing it would
+     * replace the real content with empty content for good. Such a body's content fields are dropped, so the row keeps its `sealedContent`
+     * (a detached occurrence takes the series'). A body that changes the location or description but sends the placeholder title (or none)
+     * is refused (`409`), since resealing it would lose the title. What an opened body seals is what the revision's invitations are composed
+     * from when the request carries no `invitationContent` (`READABLE_CONTENT`).
+     */
+    private async keepSealedFromClient(obj: any, existing: T, creating: boolean): Promise<void> {
+        const sealed: SealedEventContent | undefined = (existing as any).sealedContent ?? undefined;
+        if (sealed) {
+            const echo = (field: string): boolean =>
+                field === "title" ? obj.title === undefined || obj.title === PROTECTED_SUBJECT : obj[field] === undefined || obj[field] === null || obj[field] === "";
+            if (SEALED_EVENT_FIELDS.every(echo)) {
+                delete obj.sealedContent;
+                for (const field of SEALED_EVENT_FIELDS) {
+                    delete obj[field];
+                }
+                if (creating) {
+                    Object.assign(obj, { sealedContent: { ...sealed }, title: PROTECTED_SUBJECT, location: null, description: null, descriptionHtml: null });
+                }
+                return;
+            }
+            if (echo("title")) {
+                throw new ApiError(
+                    ApiErrors.INVALID_REQUEST,
+                    409,
+                    "This event's details are sealed: a change of its location or description must be sent with its opened title.",
+                );
+            }
+        }
+        const opened: InvitationContent | undefined = await this.keepSealed(obj, existing);
+        if (opened) {
+            READABLE_CONTENT.set(obj, opened);
+        }
     }
 
     /** Refuses (400) an event whose organizer or attendees can't be mailed safely - see `assertParticipants()` - and a bad description, visibility or guest permission. */
@@ -298,7 +334,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             // whatever the calendar's own setting (a 409 when that key is gone, as for an update).
             ZeroAccessRouteSealing.takeClearedFields(obj);
             delete obj.sealedFields;
-            await this.keepSealed(obj, sealedSibling);
+            await this.keepSealedFromClient(obj, sealedSibling, true);
             const origin: string | undefined = (sealedSibling as any).encryptionOrigin;
             // Sticky across a series' instances (`CalendarEvent.encryptionOrigin`).
             obj.encryptionOrigin = origin && origin !== "none" ? origin : "derived";
@@ -515,7 +551,8 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         }
         const given: any = obj?.invitationContent && typeof obj.invitationContent === "object" ? obj.invitationContent : create ? obj : undefined;
         const text = (value: unknown): string | undefined => (typeof value === "string" && value.length > 0 ? value : undefined);
-        const title: string | undefined = text(given?.title);
+        // The placeholder of an event whose content is sealed whole is what a client that could not open it sends back: no title.
+        const title: string | undefined = given?.title === PROTECTED_SUBJECT ? undefined : text(given?.title);
         return title ? { title, location: text(given.location), description: text(given.description), descriptionHtml: text(given.descriptionHtml) } : undefined;
     }
 
@@ -526,7 +563,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
      * save isn't refused as stale.
      */
     private async sendProtectedInvitations(event: T, content: InvitationContent | undefined, secrets?: MeetingLinkSecrets): Promise<T> {
-        if (!invitationsPending(event) || !(hasSealedFields(event) || event.videoMeetingUid)) {
+        if (!invitationsPending(event) || !(isSealedEvent(event) || event.videoMeetingUid)) {
             return event;
         }
         const claimed = (await (await this.getInviteSender()).sendProtectedInvitations(event, content, this.repoUtils!, "BaseCalendarEventRoute", secrets)) as
@@ -1161,7 +1198,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         }
         const content: InvitationContent | undefined = BaseCalendarEventRoute.takeInvitationContent(body, false);
         const secrets: MeetingLinkSecrets | undefined = meetingLinkSecretsOf(body?.invitationContent?.meetingLinkSecrets);
-        if (existing.encryptionOrigin !== "originated" && ((hasSealedFields(existing) && !content) || ((await (await this.getInviteSender()).isKeyedMeeting(existing)) && !secrets))) {
+        if (existing.encryptionOrigin !== "originated" && ((isSealedEvent(existing) && !content) || ((await (await this.getInviteSender()).isKeyedMeeting(existing)) && !secrets))) {
             throw new ApiError(
                 ApiErrors.INVALID_REQUEST,
                 400,
@@ -1403,7 +1440,8 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
      * protected; and the invitation of a zero-access message is sealed to that message's key whatever the calendar's setting, as inbound
      * delivery files it (`ScanQueueJob`, `specs/search.md` §3: no plaintext of a zero-access mailbox's mail at rest). That last is decided on
      * what field sealing left readable, not on the row: a row sealed field by field while the calendar was protected, answered once it no
-     * longer is, gets its content in `sealedContent` too, and loses the per-field copies it replaces.
+     * longer is, gets its content in `sealedContent` too, and loses the per-field copies it replaces - but the title's, when the revision
+     * names no title.
      */
     private async sealInvite(obj: any, existing: CalendarEvent | undefined, context: InviteContext): Promise<void> {
         if ((existing as any)?.sealedContent) {
@@ -1415,8 +1453,12 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         const zeroAccess: { keyFingerprint: string } | undefined = context.message.zeroAccess ?? undefined;
         const readable: boolean = SEALED_EVENT_FIELDS.some((field) => obj[field] !== undefined && obj[field] !== null && obj[field] !== "" && obj.sealedFields?.[field] === undefined);
         if (zeroAccess && readable) {
+            // A revision without SUMMARY: the title's sealed per-field copy is the only one there is (field sealing kept it, dropping the
+            // placeholder echo) and the new content can't carry it, so it stays - as `ScanQueueJob.supersededSealing()` keeps it.
+            const sealedTitle: string | undefined =
+                context.parsed.summary === undefined ? (obj.sealedFields?.title ?? (existing as any)?.sealedFields?.title) : undefined;
             await this.keepSealed(obj, { mailboxUid: context.mailbox.uid, sealedContent: { keyFingerprint: zeroAccess.keyFingerprint } } as any);
-            obj.sealedFields = null;
+            obj.sealedFields = sealedTitle ? { title: sealedTitle } : null;
             if (!existing) {
                 obj.encryptionOrigin = "derived";
             }

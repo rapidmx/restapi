@@ -1184,6 +1184,7 @@ describe("Route:KeyVaultMongo Tests", () => {
         app: () => server.getApplication(),
         baseUrl,
         tokenFor: (uid) => JWTUtils.createTokenSync(config.get("auth"), { uid, roles: [], elevated: Date.now() } as any),
+        adminToken: () => JWTUtils.createTokenSync(config.get("auth"), { ...admin, elevated: Date.now() }),
         createMailbox: async (data?: any) =>
             mailboxRepo.save(
                 new MailboxMongo({
@@ -1209,6 +1210,9 @@ describe("Route:KeyVaultMongo Tests", () => {
         },
         setEscrowWraps: async (mailboxUid: string, wraps: any[]) => {
             await keyVaultRepo.updateOne({ mailboxUid } as any, { $set: { zeroAccessEscrowWraps: wraps } });
+        },
+        setMemberWraps: async (mailboxUid: string, wraps: any[]) => {
+            await keyVaultRepo.updateOne({ mailboxUid } as any, { $set: { memberKeyWraps: wraps } });
         },
         createEscrowScope: (certificate: string, fingerprint: string) =>
             escrowScopeRepo.save(

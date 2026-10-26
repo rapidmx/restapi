@@ -267,6 +267,26 @@ describe("AttachmentExtractionJobMongo Tests (real DB + DI)", () => {
         expect(untouchedMessage!.version).toBe(message.version);
     });
 
+    it("Never extracts the text of an attachment of a message stored zero-access sealed (a sealed draft's upload), nor clears its stamp.", async () => {
+        const blobStore = objectFactory.getInstance<any>("BlobStore")!;
+        const blobKey = `attachments/${uuid.v4()}`;
+        await blobStore.put(blobKey, Buffer.from("CANARY draft attachment text"));
+        const message = await createMessage({
+            subject: "[...]",
+            zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" },
+            searchIndexedAt: new Date("2026-01-01T00:00:00Z"),
+        });
+        const attachment = await createAttachment({ messageUid: message.uid, mimeType: "text/plain", blobKey });
+
+        await job.run();
+
+        const updated = await attachmentRepo.findOne({ uid: attachment.uid } as any);
+        expect((await blobStore.get(updated!.extractedTextBlobKey!)).toString()).toBe("");
+        const untouchedMessage = await messageRepo.findOne({ uid: message.uid } as any);
+        expect(untouchedMessage!.searchIndexedAt).toEqual(message.searchIndexedAt);
+        expect(untouchedMessage!.version).toBe(message.version);
+    });
+
     it("Extracts non-empty text without crashing when the parent message no longer exists.", async () => {
         const blobStore = objectFactory.getInstance<any>("BlobStore")!;
         const blobKey = `attachments/${uuid.v4()}`;

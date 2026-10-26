@@ -62,7 +62,8 @@ export interface EscrowAccessMaterial {
      * secret keys (`type: "openpgp"`: an OpenPGP transferable secret key rather than PKCS#8, sealed the same way). */
     wrappedKeys: WrappedPrivateKey[];
     /** A mailbox without an owner, which has no master key: its zero-access private keys wrapped straight to this matter's escrow scope
-     * certificate (`KeyVault.zeroAccessEscrowWraps`). Empty for a mailbox with an owner. */
+     * certificate (`KeyVault.zeroAccessEscrowWraps`). Released whether or not the mailbox has an owner now: a key provisioned while it had
+     * none has no copy under any master key, so these wraps are escrow's only way to open the mail sealed to it. */
     zeroAccessEscrowWraps: ZeroAccessEscrowWrap[];
     /** The certificate of each of `wrappedKeys` and `zeroAccessEscrowWraps` (matched by fingerprint), which decrypting CMS addressed to it needs. */
     certificates: (PublicKey | ZeroAccessKey)[];
@@ -435,9 +436,8 @@ export abstract class BaseEscrowAccessRequestRoute<R extends EscrowAccessRequest
         );
 
         const wrappedKeys: WrappedPrivateKey[] = (keyVault?.wrappedKeys ?? []).filter((k) => ESCROW_RELEASED_KEY_USES.includes(k.useType));
-        const zeroAccessEscrowWraps: ZeroAccessEscrowWrap[] = (mailbox as any).ownerUserUid
-            ? []
-            : (keyVault?.zeroAccessEscrowWraps ?? []).filter((w) => w.escrowScopeId === matter.escrowScopeId);
+        // Whatever the mailbox's owner now: a key provisioned while it had none is opened by nothing else (see `EscrowAccessMaterial`).
+        const zeroAccessEscrowWraps: ZeroAccessEscrowWrap[] = (keyVault?.zeroAccessEscrowWraps ?? []).filter((w) => w.escrowScopeId === matter.escrowScopeId);
         const released: Set<string> = new Set([...wrappedKeys.map((k) => k.fingerprint), ...zeroAccessEscrowWraps.map((w) => w.zeroAccessKeyFingerprint)]);
         return {
             masterKeyWraps: masterKeyWraps.filter((w) => w.method === "escrow" && w.escrowScopeId === matter.escrowScopeId),

@@ -145,6 +145,51 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
         expect(instance.zeroAccessWriter.discardPlaintext).not.toHaveBeenCalled();
     });
 
+    describe("a draft whose sealed update lost to a concurrent write", () => {
+        /** A run over draft d1 whose update fails, with the row as `current` (or a rejection) read back afterwards. */
+        async function lostDraft(current: any) {
+            const { instance, logger } = job({ messages: [message("d1", { folderUid: "drafts" })], update: vi.fn().mockRejectedValue(new Error("version")) });
+            instance.folderRepo.find.mockResolvedValue([{ uid: "drafts", type: "drafts" }, { uid: "outbox", type: "outbox" }, { uid: "sent", type: "sent" }]);
+            instance.messageRepo.findOne = current instanceof Error ? vi.fn().mockRejectedValue(current) : vi.fn().mockResolvedValue(current);
+            instance.zeroAccessWriter.removeIndexEntry = vi.fn().mockResolvedValue(undefined);
+            await instance.run();
+            return { instance, logger };
+        }
+
+        it("removes the index entry its seal replaced when the draft is gone, a sealed save won, or it is still readable in Drafts", async () => {
+            for (const current of [
+                undefined,
+                { uid: "d1", folderUid: "drafts", zeroAccess: { keyFingerprint: "fp" }, bodyBlobKey: "za/mb/drafts/other" },
+                { uid: "d1", folderUid: "drafts", zeroAccess: null, bodyBlobKey: "bodies/b" },
+            ]) {
+                const { instance } = await lostDraft(current);
+                expect(instance.zeroAccessWriter.removeIndexEntry).toHaveBeenCalledWith(sealed.indexEntryUid);
+            }
+        });
+
+        it("keeps it once the draft was filed as its sealed Sent Items copy or left Drafts to be sent, and when the draft can't be read", async () => {
+            for (const current of [
+                { uid: "d1", folderUid: "sent", zeroAccess: { keyFingerprint: "fp" }, bodyBlobKey: "za/mb/d1" },
+                { uid: "d1", folderUid: "outbox", zeroAccess: null, bodyBlobKey: "bodies/b" },
+                new Error("database down"),
+            ]) {
+                const { instance, logger } = await lostDraft(current);
+                expect(instance.zeroAccessWriter.removeIndexEntry).not.toHaveBeenCalled();
+                if (current instanceof Error) {
+                    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("database down"));
+                }
+            }
+        });
+
+        it("logs an entry it can't remove", async () => {
+            const { instance, logger } = job({ messages: [message("d1", { folderUid: "drafts" })], update: vi.fn().mockRejectedValue(new Error("version")) });
+            instance.messageRepo.findOne = vi.fn().mockResolvedValue(undefined);
+            instance.zeroAccessWriter.removeIndexEntry = vi.fn().mockRejectedValue(new Error("index down"));
+            await instance.run();
+            expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("index down"));
+        });
+    });
+
     it("keeps a message sealed, and logs it, when its readable copies can't all be removed", async () => {
         const { instance, logger } = job({ messages: [message("m1", { receivedDate: undefined, sentDate: new Date("2026-01-01") })] });
         instance.zeroAccessWriter.discardPlaintext.mockRejectedValue(new Error("store down"));

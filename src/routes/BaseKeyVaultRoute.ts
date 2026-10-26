@@ -63,8 +63,14 @@ export type PublicKeyVault = Pick<KeyVault, "wrappedKeys" | "masterKeyWraps"> & 
 };
 
 
-/** The most member key wraps one vault holds (members times retained keys). */
+/** The most member key wraps of one zero-access key a vault holds (one per member), and the most one request writes. Counted per key:
+ * a rotation adds a wrap per member and the earlier keys' wraps stay (they open the mail sealed to those keys), so a cap on the whole
+ * vault would, after enough rotations, refuse the new key's wraps and leave new mail sealed to a key no member holds. */
 const MAX_MEMBER_KEY_WRAPS = 2000;
+
+/** The most member key wraps one vault holds across all its keys - a bound on the document's size (a wrap is about 1 KB), far above
+ * what members times retained keys reach in practice. */
+const MAX_MEMBER_KEY_WRAPS_TOTAL = 10_000;
 
 /** The most escrow copies of zero-access keys one vault holds (keys times the scopes a mailbox was assigned to over time). */
 const MAX_ESCROW_ZERO_ACCESS_WRAPS = 200;
@@ -824,12 +830,10 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         }
         const accepted: MemberKeyWrap[] = await this.validateMemberWraps(mailbox, members, wraps, false);
         const keyVault: K = await this.findOrCreateKeyVault(mailbox.uid);
-        const replaced = (existing: MemberKeyWrap) =>
-            accepted.some((wrap) => wrap.memberUserUid === existing.memberUserUid && wrap.zeroAccessKeyFingerprint === existing.zeroAccessKeyFingerprint);
-        const memberKeyWraps: MemberKeyWrap[] = [...(keyVault.memberKeyWraps ?? []).filter((existing) => !replaced(existing)), ...accepted];
-        if (memberKeyWraps.length > MAX_MEMBER_KEY_WRAPS) {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A mailbox cannot hold more than ${MAX_MEMBER_KEY_WRAPS} member key wraps.`);
-        }
+        const wrapId = (wrap: MemberKeyWrap): string => `${wrap.memberUserUid}\n${wrap.zeroAccessKeyFingerprint}`;
+        const replaced: Set<string> = new Set(accepted.map(wrapId));
+        const memberKeyWraps: MemberKeyWrap[] = [...(keyVault.memberKeyWraps ?? []).filter((existing) => !replaced.has(wrapId(existing))), ...accepted];
+        BaseKeyVaultRoute.assertMemberWrapBounds(memberKeyWraps);
         await this.keyVaultRepo!.update({ uid: keyVault.uid, version: (keyVault as any).version, memberKeyWraps } as any, keyVault, { ignoreACL: true });
         await this.auditLogUtils!.record(
             {
@@ -909,6 +913,10 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         if (scope && !body.escrowWrap) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This mailbox is assigned to an escrow scope: escrowWrap is required.");
         }
+        // Before a certificate is issued for nothing: the new key's wraps must fit in the vault (checked again in the write).
+        if (((await this.findKeyVault(mailbox.uid))?.memberKeyWraps ?? []).length + wraps.length > MAX_MEMBER_KEY_WRAPS_TOTAL) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A mailbox cannot hold more than ${MAX_MEMBER_KEY_WRAPS_TOTAL} member key wraps.`);
+        }
         const issued = await this.encryptionCa!.issue(mailbox.primarySmtpAddress, body.csr);
         const cert = new crypto.X509Certificate(issued.certificate);
         const publicKey: ZeroAccessKey = {
@@ -948,10 +956,28 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
         return await this.sharedKeyStatus(await this.requireMailbox(mailbox.uid), user, members);
     }
 
+    /** Refuses (400) a vault's member wraps once one zero-access key would have more than `MAX_MEMBER_KEY_WRAPS` of them, or the vault more
+     * than `MAX_MEMBER_KEY_WRAPS_TOTAL` in all. */
+    private static assertMemberWrapBounds(wraps: MemberKeyWrap[]): void {
+        if (wraps.length > MAX_MEMBER_KEY_WRAPS_TOTAL) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A mailbox cannot hold more than ${MAX_MEMBER_KEY_WRAPS_TOTAL} member key wraps.`);
+        }
+        const perKey: Map<string, number> = new Map();
+        for (const wrap of wraps) {
+            const count: number = (perKey.get(wrap.zeroAccessKeyFingerprint) ?? 0) + 1;
+            if (count > MAX_MEMBER_KEY_WRAPS) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A mailbox cannot hold more than ${MAX_MEMBER_KEY_WRAPS} member key wraps of one key.`);
+            }
+            perKey.set(wrap.zeroAccessKeyFingerprint, count);
+        }
+    }
+
     /** The new key on the mailbox and its member and escrow wraps in the vault, in one transaction. */
     @Transactional()
     protected async persistSharedEnrollment(mailbox: M, publicKey: ZeroAccessKey, wraps: MemberKeyWrap[], escrowWraps: ZeroAccessEscrowWrap[]): Promise<K> {
         const keyVault: K = await this.findOrCreateKeyVault(mailbox.uid);
+        const memberKeyWraps: MemberKeyWrap[] = [...(keyVault.memberKeyWraps ?? []), ...wraps];
+        BaseKeyVaultRoute.assertMemberWrapBounds(memberKeyWraps);
         await this.mailboxRepo!.update(
             { uid: mailbox.uid, version: (mailbox as any).version, zeroAccessKeys: supersedeKeys(mailbox.zeroAccessKeys, publicKey, Date.now()) } as any,
             mailbox,
@@ -961,7 +987,7 @@ export abstract class BaseKeyVaultRoute<K extends KeyVault, M extends Mailbox> {
             {
                 uid: keyVault.uid,
                 version: (keyVault as any).version,
-                memberKeyWraps: [...(keyVault.memberKeyWraps ?? []), ...wraps],
+                memberKeyWraps,
                 ...(escrowWraps.length ? { zeroAccessEscrowWraps: [...(keyVault.zeroAccessEscrowWraps ?? []), ...escrowWraps] } : {}),
             } as any,
             keyVault,

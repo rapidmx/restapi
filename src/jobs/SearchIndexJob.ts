@@ -11,7 +11,9 @@ import { SearchDocument, SearchProvider } from "../search/SearchProvider.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { removeFromSearchIndex } from "../util/SearchIndexUtils.js";
 import { isEncryptedBody } from "../util/SmimeUtils.js";
-import { Attachment, Message, RecipientType } from "../models/types.js";
+import { Attachment, Mailbox, Message, RecipientType } from "../models/types.js";
+import { newZeroAccessWriter, type ZeroAccessWriter } from "../zeroaccess/ZeroAccessWriter.js";
+import { PROTECTED_SUBJECT } from "../zeroaccess/ZeroAccessSealer.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /** Well above any real message's attachment count - see `buildDocument()`'s own note on why this must be
@@ -42,17 +44,31 @@ const MAX_ERROR_LENGTH = 1000;
  * unindexed with `searchIndexError` recorded - excluded from every later candidate query, so a permanently
  * failing message can never occupy the head of the (oldest-first) queue and starve the rest of the backlog.
  *
+ * Zero-access (`specs/search.md` §3): a sealed message is indexed as metadata only, and so is any message still stored readable in a
+ * mailbox whose mail is zero-access - a draft assembled readable to be sent, waiting in Outbox or moved back to Drafts, or mail the
+ * backfill hasn't reached yet - under the placeholder subject, without its body or attachment text. Whatever cleared its stamp (a move, a
+ * flag, an attachment extracted late), its readable text never reaches the search provider. That metadata document is what replaces a
+ * readable one the provider may still hold, so such a message is never simply given up on: when its retries run out its document is
+ * removed, and while that removal fails it is retried at the longest backoff.
+ *
  * @author Jean-Philippe Steinmetz
  */
 export abstract class SearchIndexJob<M extends Message, A extends Attachment> extends BackgroundService {
     protected abstract messageClass: any;
     protected abstract attachmentClass: any;
+    /** The backend's `Mailbox`, `EncryptionPolicy` and `ZeroAccessIndexEntry` models: which mailboxes' mail is zero-access. Optional:
+     * without them every readable message is indexed in full, as before zero-access. */
+    protected mailboxClass?: any;
+    protected encryptionPolicyClass?: any;
+    protected zeroAccessIndexEntryClass?: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
     protected messageRepo?: RecoverableRepoUtils<M>;
     protected attachmentRepo?: RepoUtils<A>;
+    protected mailboxRepo?: RepoUtils<any>;
+    protected zeroAccessWriter?: ZeroAccessWriter;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -96,6 +112,10 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
                 args: [this.attachmentClass],
             });
         }
+        if (!this.mailboxRepo && this.mailboxClass) {
+            this.mailboxRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.mailboxClass.name, args: [this.mailboxClass] });
+        }
+        this.zeroAccessWriter ??= await newZeroAccessWriter(this._objectFactory, this.encryptionPolicyClass, this.zeroAccessIndexEntryClass);
     }
 
     public async start(): Promise<void> {
@@ -144,16 +164,35 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
         // Per built message, the attachment uids whose extracted text went into its document (only for a message
         // whose attachments were actually read) - re-checked after stamping, see `recheckAttachmentText()`.
         const indexedAttachmentUids: Map<string, Set<string>> = new Map();
+        // Per readable message's mailbox, whether its mail is zero-access (`undefined`: it couldn't be told this run).
+        const zeroAccessMailboxes: Map<string, boolean | undefined> = await this.zeroAccessMailboxes(pending);
+        // The messages indexed as metadata only because of zero-access: their document replaces a readable one (`recordFailure()`).
+        const replacesReadable: Set<string> = new Set();
         for (const message of pending) {
+            const sealed: boolean = !!(message as any).zeroAccess;
+            const inZeroAccessMailbox: boolean | undefined =
+                !sealed && zeroAccessMailboxes.has(message.mailboxUid) ? zeroAccessMailboxes.get(message.mailboxUid) : false;
+            if (inZeroAccessMailbox === undefined) {
+                // Indexed in full it could put a zero-access mailbox's plaintext in the index: left for a later run. Its document may be
+                // a readable one a zero-access mailbox must not keep, so it is treated as one that does.
+                await this.recordFailure(message, "couldn't tell whether its mailbox's mail is zero-access", true);
+                continue;
+            }
+            if (sealed || inZeroAccessMailbox) {
+                replacesReadable.add(message.uid);
+            }
             try {
                 const seen: Set<string> = new Set();
-                docs.push(await this.buildDocument(message, seen));
-                if (message.hasAttachments) {
+                const doc: SearchDocument = await this.buildDocument(message, seen, inZeroAccessMailbox && !message.encrypted);
+                docs.push(doc);
+                // Only a message whose attachments were read: `recheckAttachmentText()` would otherwise clear the stamp of a sealed or
+                // metadata-only message on every pass, for attachment text its document never holds.
+                if (message.hasAttachments && !doc.metadataOnly) {
                     indexedAttachmentUids.set(message.uid, seen);
                 }
                 built.push(message);
             } catch (err: any) {
-                await this.recordFailure(message, `failed to build search document: ${err?.message}`);
+                await this.recordFailure(message, `failed to build search document: ${err?.message}`, replacesReadable.has(message.uid));
             }
         }
 
@@ -170,7 +209,7 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
         } catch (err: any) {
             // A whole-batch failure (e.g. the provider is unreachable): nothing can be assumed indexed.
             for (const message of built) {
-                await this.recordFailure(message, `bulk index failed: ${err?.message}`);
+                await this.recordFailure(message, `bulk index failed: ${err?.message}`, replacesReadable.has(message.uid));
             }
             return;
         }
@@ -178,7 +217,7 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
         const indexedAt: Date = new Date();
         for (const message of built) {
             if (!indexedUids.has(message.uid)) {
-                await this.recordFailure(message, "search provider did not index the document");
+                await this.recordFailure(message, "search provider did not index the document", replacesReadable.has(message.uid));
                 continue;
             }
             const update: any = { uid: message.uid, version: (message as any).version, searchIndexedAt: indexedAt };
@@ -267,14 +306,57 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
     }
 
     /**
+     * Whether the mail of each mailbox `pending` has a readable message in is zero-access (`ZeroAccessWriter.target()`), read once per
+     * mailbox, with the administrator's setting read once per run. A mailbox whose state couldn't be read maps to `undefined`. Empty
+     * without the zero-access models, or with no readable message.
+     */
+    private async zeroAccessMailboxes(pending: M[]): Promise<Map<string, boolean | undefined>> {
+        const result: Map<string, boolean | undefined> = new Map();
+        const uids: string[] = [...new Set(pending.filter((message) => !(message as any).zeroAccess).map((message) => message.mailboxUid))];
+        if (uids.length === 0 || !this.zeroAccessWriter || !this.mailboxRepo) {
+            return result;
+        }
+        let allowed: boolean;
+        try {
+            allowed = await this.zeroAccessWriter.allowed();
+        } catch (err: any) {
+            this.logger?.warn(`SearchIndexJob: couldn't read whether zero-access encryption is allowed: ${err?.message}`);
+            return new Map(uids.map((uid) => [uid, undefined]));
+        }
+        for (const uid of uids) {
+            try {
+                const mailbox: Mailbox | undefined = allowed ? await this.mailboxRepo.findOne(uid, { ignoreACL: true }) : undefined;
+                result.set(uid, !!mailbox && !!(await this.zeroAccessWriter.target(mailbox, "mail", allowed)));
+            } catch (err: any) {
+                this.logger?.warn(`SearchIndexJob: couldn't read mailbox ${uid}'s zero-access state: ${err?.message}`);
+                result.set(uid, undefined);
+            }
+        }
+        return result;
+    }
+
+    /**
      * Records one failed indexing attempt on `message`: increments `searchIndexAttempts`, schedules the next
      * attempt with exponential backoff, and stores the error. Once `maxAttempts` is reached the message is no
      * longer selected by `run()` and the failure is logged as an error.
+     *
+     * `replacesReadable`: the message's document is metadata only because of zero-access, and replaces one the provider may still hold
+     * with its readable text. When its attempts run out that document is removed instead; while the removal fails, the message stays
+     * selected and is retried at the longest backoff, so a readable document is never left behind for good.
      */
-    private async recordFailure(message: M, reason: string): Promise<void> {
-        const attempts: number = (message.searchIndexAttempts ?? 0) + 1;
-        const exhausted: boolean = attempts >= this.maxAttempts;
-        const delayMs: number = this.retryBackoffSeconds * 1000 * Math.pow(2, attempts - 1);
+    private async recordFailure(message: M, reason: string, replacesReadable: boolean): Promise<void> {
+        let attempts: number = (message.searchIndexAttempts ?? 0) + 1;
+        let exhausted: boolean = attempts >= this.maxAttempts;
+        if (exhausted && replacesReadable) {
+            if ((await removeFromSearchIndex(this.searchProvider, "message", message.uid, this.logger)) > 0) {
+                exhausted = false;
+                attempts = Math.max(this.maxAttempts - 1, 0);
+                reason = `${reason} (its readable document couldn't be removed either, so it is retried)`;
+            } else {
+                reason = `${reason} (its document was removed from the index)`;
+            }
+        }
+        const delayMs: number = this.retryBackoffSeconds * 1000 * Math.pow(2, Math.max(attempts - 1, 0));
         if (exhausted) {
             this.logger?.error(`SearchIndexJob: giving up on message ${message.uid} after ${attempts} failed attempt(s): ${reason}`);
         } else {
@@ -297,10 +379,12 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
         }
     }
 
-    private async buildDocument(message: M, indexedAttachmentUids?: Set<string>): Promise<SearchDocument> {
+    /** `zeroAccessMailbox`: `message` is still readable in a mailbox whose mail is zero-access, and is indexed as a sealed one is. */
+    private async buildDocument(message: M, indexedAttachmentUids?: Set<string>, zeroAccessMailbox: boolean = false): Promise<SearchDocument> {
         // A zero-access message is stored sealed: there is nothing here to read, so its metadata is indexed without fetching the blob.
-        // Its content is searched on the owner's devices, from its sealed index entry (`specs/search.md` §7).
-        const sealed: boolean = !!(message as any).zeroAccess;
+        // Its content is searched on the owner's devices, from its sealed index entry (`specs/search.md` §7). One still readable in a
+        // zero-access mailbox (a draft assembled for sending) gets the same document, under the placeholder subject its sealed copy gets.
+        const sealed: boolean = !!(message as any).zeroAccess || zeroAccessMailbox;
         // `skipImageLinks`: otherwise a related image is inlined into the HTML as a `data:` URI - base64 of the whole image, which
         // is what would be indexed (and held in memory) for an HTML-only message.
         const parsed: ParsedMail | undefined = sealed ? undefined : await simpleParser(await this.blobStore!.get(message.bodyBlobKey), { skipImageLinks: true });
@@ -352,7 +436,7 @@ export abstract class SearchIndexJob<M extends Message, A extends Attachment> ex
             entityType: "message",
             entityUid: message.uid,
             mailboxUid: message.mailboxUid,
-            subject: message.subject,
+            subject: zeroAccessMailbox ? PROTECTED_SUBJECT : message.subject,
             body,
             attachmentText,
             participants,

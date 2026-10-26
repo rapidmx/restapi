@@ -212,6 +212,29 @@ describe("CalendarReminderJobMongo Tests (real DB + DI)", () => {
         expect(JSON.parse(fakeRedis.published[0].message).data).toEqual(expect.objectContaining({ title: "[...]", protected: true }));
     });
 
+    it("Carries only the busy block in a private or confidential event's reminder, which a read-only grantee's socket receives too.", async () => {
+        const now = Date.now();
+        for (const visibility of ["private", "confidential"]) {
+            await createEvent({
+                startDate: new Date(now + 5 * 60 * 1000),
+                reminderMinutesBeforeStart: 4.5,
+                title: "CANARY Oncology appointment",
+                location: "CANARY Clinic X",
+                visibility,
+            } as any);
+        }
+
+        await job.run();
+
+        expect(fakeRedis.published).toHaveLength(4);
+        for (const entry of fakeRedis.published) {
+            const data = JSON.parse(entry.message).data;
+            expect(data).toEqual(expect.objectContaining({ title: "Busy", redacted: true, protected: true }));
+            expect(data.location).toBeUndefined();
+            expect(entry.message).not.toContain("CANARY");
+        }
+    });
+
     it("Carries the event's own location in the reminder, verbatim.", async () => {
         const now = Date.now();
         const event = await createEvent({

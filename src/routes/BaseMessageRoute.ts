@@ -1430,10 +1430,13 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             // `assertSenderAllowed()` above refused a sender that has no mailbox.
             await this.reportUndelivered(message, sendingMailbox!, undelivered, messageId);
         }
-        // The Sent Items copy joins the conversation the message it replies to is already in, rather than
-        // starting one keyed on whichever ancestor its own headers happen to name - see `resolveConversationId()`.
-        const conversationId: string = await this.threadConversationId(message.mailboxUid, references, inReplyTo, messageId);
+        // Relayed: from here on, whatever fails, the catch records the relay's sanitized render (or removes it), so nothing written by the
+        // relay is left that no row names - the conversation lookup included.
+        let conversationId: string | undefined;
         try {
+            // The Sent Items copy joins the conversation the message it replies to is already in, rather than
+            // starting one keyed on whichever ancestor its own headers happen to name - see `resolveConversationId()`.
+            conversationId = await this.threadConversationId(message.mailboxUid, references, inReplyTo, messageId);
             return await this.fileSentMessage(message, claimed, user, raw, relayedRaw, attachesReceiptRequest, envelopeTo, {
                 messageId,
                 conversationId,
@@ -1484,16 +1487,22 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * conversation one of its ancestors is already filed under, or - when the mailbox holds none of them - the
      * one its own headers derive (see `util/ConversationUtils.ts`). Used for a message this mailbox sends;
      * `ScanQueueJob` resolves a delivered one exactly the same way, so the sender's Sent Items copy and every
-     * recipient's own copy each join the thread their own mailbox already holds. */
+     * recipient's own copy each join the thread their own mailbox already holds. The ancestor lookup is best effort: it runs after the
+     * relay, so a failing one falls back to the headers' own conversation rather than failing a send that already went out. */
     private async threadConversationId(
         mailboxUid: string,
         references: string[],
         inReplyTo: string | undefined,
         messageId: string,
     ): Promise<string> {
-        return await resolveConversationId(references, inReplyTo, messageId, (ancestors) =>
-            findThreadConversationId(this.repoUtils!, mailboxUid, ancestors),
-        );
+        return await resolveConversationId(references, inReplyTo, messageId, async (ancestors) => {
+            try {
+                return await findThreadConversationId(this.repoUtils!, mailboxUid, ancestors);
+            } catch (err: any) {
+                this.logger?.warn(`BaseMessageRoute: couldn't look up the conversation of a sent message's ancestors: ${err?.message ?? err}`);
+                return undefined;
+            }
+        });
     }
 
     /** Whether `current` is still in the Outbox `claimed` was claimed in, carrying the lease that claim wrote. */

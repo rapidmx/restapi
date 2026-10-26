@@ -7,7 +7,7 @@ import { type MailboxIdentity, MeetingInviteSender } from "../scheduling/Meeting
 import { ApiErrors, BackgroundService, ModelUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { CalendarEvent, CalendarEventStatus } from "../models/types.js";
-import { hasSealedFields } from "../zeroaccess/ZeroAccessFieldSealer.js";
+import { isSealedEvent } from "../zeroaccess/ZeroAccessFieldSealer.js";
 const { Config, Init, Logger } = ObjectDecorators;
 
 /** A mailbox's own identity, as this job sends for it: its (lowercased) addresses and its safe display name. */
@@ -313,9 +313,10 @@ export abstract class MeetingSchedulingJob<CE extends CalendarEvent> extends Bac
                 if (event.inviteSequenceSent !== undefined && event.inviteSequenceSent === event.sequence) {
                     continue;
                 }
-                // A protected event's title is sealed: its invitations are sent by the route that saves it, from the request's plaintext
-                // (`BaseCalendarEventRoute.sendProtectedInvitations()`), never composed here from placeholders. Left pending, not stamped.
-                if (hasSealedFields(event)) {
+                // A protected event's title is sealed - field by field, or whole as an event filed from a zero-access invitation: its
+                // invitations are sent by the route that saves it, from the request's plaintext (`BaseCalendarEventRoute.sendProtectedInvitations()`),
+                // never composed here from placeholders. Left pending, not stamped.
+                if (isSealedEvent(event)) {
                     continue;
                 }
                 // A meeting protected by a per-meeting key: its guests' links need keys only a save carries (meet-plugin

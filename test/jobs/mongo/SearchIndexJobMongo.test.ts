@@ -20,6 +20,10 @@ import { SearchIndexJobMongo } from "../../../src/jobs/mongo/SearchIndexJobMongo
 import { AttachmentMongo } from "../../../src/models/mongo/AttachmentMongo.js";
 import { MessageMongo } from "../../../src/models/mongo/MessageMongo.js";
 import { RecipientType } from "../../../src/models/types.js";
+import { EncryptionPolicyMongo } from "../../../src/models/mongo/EncryptionPolicyMongo.js";
+import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
+import { ZeroAccessIndexEntryMongo } from "../../../src/models/mongo/ZeroAccessIndexEntryMongo.js";
+import { searchIndexZeroAccessSuite } from "../searchIndexZeroAccessSuite.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: { port: 9999, dbName: "rrst-test" },
@@ -32,6 +36,8 @@ describe("SearchIndexJobMongo Tests (real DB + DI)", () => {
     let job: SearchIndexJobMongo;
     let messageRepo: MongoRepository<MessageMongo>;
     let attachmentRepo: MongoRepository<AttachmentMongo>;
+    let mailboxRepo: MongoRepository<MailboxMongo>;
+    let policyRepo: MongoRepository<EncryptionPolicyMongo>;
 
     const mailboxUid = uuid.v4();
 
@@ -76,6 +82,9 @@ describe("SearchIndexJobMongo Tests (real DB + DI)", () => {
         const models = new Map<string, any>();
         models.set("MessageMongo", MessageMongo);
         models.set("AttachmentMongo", AttachmentMongo);
+        models.set("MailboxMongo", MailboxMongo);
+        models.set("EncryptionPolicyMongo", EncryptionPolicyMongo);
+        models.set("ZeroAccessIndexEntryMongo", ZeroAccessIndexEntryMongo);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("mongo");
@@ -84,6 +93,8 @@ describe("SearchIndexJobMongo Tests (real DB + DI)", () => {
         }
         messageRepo = conn.getMongoRepository("MessageMongo");
         attachmentRepo = conn.getMongoRepository("AttachmentMongo");
+        mailboxRepo = conn.getMongoRepository("MailboxMongo");
+        policyRepo = conn.getMongoRepository("EncryptionPolicyMongo");
 
         // Constructed once via real ObjectFactory DI: `@Init` builds its two real `RepoUtils` against the live
         // connection above, and `@Inject("BlobStore")`/`@Inject("SearchProvider")` resolve to the registered
@@ -97,7 +108,7 @@ describe("SearchIndexJobMongo Tests (real DB + DI)", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [messageRepo, attachmentRepo]) {
+        for (const repo of [messageRepo, attachmentRepo, mailboxRepo, policyRepo] as MongoRepository<any>[]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -633,5 +644,36 @@ describe("SearchIndexJobMongo Tests (real DB + DI)", () => {
             expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("simulated re-check lookup failure"));
             expect((await findMessage(message.uid))!.searchIndexedAt).toBeInstanceOf(Date);
         });
+    });
+
+    searchIndexZeroAccessSuite({
+        job: () => job,
+        searchProvider: () => objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!,
+        blobStore: () => objectFactory.getInstance<any>("BlobStore")!,
+        createMessage: (data?: any) => createMessage(data),
+        createAttachment: (data?: any) => createAttachment(data),
+        findMessage: async (uid) => await messageRepo.findOne({ uid } as any),
+        updateMessage: async (uid, fields) => {
+            await messageRepo.updateOne({ uid } as any, { $set: fields });
+        },
+        createMailbox: async (data?: any) =>
+            await mailboxRepo.save(
+                new MailboxMongo({
+                    ownerUserUid: uuid.v4(),
+                    primarySmtpAddress: `${uuid.v4()}@example.com`,
+                    aliasAddresses: [],
+                    displayName: "Index Mailbox",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                    ...data,
+                }),
+            ),
+        setAllowZeroAccess: async (allow) => {
+            await policyRepo.deleteMany({});
+            if (allow !== undefined) {
+                await policyRepo.save(new EncryptionPolicyMongo({ uid: "encryption-policy", allowZeroAccess: allow }));
+            }
+        },
     });
 });

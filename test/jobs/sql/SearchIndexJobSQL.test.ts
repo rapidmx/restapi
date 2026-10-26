@@ -17,6 +17,10 @@ import { SearchIndexJobSQL } from "../../../src/jobs/sql/SearchIndexJobSQL.js";
 import { AttachmentSQL } from "../../../src/models/sql/AttachmentSQL.js";
 import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
 import { RecipientType } from "../../../src/models/types.js";
+import { EncryptionPolicySQL } from "../../../src/models/sql/EncryptionPolicySQL.js";
+import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
+import { ZeroAccessIndexEntrySQL } from "../../../src/models/sql/ZeroAccessIndexEntrySQL.js";
+import { searchIndexZeroAccessSuite } from "../searchIndexZeroAccessSuite.js";
 
 describe("SearchIndexJobSQL Tests (real DB + DI)", () => {
     const logger = Logger();
@@ -25,6 +29,8 @@ describe("SearchIndexJobSQL Tests (real DB + DI)", () => {
     let job: SearchIndexJobSQL;
     let messageRepo: Repository<MessageSQL>;
     let attachmentRepo: Repository<AttachmentSQL>;
+    let mailboxRepo: Repository<MailboxSQL>;
+    let policyRepo: Repository<EncryptionPolicySQL>;
 
     const mailboxUid = uuid.v4();
 
@@ -71,6 +77,9 @@ describe("SearchIndexJobSQL Tests (real DB + DI)", () => {
         models.set("AccessControlListSQL", AccessControlListSQL);
         models.set("MessageSQL", MessageSQL);
         models.set("AttachmentSQL", AttachmentSQL);
+        models.set("MailboxSQL", MailboxSQL);
+        models.set("EncryptionPolicySQL", EncryptionPolicySQL);
+        models.set("ZeroAccessIndexEntrySQL", ZeroAccessIndexEntrySQL);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("sql");
@@ -79,6 +88,8 @@ describe("SearchIndexJobSQL Tests (real DB + DI)", () => {
         }
         messageRepo = conn.getRepository(MessageSQL);
         attachmentRepo = conn.getRepository(AttachmentSQL);
+        mailboxRepo = conn.getRepository(MailboxSQL);
+        policyRepo = conn.getRepository(EncryptionPolicySQL);
 
         // Constructed once via real ObjectFactory DI: `@Init` builds its two real `RepoUtils` against the live
         // connection above, and `@Inject("BlobStore")`/`@Inject("SearchProvider")` resolve to the registered
@@ -91,7 +102,7 @@ describe("SearchIndexJobSQL Tests (real DB + DI)", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [messageRepo, attachmentRepo]) {
+        for (const repo of [messageRepo, attachmentRepo, mailboxRepo, policyRepo] as Repository<any>[]) {
             await repo.clear();
         }
         objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!.indexed.clear();
@@ -551,5 +562,36 @@ describe("SearchIndexJobSQL Tests (real DB + DI)", () => {
             expect(searchProvider.indexed.get(`message:${message.uid}`)!.attachmentText).toEqual(["late attachment text"]);
             expect((await findMessage(message.uid))!.searchIndexedAt).toBeInstanceOf(Date);
         });
+    });
+
+    searchIndexZeroAccessSuite({
+        job: () => job,
+        searchProvider: () => objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!,
+        blobStore: () => objectFactory.getInstance<any>("BlobStore")!,
+        createMessage: (data?: any) => createMessage(data),
+        createAttachment: (data?: any) => createAttachment(data),
+        findMessage: async (uid) => await messageRepo.findOne({ where: { uid } }),
+        updateMessage: async (uid, fields) => {
+            await messageRepo.update({ uid }, fields);
+        },
+        createMailbox: async (data?: any) =>
+            await mailboxRepo.save(
+                new MailboxSQL({
+                    ownerUserUid: uuid.v4(),
+                    primarySmtpAddress: `${uuid.v4()}@example.com`,
+                    aliasAddresses: [],
+                    displayName: "Index Mailbox",
+                    timezone: "UTC",
+                    quotaBytes: 1_000_000_000,
+                    usedBytes: 0,
+                    ...data,
+                }),
+            ),
+        setAllowZeroAccess: async (allow) => {
+            await policyRepo.clear();
+            if (allow !== undefined) {
+                await policyRepo.save(new EncryptionPolicySQL({ uid: "encryption-policy", allowZeroAccess: allow }));
+            }
+        },
     });
 });

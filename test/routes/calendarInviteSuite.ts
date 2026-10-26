@@ -316,6 +316,20 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
                 expect(JSON.stringify(rows)).not.toContain("CANARY");
             });
 
+            it("Gives an occurrence a client that couldn't open the series sends back with its placeholders the series' sealed content", async () => {
+                const { mailbox, calendar, me, series } = await acceptedSeries();
+
+                const result = await owner(request(ctx.app()).post(ctx.baseUrl)).send(
+                    occurrence(mailbox, calendar, me, { title: "[...]", location: null, description: null }),
+                );
+
+                expect(result.status).toBeLessThan(300);
+                const row: any = (await ctx.findEvents(mailbox.uid)).find((event: any) => event.uid !== series.uid);
+                expect(row.title).toBe("[...]");
+                expect(row.sealedContent).toEqual(series.sealedContent);
+                expect((await openSealedField(row.sealedContent.sealed, keys.get(mailbox.uid)!)).title).toBe("Video Test");
+            });
+
             it("Leaves a create of another icalUid, or of another mailbox's series, to the calendar's own setting", async () => {
                 const { mailbox, calendar, me } = await acceptedSeries();
                 const other = await setup();
@@ -332,6 +346,140 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
                 expect(copied.title).toBe("CANARY Video Test");
                 expect(copied.sealedContent ?? null).toBeNull();
             });
+        });
+
+        describe("an update of an event filed from a zero-access invitation by a client that couldn't open it", () => {
+            const acceptedMeeting = async () => {
+                const context = await setup();
+                const message = await receiveSealed(context.mailbox.uid, context.inbox.uid);
+                expect((await owner(request(ctx.app()).post(inviteUrl(message.uid, "/respond"))).send({ responseStatus: "accepted", ics: requestFor(context.me) })).status).toBe(200);
+                const [row] = await ctx.findEvents(context.mailbox.uid);
+                return { ...context, row };
+            };
+
+            it("Keeps the sealed content of the event written back as it was served, with a new time", async () => {
+                const { mailbox, row } = await acceptedMeeting();
+                const served = await owner(request(ctx.app()).get(`${ctx.baseUrl}/${row.uid}`));
+                expect(served.body).toMatchObject({ title: "[...]" });
+                const later = new Date(start.getTime() + 3 * HOUR);
+
+                const result = await owner(request(ctx.app()).put(`${ctx.baseUrl}/${row.uid}`)).send({
+                    ...served.body,
+                    startDate: later,
+                    endDate: new Date(later.getTime() + HOUR),
+                });
+
+                expect(result.status).toBe(200);
+                const [updated] = await ctx.findEvents(mailbox.uid);
+                expect(new Date(updated.startDate).getTime()).toBe(later.getTime());
+                expect(updated.sealedContent).toEqual(row.sealedContent);
+                expect((await openSealedField(updated.sealedContent.sealed, keys.get(mailbox.uid)!)).title).toBe("Video Test");
+            });
+
+            it("Refuses (409) a new location sent with the placeholder title, which resealing would lose", async () => {
+                const { mailbox, row } = await acceptedMeeting();
+
+                const result = await owner(request(ctx.app()).put(`${ctx.baseUrl}/${row.uid}`)).send({
+                    uid: row.uid,
+                    version: row.version,
+                    title: "[...]",
+                    location: "CANARY Room 5",
+                });
+
+                expect(result.status).toBe(409);
+                const [unchanged] = await ctx.findEvents(mailbox.uid);
+                expect(unchanged.sealedContent).toEqual(row.sealedContent);
+                expect(JSON.stringify(unchanged)).not.toContain("CANARY");
+            });
+        });
+
+        describe("a meeting the mailbox organizes whose content is sealed whole", () => {
+            const GUEST = "guest@elsewhere.example";
+            const organized = async () => {
+                const context = await setup();
+                const key = await keyOf(context.mailbox.uid);
+                const row = await ctx.createCalendarEvent(context.mailbox.uid, context.calendar.uid, {
+                    icalUid: `organized-${uuid.v4()}`,
+                    title: "[...]",
+                    sealedContent: { keyFingerprint: key.key.fingerprint, sealed: "eA==" },
+                    organizer: { address: context.me, type: RecipientType.TO },
+                    attendees: [{ address: GUEST, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false }],
+                    sequence: 0,
+                    inviteSequenceSent: 0,
+                });
+                return { ...context, row };
+            };
+            const moved = (row: any, fields: any = {}) => ({
+                uid: row.uid,
+                version: row.version,
+                startDate: new Date(start.getTime() + 5 * HOUR),
+                endDate: new Date(start.getTime() + 6 * HOUR),
+                ...fields,
+            });
+
+            it("Invites for a move from the content the organizer's client opened, never from the placeholders", async () => {
+                const { mailbox, row } = await organized();
+                const before = ctx.transport().sent.length;
+
+                const result = await owner(request(ctx.app()).put(`${ctx.baseUrl}/${row.uid}`)).send(
+                    moved(row, { title: "CANARY Board review", location: "CANARY Room 2", description: null, descriptionHtml: null }),
+                );
+
+                expect(result.status).toBe(200);
+                const sent = ctx.transport().sent.slice(before);
+                expect(sent).toHaveLength(1);
+                const text = decoded(sent[0].raw);
+                expect(text).toContain("SUMMARY:CANARY Board review");
+                expect(text).not.toContain("[...]");
+                const [stored] = await ctx.findEvents(mailbox.uid);
+                expect(stored.inviteSequenceSent).toBe(stored.sequence);
+                expect(stored.title).toBe("[...]");
+                expect(JSON.stringify(stored)).not.toContain("CANARY");
+            });
+
+            it("Sends nothing for a move by a client that couldn't open it, leaving the revision pending", async () => {
+                const { mailbox, row } = await organized();
+                const before = ctx.transport().sent.length;
+
+                const result = await owner(request(ctx.app()).put(`${ctx.baseUrl}/${row.uid}`)).send(moved(row, { title: "[...]", location: null }));
+
+                expect(result.status).toBe(200);
+                expect(ctx.transport().sent.length).toBe(before);
+                const [stored] = await ctx.findEvents(mailbox.uid);
+                expect(stored.sequence).toBe(1);
+                expect(stored.inviteSequenceSent).toBe(0);
+                expect(stored.sealedContent).toEqual(row.sealedContent);
+            });
+        });
+
+        it("Keeps the title's sealed copy when an answered revision names no title, though its location goes into sealed content", async () => {
+            const { mailbox, inbox, calendar, me } = await setup();
+            // Mail stays zero-access; the calendar isn't protected any more, but the copy kept its per-field sealing.
+            const message = await receiveSealed(mailbox.uid, inbox.uid);
+            await ctx.createCalendarEvent(mailbox.uid, calendar.uid, {
+                uid: nameBasedUuid(`itip:${mailbox.uid}:${eventUid}:master`),
+                icalUid: eventUid,
+                title: "Protected event",
+                sealedFields: { title: "c2VhbGVkIHRpdGxl" },
+                organizer: { address: "boss@boss.example.com", type: RecipientType.TO },
+                attendees: [{ address: me, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false }],
+                sequence: 0,
+                inviteSequenceSent: 0,
+            });
+
+            const result = await owner(request(ctx.app()).post(inviteUrl(message.uid, "/respond"))).send({
+                responseStatus: "accepted",
+                ics: requestFor(me, { sequence: 1, extra: ["LOCATION:CANARY Room 9"] }).replace("SUMMARY:Video Test\r\n", ""),
+            });
+
+            expect(result.status).toBe(200);
+            const [row] = await ctx.findEvents(mailbox.uid);
+            expect(row.sequence).toBe(1);
+            expect(row.sealedContent.keyFingerprint).toBe((await keyOf(mailbox.uid)).key.fingerprint);
+            expect(row.location ?? null).toBeNull();
+            expect(JSON.stringify(row)).not.toContain("CANARY");
+            // The only copy of the title there is.
+            expect(row.sealedFields).toEqual({ title: "c2VhbGVkIHRpdGxl" });
         });
 
         it("Clears the readable location of a copy not sealed yet when a newer revision in a protected calendar names none", async () => {

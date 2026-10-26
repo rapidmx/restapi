@@ -128,6 +128,15 @@ export function meetingSchedulingLinkSuite(ctx: MeetingSchedulingLinkSuiteContex
             expect((await ctx.reload(event.uid)).inviteSequenceSent).not.toBe(0);
         });
 
+        it("Leaves an organizer's event filed from a zero-access invitation, its content sealed whole, to the save that holds its plaintext.", async () => {
+            const event = await ctx.createEvent({ title: "[...]", sealedContent: { keyFingerprint: "fp", sealed: "c2VhbGVk" }, attendees: [attendee(ALICE)] });
+
+            await ctx.job().run();
+
+            expect(ctx.transport().sent).toHaveLength(0);
+            expect((await ctx.reload(event.uid)).inviteSequenceSent).not.toBe(0);
+        });
+
         it("Matches an attendee's link case-insensitively, however the plugin stored the address.", async () => {
             const event = await ctx.createEvent({ videoMeetingUid: "meeting-1", attendees: [{ ...attendee("Alice@Example.com") }] });
             await ctx.createLink({ mailboxUid: ctx.mailboxUid(), calendarEventUid: event.uid, attendeeAddress: " ALICE@EXAMPLE.COM ", url: ALICE_URL });

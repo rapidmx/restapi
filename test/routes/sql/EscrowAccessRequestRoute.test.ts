@@ -316,13 +316,14 @@ describe("Route:EscrowAccessRequestSQL Tests", () => {
             expect(fulfilled?.status).toBe("fulfilled");
             expect(fulfilled?.fulfilledAt).toBeTruthy();
 
-            // Once the mailbox has an owner, its escrowed master key opens its keys; its key escrow wraps are not released.
+            // Once the mailbox has an owner, its escrowed master key opens the keys it wraps - but not one provisioned while it had none,
+            // whose escrow wrap is the only copy escrow has: still released.
             await mailboxRepo.update({ uid: mailbox.uid }, { ownerUserUid: uuid.v4() });
             const owned = await request(server.getApplication())
                 .get(`${baseUrl}/${createResult.body.uid}/material`)
                 .set("Authorization", "jwt " + holderAToken);
-            expect(owned.body.zeroAccessEscrowWraps).toEqual([]);
-            expect(owned.body.certificates.map((k: any) => k.fingerprint).sort()).toEqual(["fp-enc", "fp-za"]);
+            expect(owned.body.zeroAccessEscrowWraps.map((w: any) => w.zeroAccessKeyFingerprint)).toEqual(["fp-za-shared"]);
+            expect(owned.body.certificates.map((k: any) => k.fingerprint).sort()).toEqual(["fp-enc", "fp-za", "fp-za-shared"]);
         });
     });
 

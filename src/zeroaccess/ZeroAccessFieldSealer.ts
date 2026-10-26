@@ -139,3 +139,9 @@ export async function sealFieldsOnWrite<R extends { sealedFields?: SealedFields 
 export function hasSealedFields(record: { sealedFields?: SealedFields | null } | undefined): boolean {
     return !!record?.sealedFields && Object.keys(record.sealedFields).length > 0;
 }
+
+/** Whether an event's content is sealed at all: field by field (`sealedFields`), or whole as an event filed from a zero-access invitation
+ * (`sealedContent`). Either way its stored title, location and description are placeholders nothing may compose an invitation from. */
+export function isSealedEvent(event: { sealedFields?: SealedFields | null; sealedContent?: unknown } | undefined): boolean {
+    return hasSealedFields(event) || !!event?.sealedContent;
+}

@@ -15,7 +15,7 @@ import { EncryptionPolicyMongo } from "../../../src/models/mongo/EncryptionPolic
 import { MailboxMongo } from "../../../src/models/mongo/MailboxMongo.js";
 import { DataSubjectErasureRequestMongo } from "../../../src/models/mongo/DataSubjectErasureRequestMongo.js";
 import { TransportRuleMongo } from "../../../src/models/mongo/TransportRuleMongo.js";
-import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
+import { InMemoryBlobStore, NoopSearchProvider, registerTestDoubles } from "../../testDoubles.js";
 import { zeroAccessDeliverySuite } from "../zeroAccessDeliverySuite.js";
 import { zeroAccessIndexSuite } from "../zeroAccessIndexSuite.js";
 import { ZeroAccessBackfillJobMongo } from "../../../src/jobs/mongo/ZeroAccessBackfillJobMongo.js";
@@ -86,6 +86,7 @@ describe("Zero-access delivery (Mongo)", () => {
         baseUrl: "/mongo/internal/mta",
         secret: config.get("mail:transport:ingest:secret"),
         blobStore: () => objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!,
+        searchProvider: () => objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!,
         createMailbox: async (data?: any) =>
             repos.MailboxMongo.save(
                 new MailboxMongo({

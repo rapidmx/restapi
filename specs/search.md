@@ -132,7 +132,7 @@ A protected contact shows its first email address in place of its name, and keep
 
 Turning a type off never decrypts anything. Items written afterwards are stored readable; an existing protected item stays protected until it is next edited. Turning a type on starts a background backfill of that type's existing items.
 
-**Calendar invitations** for a protected calendar are composed and handed to the outbound mail path while the server still holds the plaintext of the save request, so attendees receive ordinary invitations while the stored event is sealed. Reminders carry only the event and its time; the client shows its own decrypted title.
+**Calendar invitations** for a protected calendar are composed and handed to the outbound mail path while the server still holds the plaintext of the save request, so attendees receive ordinary invitations while the stored event is sealed. Reminders carry only the event and its time; the client shows its own decrypted title. The same holds for an event filed from a zero-access invitation, whose content is sealed whole (`sealedContent`): the scheduling job never invites for it, and a save of a meeting the mailbox organizes invites from the content the client opened. A client that couldn't open such an event writes back its placeholders, which leave the sealed content as it is; a new location or description sent with the placeholder title is refused (409), since resealing would lose the title.
 
 - **What the client sends.** A save of a protected event sends only the fields that changed, plus `invitationContent` — the event's full title, location and description in plaintext — whenever the change needs the attendees told. The server builds the invitation from it, sends it, records the sequence as sent, and stores the content sealed. `invitationContent` itself is never stored.
 - **Without it,** the save still succeeds but no invitation goes out; the change stays pending (the server logs it) until a save that carries the content. The background scheduling job never sends an invitation for a protected event, because all it could send is the placeholder.
@@ -167,6 +167,8 @@ Drafts are sealed on save. Because the server can no longer read a stored draft,
 
 Server-side mailbox import (`POST /mailbox-import-requests`) is refused (409) for a mailbox whose mail is zero-access: the uploaded PST or mbox would wait in the blob store as a readable archive until `MailboxImportJob` runs, a plaintext spool outside the request. Such a mailbox's archive can only be imported by a client that seals each message. An import queued before zero-access was turned on is still sealed message by message (`sealRaw`), and its archive deleted once it ends.
 
+The server-side search index (`SearchIndexJob`) holds only metadata for a zero-access mailbox's mail: a sealed message's, and also a message still stored readable in such a mailbox (a draft assembled for sending, waiting in Outbox or moved back to Drafts, or mail the backfill hasn't reached), under the placeholder subject with no body or attachment text, whatever cleared its index stamp. That metadata document replaces any readable one the provider still holds, so it is retried until it is written; when its retries run out the old document is removed instead (and retried while even that fails). The backfill removes the document of restorable deleted mail it seals, which the indexer never revisits. The attachments of a sealed draft are never text-extracted.
+
 The subject and preview of a zero-access message are replaced on the server by a placeholder and carried only in the sealed summary. Derived server data — push notification payloads, the mail event stream, contact enrichment — carries envelope fields only. A `message.delivered` event for a zero-access copy says so (`zeroAccess: true`) and carries no subject and no report parsed from the body (a bounce's or complaint's details), so a plugin can't handle a bounce that reaches a zero-access mailbox. Notices the server composes about a zero-access message never quote the placeholder: a recall goes out as `Recall`, naming the message by its sent date, and a read or delivery receipt as `Read receipt` or `Delivery receipt`; recipients still match them by `X-RapidMX-Recall-Of` and `Original-Message-ID`.
 
 ### Shared Mailboxes
@@ -187,10 +189,12 @@ Instead, the mailbox's zero-access **private key** — never its MK, signing key
   - A member's "own certificate" is the active zero-access key of a mailbox they own.
   - Membership is read from the access list uncached.
   - Retained keys need no re-wrapping on rotation: the remaining members already hold them. Only the departed user's wraps are removed.
+  - A vault holds at most 2000 member wraps of any one key and 10,000 in all. The bound is per key because the earlier keys' wraps stay after each rotation.
+- **Owner.** A mailbox without an owner that has zero-access keys can't be given one (409): its keys' only copies are member and escrow wraps, which an owner (who opens keys through their MK) never reads.
 - **Escrow.** An owned mailbox's keys are opened by its escrowed MK. A mailbox without an owner has no MK, so each of its zero-access private keys is wrapped straight to its escrow scope's certificate (`KeyVault.zeroAccessEscrowWraps`).
   - `POST shared-zero-access-key` requires `escrowWrap` while the mailbox is assigned to a scope, written in the same transaction as the key.
   - `PUT escrow-wraps` (full-access members) adds the copies a scope is missing: keys provisioned before the mailbox was assigned, or under an earlier scope. `GET members` reports them as `escrowPending`, and an unlocked member's client fills them in the background.
-  - Each wrap must be CMS addressed to the scope's certificate. An escrow release (`/material`) carries the wraps for the matter's scope.
+  - Each wrap must be CMS addressed to the scope's certificate. An escrow release (`/material`) carries the wraps for the matter's scope, whether or not the mailbox has an owner now.
 
 ## 4. Encryption Scope
 

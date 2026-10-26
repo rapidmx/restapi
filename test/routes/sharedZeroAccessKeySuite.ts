@@ -19,12 +19,16 @@ export interface SharedZeroAccessKeySuiteContext {
     /** The mailbox route, e.g. `/mongo/mailboxes`. */
     baseUrl: string;
     tokenFor: (uid: string) => string;
+    /** An elevated administrator's token. */
+    adminToken: () => string;
     createMailbox: (data?: any) => Promise<any>;
     setAcl: (mailboxUid: string, records: { userOrRoleId: string; actions: string[] }[]) => Promise<void>;
     findMailbox: (uid: string) => Promise<any>;
     findKeyVault: (mailboxUid: string) => Promise<any>;
     updateMailbox: (uid: string, data: any) => Promise<void>;
     setEscrowWraps: (mailboxUid: string, wraps: any[]) => Promise<void>;
+    /** Replaces the member wraps of the mailbox's existing vault. */
+    setMemberWraps: (mailboxUid: string, wraps: any[]) => Promise<void>;
     /** An escrow scope whose key is the certificate `certificate` (base64 DER). */
     createEscrowScope: (certificate: string, fingerprint: string) => Promise<any>;
 }
@@ -232,6 +236,106 @@ export function sharedZeroAccessKeySuite(ctx: SharedZeroAccessKeySuiteContext): 
             expect((await ctx.findKeyVault(mailbox.uid)).memberKeyWraps).toEqual([]);
             // Nothing left to clear is not an error.
             expect((await request(ctx.app()).delete(`${ctx.baseUrl}/${mailbox.uid}/keyvault/member-wraps/${delegate.uid}`).set("Authorization", as(owner.uid))).status).toBe(200);
+        });
+
+        /** `count` stored wraps of the key `fingerprint` for members long gone - what rotations leave behind. */
+        const keptWraps = (fingerprint: string, count: number) =>
+            Array.from({ length: count }, () => ({ memberUserUid: uuid.v4(), recipientFingerprint: "r", zeroAccessKeyFingerprint: fingerprint, cms: "eA==", createdAt: 1 }));
+
+        it("bounds member wraps per key, so the wraps kept for earlier keys never block the active key's, and bounds the vault as a whole", async () => {
+            const owner = await user();
+            const delegate = await user();
+            const ownerKey = await zeroAccessKey();
+            const mailbox = await ctx.createMailbox({ ownerUserUid: owner.uid, zeroAccessKeys: [ownerKey.key] });
+            await ctx.setAcl(mailbox.uid, [
+                { userOrRoleId: owner.uid, actions: [ACLAction.FULL] },
+                { userOrRoleId: delegate.uid, actions: [ACLAction.READ] },
+            ]);
+            const put = async () =>
+                await request(ctx.app())
+                    .put(`${ctx.baseUrl}/${mailbox.uid}/keyvault/member-wraps`)
+                    .set("Authorization", as(owner.uid))
+                    .send({ wraps: [await wrapFor(delegate, ownerKey.key.fingerprint)] });
+            expect((await put()).status).toBe(200);
+            const own = (await ctx.findKeyVault(mailbox.uid)).memberKeyWraps;
+
+            // Ten rotations of a 200-member mailbox: 2000 wraps of earlier keys.
+            await ctx.setMemberWraps(mailbox.uid, [...own, ...Array.from({ length: 10 }, (_, i) => keptWraps(`old-${i}`, 200)).flat()]);
+            const granted = await put();
+            expect(granted.status).toBe(200);
+            expect((await ctx.findKeyVault(mailbox.uid)).memberKeyWraps).toHaveLength(2001);
+
+            // One key wrapped for more members than a mailbox can have.
+            await ctx.setMemberWraps(mailbox.uid, [...own, ...keptWraps(ownerKey.key.fingerprint, 2000)]);
+            const perKey = await put();
+            expect(perKey.status).toBe(400);
+            expect(perKey.body.message).toContain("of one key");
+
+            // The vault as a whole.
+            await ctx.setMemberWraps(mailbox.uid, [...own, ...Array.from({ length: 5 }, (_, i) => keptWraps(`old-${i}`, 2000)).flat()]);
+            const total = await put();
+            expect(total.status).toBe(400);
+            expect(total.body.message).toContain("10000");
+        }, 60_000);
+
+        it("refuses an ownerless mailbox's rotation whose wraps the vault can't hold, before a certificate is issued", async () => {
+            const manager = await user();
+            const shared = await ctx.createMailbox({ ownerUserUid: null });
+            await ctx.setAcl(shared.uid, [{ userOrRoleId: manager.uid, actions: [ACLAction.FULL] }]);
+            const enroll = async () =>
+                await request(ctx.app())
+                    .post(`${ctx.baseUrl}/${shared.uid}/keyvault/shared-zero-access-key`)
+                    .set("Authorization", as(manager.uid))
+                    .send({ csr: await generateTestCsr(shared.primarySmtpAddress), wraps: [await wrapFor(manager)] });
+            expect((await enroll()).status).toBe(200);
+            const own = (await ctx.findKeyVault(shared.uid)).memberKeyWraps;
+            await ctx.setMemberWraps(shared.uid, [...own, ...Array.from({ length: 5 }, (_, i) => keptWraps(`old-${i}`, 2000)).flat()].slice(0, 10_000));
+
+            const refused = await enroll();
+
+            expect(refused.status).toBe(400);
+            expect((await ctx.findMailbox(shared.uid)).zeroAccessKeys).toHaveLength(1);
+        }, 60_000);
+
+        it("refuses to give an owner to an ownerless mailbox whose zero-access keys only its members and escrow hold, however the change is sent", async () => {
+            const manager = await user();
+            const shared = await ctx.createMailbox({ ownerUserUid: null });
+            await ctx.setAcl(shared.uid, [{ userOrRoleId: manager.uid, actions: [ACLAction.FULL] }]);
+            const enrolled = await request(ctx.app())
+                .post(`${ctx.baseUrl}/${shared.uid}/keyvault/shared-zero-access-key`)
+                .set("Authorization", as(manager.uid))
+                .send({ csr: await generateTestCsr(shared.primarySmtpAddress), wraps: [await wrapFor(manager)] });
+            expect(enrolled.status).toBe(200);
+            const admin = "jwt " + ctx.adminToken();
+            const current = await ctx.findMailbox(shared.uid);
+
+            const whole = await request(ctx.app())
+                .put(`${ctx.baseUrl}/${shared.uid}`)
+                .set("Authorization", admin)
+                .send({ uid: shared.uid, version: current.version, ownerUserUid: manager.uid });
+            const property = await request(ctx.app())
+                .put(`${ctx.baseUrl}/${shared.uid}/ownerUserUid`)
+                .set("Authorization", admin)
+                .set("Content-Type", "application/json")
+                .send(JSON.stringify(manager.uid));
+            const bulk = await request(ctx.app())
+                .put(ctx.baseUrl)
+                .set("Authorization", admin)
+                .send([{ uid: shared.uid, version: current.version, ownerUserUid: manager.uid }]);
+
+            expect(whole.status).toBe(409);
+            expect(whole.body.message).toContain("can't be given an owner");
+            expect(property.status).toBe(409);
+            expect(bulk.status).toBeGreaterThanOrEqual(400);
+            expect((await ctx.findMailbox(shared.uid)).ownerUserUid ?? null).toBeNull();
+
+            // One without zero-access keys can still be given one.
+            const plain = await ctx.createMailbox({ ownerUserUid: null });
+            const given = await request(ctx.app())
+                .put(`${ctx.baseUrl}/${plain.uid}`)
+                .set("Authorization", admin)
+                .send({ uid: plain.uid, version: (await ctx.findMailbox(plain.uid)).version, ownerUserUid: manager.uid });
+            expect(given.status).toBe(200);
         });
 
         it("escrows an ownerless mailbox's key to its escrow scope: required when provisioning, reported while missing, and added later", async () => {

@@ -14,7 +14,7 @@ import { scanAndRelay } from "../util/MailSendUtils.js";
 import { isPlainAddress, safeDisplayName } from "../util/MimeHeaderUtils.js";
 import { sendOrThrow } from "../transport/TransportResultUtils.js";
 import type { MailTransport, OutboundMessage, TransportResult } from "../transport/MailTransport.js";
-import { hasSealedFields } from "../zeroaccess/ZeroAccessFieldSealer.js";
+import { isSealedEvent } from "../zeroaccess/ZeroAccessFieldSealer.js";
 import { CalendarEventStatus, type Attendee, type CalendarEvent, type CalendarEventAttendeeLink } from "../models/types.js";
 const { Config, Inject, Logger } = ObjectDecorators;
 
@@ -57,9 +57,10 @@ export function invitationsPending(event: CalendarEvent): boolean {
     return event.inviteSequenceSent === undefined || event.inviteSequenceSent === null || event.inviteSequenceSent !== event.sequence;
 }
 
-/** Whether `event` is of a calendar zero-access encryption protects and its current revision's invitations are still to be sent. */
+/** Whether `event`'s content is sealed (`isSealedEvent()`: of a calendar zero-access encryption protects, or filed from a zero-access
+ * invitation) and its current revision's invitations are still to be sent. */
 export function protectedInvitationsPending(event: CalendarEvent): boolean {
-    return hasSealedFields(event) && invitationsPending(event);
+    return isSealedEvent(event) && invitationsPending(event);
 }
 
 /** The organizer's mailbox as an invitation is sent from it: the addresses it may organize as, and its display name. */
@@ -250,7 +251,7 @@ export class MeetingInviteSender {
         if (!invitationsPending(event)) {
             return undefined;
         }
-        const sealed: boolean = hasSealedFields(event);
+        const sealed: boolean = isSealedEvent(event);
         const keyed: boolean = await this.isKeyedMeeting(event);
         if (!sealed && !keyed) {
             return undefined;

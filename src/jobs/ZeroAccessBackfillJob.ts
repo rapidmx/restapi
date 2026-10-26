@@ -13,7 +13,9 @@ import { deleteBlobsIfUnreferenced, type MessageBlobRepos } from "../util/BlobRe
 import { asEntity } from "../util/EntityUtils.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
-import { SEARCH_REINDEX } from "../util/SearchIndexUtils.js";
+import { removeFromSearchIndex, SEARCH_REINDEX } from "../util/SearchIndexUtils.js";
+import type { SearchProvider } from "../search/SearchProvider.js";
+import { zeroAccessDraftBlobPrefix } from "../zeroaccess/ZeroAccessFiling.js";
 import { newZeroAccessWriter, type ZeroAccessSealedFields, type ZeroAccessWriter } from "../zeroaccess/ZeroAccessWriter.js";
 import { sealFieldsOnWrite } from "../zeroaccess/ZeroAccessFieldSealer.js";
 import { newZeroAccessRecordSealer, PROTECTED_FIELDS, type ZeroAccessRecordSealer } from "../zeroaccess/ZeroAccessRecordSealer.js";
@@ -32,7 +34,9 @@ const RECORD_TYPES: readonly ZeroAccessDataType[] = ["calendar", "contacts", "ta
  * every message still stored readable - delivered, sent, imported, drafts, deleted-but-restorable - is encrypted to the mailbox's
  * zero-access key exactly as delivery would have done (`ZeroAccessWriter`), indexed into its week (by the message's own receipt
  * date), and its readable copies removed: the body blob (unless another message still shares it), the sanitized HTML, and the
- * attachment rows and blobs. The message is then indexed again by `SearchIndexJob`, which now sees only its metadata.
+ * attachment rows and blobs. The message is then indexed again by `SearchIndexJob`, which now sees only its metadata; a deleted-but-
+ * restorable one, which `SearchIndexJob` never selects, has its search document removed here instead (search leaves deleted messages out
+ * anyway, and a restored one is indexed again from its sealed row).
  *
  * Each run seals at most `batch_size` messages across all mailboxes, newest first within a mailbox, so the newest mail is protected
  * first and a large backlog is worked through over many runs. It is idempotent: a message is selected while its `zeroAccess` is unset,
@@ -82,6 +86,9 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
 
     @Inject("BlobStore")
     protected blobStore?: BlobStore;
+
+    @Inject("SearchProvider")
+    protected searchProvider?: SearchProvider;
 
     @Config("mail:jobs:zero_access_backfill:schedule", "0 * * * * *")
     private scheduleExpr: string = "0 * * * * *";
@@ -349,7 +356,7 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
                 continue;
             }
             attempted++;
-            if (!(await this.sealMessage(mailbox, message, drafts.has(message.folderUid)))) {
+            if (!(await this.sealMessage(mailbox, message, drafts))) {
                 // Zero-access stopped being active for this mailbox meanwhile: leave the rest for when it is again.
                 break;
             }
@@ -357,8 +364,10 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
         return attempted;
     }
 
-    /** Seals one message; `false` when zero-access is no longer active for its mailbox (nothing was changed). */
-    private async sealMessage(mailbox: X, message: M, isDraft: boolean): Promise<boolean> {
+    /** Seals one message; `false` when zero-access is no longer active for its mailbox (nothing was changed). `drafts`: the mailbox's
+     * Drafts folders. */
+    private async sealMessage(mailbox: X, message: M, drafts: Set<string>): Promise<boolean> {
+        const isDraft: boolean = drafts.has(message.folderUid);
         let raw: Buffer;
         try {
             raw = await this.blobStore!.get(message.bodyBlobKey);
@@ -403,9 +412,15 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
                 { ignoreACL: true, includeDeleted: true } as any,
             );
         } catch (err: any) {
-            // Changed meanwhile (a move, a flag): the next run picks it up again. A draft's fresh blob isn't the message's.
+            // Changed meanwhile (a move, a flag): the next run picks it up again. A draft's fresh blob isn't the message's, and the index
+            // entry `sealDraft()` replaced may now stand in for content the draft no longer has (`losingDraftEntryMayGo()`).
             if (isDraft) {
                 await this.blobStore!.delete(sealed.bodyBlobKey).catch(() => undefined);
+                if (await this.losingDraftEntryMayGo(message, drafts)) {
+                    await this.zeroAccessWriter!.removeIndexEntry(sealed.indexEntryUid).catch((removeErr: any) => {
+                        this.logger?.warn(`ZeroAccessBackfillJob: draft ${message.uid}'s index entry couldn't be removed after a failed seal: ${removeErr?.message ?? removeErr}`);
+                    });
+                }
             }
             this.logger?.debug?.(`ZeroAccessBackfillJob: message ${message.uid} changed while it was sealed; retrying later: ${err?.message}`);
             return true;
@@ -415,7 +430,36 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
         } catch (err: any) {
             this.logger?.warn(`ZeroAccessBackfillJob: message ${message.uid} is sealed but its readable copies couldn't all be removed: ${err?.message}`);
         }
+        if ((message as any).deleted === true) {
+            // `SearchIndexJob` never selects a soft-deleted row, so `SEARCH_REINDEX` alone would leave its readable document in place until
+            // a purge. Best effort (logged).
+            await removeFromSearchIndex(this.searchProvider, "message", message.uid, this.logger);
+        }
         return true;
+    }
+
+    /**
+     * Whether the index entry a draft's seal wrote (`sealDraft()` replaces the draft's entry) must go once the draft's own update lost to a
+     * concurrent write - the rule the server's compose route applies to a losing sealed save (`losingIndexEntryMayGo()`). It goes when the
+     * draft is gone, when a sealed draft save won (that save wrote its own entry, which this one replaced; its next save writes a fresh
+     * one), and when the draft is still readable in Drafts (the next run seals it again, entry included). It stays when the message was
+     * filed as its sealed Sent Items copy, which shares its uid, or left Drafts to be sent (the copy filed then keeps the entry it finds),
+     * and when the draft can't be read.
+     */
+    private async losingDraftEntryMayGo(message: M, drafts: Set<string>): Promise<boolean> {
+        try {
+            const current: any = await this.messageRepo!.findOne(message.uid, { ignoreACL: true, includeDeleted: true });
+            if (!current) {
+                return true;
+            }
+            if (current.zeroAccess) {
+                return typeof current.bodyBlobKey === "string" && current.bodyBlobKey.startsWith(zeroAccessDraftBlobPrefix(message.mailboxUid));
+            }
+            return drafts.has(current.folderUid);
+        } catch (err: any) {
+            this.logger?.warn(`ZeroAccessBackfillJob: couldn't tell whether draft ${message.uid}'s index entry outlived a failed seal; keeping it: ${err?.message ?? err}`);
+            return false;
+        }
     }
 
     private async recordFailure(message: M, error: string): Promise<void> {

@@ -41,6 +41,7 @@ describe("MeetingInviteSender (isolated)", () => {
         expect(invitationsPending(event({ attendees: [] }))).toBe(false);
         expect(invitationsPending(event({ status: CalendarEventStatus.CANCELLED }))).toBe(false);
         expect(protectedInvitationsPending(event({ sealedFields: { title: "x" } }))).toBe(true);
+        expect(protectedInvitationsPending(event({ sealedContent: { keyFingerprint: "fp", sealed: "x" } }))).toBe(true);
         expect(protectedInvitationsPending(event())).toBe(false);
     });
 

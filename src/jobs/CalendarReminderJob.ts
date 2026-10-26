@@ -7,7 +7,8 @@ import { ApiErrors, BackgroundService, NotificationUtils, ObjectFactory } from "
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { expandOccurrences, OccurrenceWindow } from "../util/IcsUtils.js";
 import { CalendarEvent, CalendarEventStatus } from "../models/types.js";
-import { hasSealedFields } from "../zeroaccess/ZeroAccessFieldSealer.js";
+import { isSealedEvent } from "../zeroaccess/ZeroAccessFieldSealer.js";
+import { BUSY_TITLE, hidesDetailsFromReaders } from "../util/CalendarEventUtils.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 const MS_PER_MINUTE = 60 * 1000;
@@ -338,14 +339,19 @@ export abstract class CalendarReminderJob<CE extends CalendarEvent> extends Back
         if (!(await this.claim(event, marker, occurrence.start, isMaster))) {
             return;
         }
+        // Published to the calendar's and the mailbox's channels, which a read-only grantee of a shared calendar or a delegate with READ may
+        // subscribe to: a private or confidential event's reminder carries the busy block they are shown (`redactEventForReader()`), never
+        // its title or location.
+        const redacted: boolean = hidesDetailsFromReaders(event);
         this.notificationUtils?.sendMessage([event.folderUid, event.mailboxUid], "CalendarEvent", "reminder", {
             eventUid: event.uid,
-            title: event.title,
+            title: redacted ? BUSY_TITLE : event.title,
             startDate: occurrence.start,
-            location: event.location,
+            ...(redacted ? { redacted: true } : { location: event.location }),
             // The title and location are placeholders - sealed field by field, or (an event filed from a zero-access invitation) whole in
-            // `sealedContent`: the client opens the event by its uid to show the real ones.
-            ...(hasSealedFields(event) || event.sealedContent ? { protected: true } : {}),
+            // `sealedContent`, or a private event's busy block: the client opens the event by its uid, which shows the real ones to whoever
+            // may see them.
+            ...(redacted || isSealedEvent(event) ? { protected: true } : {}),
         });
     }
 

@@ -495,14 +495,22 @@ export abstract class ScheduledSendJob<M extends Message> extends BackgroundServ
                 relayedRaw = result.raw;
                 relayInfo = { encrypted: result.encrypted, inReplyTo: result.inReplyTo, references: result.references };
                 messageId = result.messageId;
-                // The conversation this mailbox already files the message being replied to under, falling back to
-                // what the relayed headers derive on their own - the same resolution `BaseMessageRoute.send()`
-                // applies to an immediate send, so a scheduled reply threads identically to an immediate one.
-                conversationId = await resolveConversationId(result.references, result.inReplyTo, result.messageId, (ancestors) =>
-                    findThreadConversationId(this.messageRepo!, claimed.mailboxUid, ancestors),
-                );
+                // Taken before anything else here can fail: the filing (or its failure's record) must name the relay's own render, or
+                // nothing would ever remove it.
                 sanitizedHtmlBlobKey = result.sanitizedHtmlBlobKey ?? sanitizedHtmlBlobKey;
                 undelivered = result.undelivered;
+                // The conversation this mailbox already files the message being replied to under, falling back to
+                // what the relayed headers derive on their own - the same resolution `BaseMessageRoute.send()`
+                // applies to an immediate send, so a scheduled reply threads identically to an immediate one. Best effort, as there:
+                // the message has been relayed.
+                conversationId = await resolveConversationId(result.references, result.inReplyTo, result.messageId, async (ancestors) => {
+                    try {
+                        return await findThreadConversationId(this.messageRepo!, claimed.mailboxUid, ancestors);
+                    } catch (err: any) {
+                        this.logger?.warn(`ScheduledSendJob: couldn't look up the conversation of message ${claimed.uid}'s ancestors: ${err?.message ?? err}`);
+                        return undefined;
+                    }
+                });
                 // Recipient suggestions: everyone the message went to. Best-effort - `CorrespondentUtils.recordCorrespondents()` never throws.
                 if (sendingMailbox) {
                     await this.correspondentUtils!.recordCorrespondents(
