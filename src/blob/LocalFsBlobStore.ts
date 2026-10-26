@@ -89,12 +89,21 @@ export class LocalFsBlobStore implements BlobStore {
         }
     }
 
+    /**
+     * `false` only when the filesystem says nothing is there (ENOENT, or ENOTDIR: a file where a directory would be). Any other error
+     * (EACCES/EPERM on a directory a restore left unreadable, EIO, a stale NFS handle) is rethrown, as `S3BlobStore` does for anything
+     * but a 404: a store that can't tell must not say "gone" - callers act on that (`MailboxQuotaRecalcJob` counts a gone body as no
+     * space, `ZeroAccessBackfillJob` gives up on a gone body or photo).
+     */
     public async exists(key: string): Promise<boolean> {
         try {
             await fs.access(this.resolvePath(key));
             return true;
-        } catch {
-            return false;
+        } catch (err: any) {
+            if (err.code === "ENOENT" || err.code === "ENOTDIR") {
+                return false;
+            }
+            throw err;
         }
     }
 

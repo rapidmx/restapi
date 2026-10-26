@@ -9,6 +9,10 @@ import { ApiErrors, ObjectFactory } from "@rapidrest/service-core";
 import config from "../config.js";
 import { ZeroAccessBackfillJobMongo } from "../../src/jobs/mongo/ZeroAccessBackfillJobMongo.js";
 import { openSealedField, testZeroAccessKey, type TestZeroAccessKey } from "../zeroAccessTestKeys.js";
+import * as fs from "fs/promises";
+import * as os from "os";
+import * as path from "path";
+import { LocalFsBlobStore } from "../../src/blob/LocalFsBlobStore.js";
 
 const objectFactory = new ObjectFactory(config, Logger());
 const sealed = { subject: "[...]", bodyPreview: "", bodyBlobKey: "za/mb/m", zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" }, indexEntryUid: "ix" };
@@ -16,12 +20,13 @@ const message = (uid: string, fields: object = {}) => ({ uid, version: 0, folder
 
 function job(options: { mailboxes?: any[]; messages?: any[]; writer?: any; update?: any } = {}) {
     const instance = objectFactory.newInstance<ZeroAccessBackfillJobMongo>(ZeroAccessBackfillJobMongo, { initialize: false }) as any;
-    const pages = [options.mailboxes ?? [{ uid: "mb", ownerUserUid: "u", zeroAccessKeys: [{}] }], []];
+    const mailboxes = options.mailboxes ?? [{ uid: "mb", ownerUserUid: "u", zeroAccessKeys: [{}] }];
     const logger = { warn: vi.fn(), debug: vi.fn() };
     Object.assign(instance, {
         logger,
         blobStore: { get: vi.fn().mockResolvedValue(Buffer.from("raw")), delete: vi.fn().mockResolvedValue(undefined), exists: vi.fn().mockResolvedValue(false) },
-        mailboxRepo: { find: vi.fn(async () => pages.shift() ?? []), update: vi.fn(async (patch: any) => patch) },
+        // One page each run (`findPagesByUid()` asks past it only when it is full).
+        mailboxRepo: { find: vi.fn(async (query: any) => (query.uid ? [] : mailboxes)), update: vi.fn(async (patch: any) => patch) },
         folderRepo: { find: vi.fn().mockResolvedValue([{ uid: "drafts", type: "drafts" }]) },
         messageRepo: {
             find: vi.fn(async (query: any) => (query.deleted ? [] : (options.messages ?? []))),
@@ -98,13 +103,53 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
         expect(instance.messageRepo.update).not.toHaveBeenCalled();
     });
 
-    it("marks a message whose body is gone, and tolerates the mark itself failing", async () => {
+    it("marks a message whose body has been gone for a day, and tolerates the mark itself failing", async () => {
         const update = vi.fn().mockRejectedValue(new Error("conflict"));
         const { instance, logger } = job({ messages: [message("m1")], update });
+        let now = Date.now();
+        instance.goneBlobs.now = () => now;
         instance.blobStore.get = vi.fn().mockRejectedValue(new Error("NoSuchKey"));
+        // Not there at one look: maybe the volume isn't mounted. Left alone, unmarked.
+        await instance.run();
+        now += 23 * 3_600_000;
+        await instance.run();
+        expect(update).not.toHaveBeenCalled();
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("m1's body isn't there; left until"));
+        now += 3_600_000;
         await instance.run();
         expect(update.mock.calls[0][0].zeroAccessBackfillError).toContain("NoSuchKey");
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("NoSuchKey"));
+    });
+
+    it("leaves a message whose blob volume isn't mounted unmarked, and seals it once it is (round 8 review of #801)", async () => {
+        const root: string = await fs.mkdtemp(path.join(os.tmpdir(), "za-backfill-"));
+        const empty: string = await fs.mkdtemp(path.join(os.tmpdir(), "za-backfill-unmounted-"));
+        try {
+            const store = new LocalFsBlobStore();
+            (store as any).root = root;
+            await store.put("b/m1", Buffer.from("Subject: hi\r\n\r\nbody"));
+            const sealRaw = vi.fn().mockResolvedValue(sealed);
+            const { instance } = job({
+                messages: [message("m1")],
+                writer: { target: vi.fn().mockResolvedValue({}), sealRaw, discardPlaintext: vi.fn().mockResolvedValue(undefined) },
+            });
+            instance.blobStore = store;
+            // The volume failed to mount: the root is an empty mount-point directory, and every body reads as not there.
+            (store as any).root = empty;
+            await instance.run();
+            expect(instance.messageRepo.update).not.toHaveBeenCalled();
+            expect(sealRaw).not.toHaveBeenCalled();
+
+            // Mounted again: sealed, not left readable for good.
+            (store as any).root = root;
+            await instance.run();
+            expect(sealRaw).toHaveBeenCalledTimes(1);
+            expect(instance.messageRepo.update.mock.calls[0][0]).toMatchObject({ uid: "m1", zeroAccess: sealed.zeroAccess });
+            expect(instance.messageRepo.update.mock.calls[0][0].zeroAccessBackfillError).toBeUndefined();
+        } finally {
+            await fs.rm(root, { recursive: true, force: true });
+            await fs.rm(empty, { recursive: true, force: true });
+        }
     });
 
     it("leaves a message whose sealing or body read failed for a while unmarked, for the next run", async () => {
@@ -219,7 +264,7 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
         expect(instance.messageRepo.update.mock.calls.map((call: any[]) => call[0].uid)).toEqual(["failed", "lapsed", "unfiled"]);
     });
 
-    it("keeps a soft-deleted scheduled Outbox message, which a restore sends, until deleted_scheduled_send_days after its time and deletion, then seals it and clears its schedule (#604, #610)", async () => {
+    it("keeps a soft-deleted scheduled Outbox message, which a restore sends, until deleted_scheduled_send_days after its time and deletion, then seals it and clears its schedule (#604, #610); seals a relayed one at once, keeping its schedule so a restore files it (#802)", async () => {
         const day = 86_400_000;
         const future = new Date(Date.now() + 60_000);
         const past = new Date(Date.now() - 60_000);
@@ -235,17 +280,24 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
                       message("deleted-unknown", { folderUid: "outbox", deleted: true, scheduledSendTime: longAgo, dateModified: undefined }),
                       message("deleted-scheduled", { folderUid: "outbox", deleted: true, scheduledSendTime: longAgo, dateModified: longAgo }),
                       message("deleted-relayed", { folderUid: "outbox", deleted: true, scheduledSendTime: longAgo, dateModified: longAgo, scheduledSendRelayedAt: longAgo }),
+                      // Relayed, its filing waiting out a retry, and deleted just now: it has gone out, so nothing is left to send.
+                      message("deleted-relayed-recently", { folderUid: "outbox", deleted: true, scheduledSendTime: future, scheduledSendAttempts: 1, scheduledSendLeaseExpiresAt: past, dateModified: past, scheduledSendRelayedAt: past }),
                       message("deleted-in-flight", { folderUid: "outbox", deleted: true, scheduledSendTime: null, scheduledSendLeaseExpiresAt: future }),
+                      message("deleted-relayed-in-flight", { folderUid: "outbox", deleted: true, scheduledSendTime: future, scheduledSendLeaseExpiresAt: future, scheduledSendRelayedAt: past }),
                   ]
-                : [message("inbox-mail")],
+                : [message("inbox-mail"), message("relayed-retrying", { folderUid: "outbox", scheduledSendTime: future, scheduledSendRelayedAt: past })],
         );
         await instance.run();
         expect(instance.zeroAccessWriter.sealDraft.mock.calls.map((call: any[]) => call[2])).toEqual(["deleted-unknown", "deleted-scheduled"]);
-        expect(instance.zeroAccessWriter.sealRaw.mock.calls.map((call: any[]) => call[2])).toEqual(["inbox-mail", "deleted-relayed"]);
+        // Relayed: sealed as sent mail at once, however recently deleted - but not one whose filing is under way, nor a live one's retry.
+        expect(instance.zeroAccessWriter.sealRaw.mock.calls.map((call: any[]) => call[2])).toEqual(["inbox-mail", "deleted-relayed", "deleted-relayed-recently"]);
         const patches = Object.fromEntries(instance.messageRepo.update.mock.calls.map((call: any[]) => [call[0].uid, call[0]]));
-        expect(Object.keys(patches)).toEqual(["inbox-mail", "deleted-unknown", "deleted-scheduled", "deleted-relayed"]);
-        for (const uid of ["deleted-scheduled", "deleted-relayed"]) {
-            expect(patches[uid]).toMatchObject({ scheduledSendTime: null, scheduledSendAttempts: null, scheduledSendLeaseExpiresAt: null });
+        expect(Object.keys(patches)).toEqual(["inbox-mail", "deleted-unknown", "deleted-scheduled", "deleted-relayed", "deleted-relayed-recently"]);
+        expect(patches["deleted-scheduled"]).toMatchObject({ scheduledSendTime: null, scheduledSendAttempts: null, scheduledSendLeaseExpiresAt: null });
+        // A relayed one only loses its lapsed claim: `ScheduledSendJob` files it, sealed as it is, once it is restored.
+        for (const uid of ["deleted-relayed", "deleted-relayed-recently"]) {
+            expect(patches[uid]).toMatchObject({ scheduledSendLeaseExpiresAt: null });
+            expect("scheduledSendTime" in patches[uid] || "scheduledSendAttempts" in patches[uid]).toBe(false);
         }
         // Only an Outbox row's schedule is touched.
         expect("scheduledSendTime" in patches["inbox-mail"]).toBe(false);
@@ -427,9 +479,19 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
             expect(stuck.logger.debug).toHaveBeenCalledWith(expect.stringContaining("version"));
         });
 
-        it("seals a contact whose photo blob is gone without it, and leaves one whose photo can't be read or stored for now for the next run", async () => {
+        it("seals a contact whose photo blob has been gone for a day without it, and leaves one whose photo can't be read or stored for now for the next run", async () => {
             const contact = (uid: string) => ({ uid, version: 0, mailboxUid: "mb", displayName: "Jane", emails: [], photoBlobKey: `contact-photos/${uid}/old` });
-            const { instance, logger, repos } = await recordJob({ contacts: [contact("gone"), contact("slow"), contact("full")] });
+            const { instance, logger, repos } = await recordJob({ contacts: [contact("gone")] });
+            let now = Date.now();
+            instance.goneBlobs.now = () => now;
+            instance.blobStore.get = vi.fn().mockRejectedValue(new Error("NoSuchKey"));
+            instance.blobStore.exists = vi.fn().mockResolvedValue(false);
+            // Not there at one look (a volume that isn't mounted?): the record keeps its photo key and is left for later.
+            await instance.run();
+            expect(repos.contacts.update).not.toHaveBeenCalled();
+            expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("gone's photo isn't there; left until"));
+            now += 24 * 3_600_000;
+            repos.contacts.find.mockImplementation(async (query: any) => (query.deleted ? [] : [contact("gone"), contact("slow"), contact("full")]));
             instance.blobStore.get = vi.fn().mockRejectedValueOnce(new Error("NoSuchKey")).mockRejectedValueOnce(new Error("timeout")).mockResolvedValueOnce(Buffer.from("PHOTO"));
             instance.blobStore.exists = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
             instance.blobStore.put = vi.fn().mockRejectedValue(new Error("disk full"));

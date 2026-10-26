@@ -143,8 +143,11 @@ describe("Zero-access delivery (SQL)", () => {
         },
         createErasureRequest: async (mailboxUid, status) =>
             repo(DataSubjectErasureRequestSQL).save(new DataSubjectErasureRequestSQL({ mailboxUid, requestedByUserUid: uuid.v4(), status })),
-        runBackfill: async () => {
+        runBackfill: async (options?: { goneConfirmMs?: number }) => {
             const job = await objectFactory.newInstance<ZeroAccessBackfillJobSQL>(ZeroAccessBackfillJobSQL, { name: `za-backfill-${uuid.v4()}` });
+            if (options?.goneConfirmMs !== undefined) {
+                (job as any).goneBlobs.windowMs = options.goneConfirmMs;
+            }
             await job.run();
         },
         runScheduledSend: async () => {

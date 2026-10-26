@@ -6,6 +6,7 @@ import * as crypto from "crypto";
 import { ObjectDecorators } from "@rapidrest/core";
 import { ApiErrors, BackgroundService, ModelUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import type { BlobStore } from "../blob/BlobStore.js";
+import { GoneBlobConfirmations } from "../blob/GoneBlobConfirmations.js";
 import { FolderType, type Folder, type Mailbox, type Message, type ZeroAccessDataType } from "../models/types.js";
 import { CONTACT_PHOTO_KEY_PREFIX } from "../routes/BaseContactRoute.js";
 import { settleZeroAccessTypes } from "../util/ZeroAccessUtils.js";
@@ -43,8 +44,10 @@ const RECORD_TYPES: readonly ZeroAccessDataType[] = ["calendar", "contacts", "ta
  * first and a large backlog is worked through over many runs. It is idempotent: a message is selected while its `zeroAccess` is unset,
  * and the sealed blob and index entry are keyed by the message, so a run interrupted halfway is completed by the next. A message it
  * can never seal - its body is gone - gets `zeroAccessBackfillError` and is never selected again, so it can't block the rest; one that
- * failed for a reason that passes (the blob store or the database failing for a moment) is tried again next run. A body that can't be
- * parsed is still sealed whole (`ZeroAccessWriter.sealRaw()`).
+ * failed for a reason that passes (the blob store or the database failing for a moment) is tried again next run. "Gone" means missing
+ * for a day (`goneBlobs`), not just at one look: a local blob volume that failed to mount answers "not there" for every body, and
+ * giving up on those would leave them readable for good once it is mounted again. A body that can't be parsed is still sealed whole
+ * (`ZeroAccessWriter.sealRaw()`).
  *
  * Messages in Outbox are left alone while their send can still go ahead - due, scheduled or waiting out a retry (`scheduledSendTime`), or
  * claimed (a live `scheduledSendLeaseExpiresAt`) - since they are relayed from the readable copy and `ScheduledSendJob` seals the Sent
@@ -53,16 +56,19 @@ const RECORD_TYPES: readonly ZeroAccessDataType[] = ["calendar", "contacts", "ta
  * `deleted_scheduled_send_days` (30) after the later of its scheduled time and its deletion, since nothing else bounds it (deleted mail
  * is purged only by a retention policy or an explicit purge). One whose send failed for good, that was relayed but never filed, or
  * that was deleted longer ago than that is nothing left to send: it is sealed, as a draft when it was never relayed (reopened and sent
- * again like any sealed draft) and as sent mail when it was, and its schedule is cleared. Mail the sender encrypted end
- * to end is left alone. Turning zero-access off never decrypts anything (the server can't): this job only ever seals.
+ * again like any sealed draft), its schedule cleared, and as sent mail when it was. A relayed one deleted while its filing waits for a
+ * retry is sealed at once - it has gone out - and keeps that schedule, so a restore has `ScheduledSendJob` file it into Sent Items, sealed
+ * as it is. Mail the sender encrypted end to end is left alone. Turning zero-access off never decrypts anything (the server can't): this
+ * job only ever seals.
  *
  * Calendar events, contacts and tasks are sealed the same way, per data type, once that type is protected for the mailbox (`specs/search.md`
  * §3 *What It Covers*), within the same budget and after its mail: each record that has no `sealedFields` yet gets its protected fields
  * sealed exactly as a write would (`sealFieldsOnWrite()`), and a contact's photo is stored again sealed. A record with nothing to seal
  * gets an empty `sealedFields`, so it isn't selected again; an event made from a zero-access invitation (`sealedContent`) is already
- * sealed. A contact whose photo blob is gone is sealed without it. A record the write of its sealed fields is refused for (anything but
- * a concurrent change) gets `zeroAccessBackfillError` like a message, so it can't use up every run's budget. A record edited while its
- * type was off after it had been sealed keeps the fields edited then readable until it is next edited.
+ * sealed. A contact whose photo blob is gone (missing for a day, as a body) is sealed without it. A record the write of its sealed
+ * fields is refused for (anything but a concurrent change) gets `zeroAccessBackfillError` like a message, so it can't use up every
+ * run's budget. A record edited while its type was off after it had been sealed keeps the fields edited then readable until it is next
+ * edited.
  *
  * The administrator's "Allow zero-access encryption" is read once per run (nothing is sealed while it is off), and a mailbox's folders
  * only once it has mail to seal: a run over mailboxes with nothing left to do costs a few indexed queries each.
@@ -108,6 +114,9 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
      * scheduled time and its deletion, before it is sealed with its schedule cleared. */
     @Config("mail:jobs:zero_access_backfill:deleted_scheduled_send_days", 30)
     private deletedScheduledSendDays: number = 30;
+
+    /** A body or contact photo the store says isn't there counts as gone only once it has been missing for a day. */
+    protected goneBlobs: GoneBlobConfirmations = new GoneBlobConfirmations(24 * 3_600_000);
 
     @Logger
     protected logger: any;
@@ -250,7 +259,8 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
 
     /**
      * Seals one record's protected fields (and a contact's photo) to `target`. A record changed meanwhile, or whose photo can't be read
-     * for a reason that passes, is left for the next run; a photo whose blob is gone is dropped from the record, which is sealed without it.
+     * for a reason that passes or is missing but not yet for long enough to be gone (`goneBlobs`), is left for the next run; a photo
+     * whose blob is gone is dropped from the record, which is sealed without it.
      * A record whose sealed write is refused for any other reason is marked (`zeroAccessBackfillError`) and never selected again.
      */
     private async sealRecord(repo: RecoverableRepoUtils<any>, type: ZeroAccessDataType, record: any, target: ZeroAccessTarget): Promise<void> {
@@ -264,9 +274,14 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
             let photo: Buffer | undefined;
             try {
                 photo = await this.blobStore!.get(record.photoBlobKey);
+                this.goneBlobs.forget(record.photoBlobKey);
             } catch (err: any) {
                 if (await this.blobExists(record.photoBlobKey)) {
                     this.logger?.warn(`ZeroAccessBackfillJob: contact ${record.uid}'s photo couldn't be read this run: ${err?.message ?? err}`);
+                    return;
+                }
+                if (!this.goneBlobs.confirmed(record.photoBlobKey)) {
+                    this.logger?.warn(`ZeroAccessBackfillJob: contact ${record.uid}'s photo isn't there; left until it has been missing for a while.`);
                     return;
                 }
                 // Gone: nothing readable is left to seal, and the record no longer names it.
@@ -323,8 +338,8 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
         }
     }
 
-    /** Whether a blob that couldn't be read is still there - the read failed for a reason that passes - or is gone for good. A store
-     * that can't even say is taken to still have it. */
+    /** Whether a blob that couldn't be read is still there - the read failed for a reason that passes - or isn't (gone for good once
+     * `goneBlobs` confirms it). A store that can't even say is taken to still have it. */
     private async blobExists(key: string): Promise<boolean> {
         try {
             return await this.blobStore!.exists(key);
@@ -384,7 +399,9 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
     /**
      * Whether an Outbox message's send can still go ahead: it is due, scheduled or waiting out a retry, or a send holds a live claim. A
      * soft-deleted one isn't sent while deleted (`ScheduledSendJob` doesn't select it) but is again once restored, so its schedule counts
-     * until `deletedDays` after the later of its scheduled time and its deletion (`dateModified`, which a soft delete bumps).
+     * until `deletedDays` after the later of its scheduled time and its deletion (`dateModified`, which a soft delete bumps). Not one
+     * already relayed whose filing waits for a retry: it has gone out, so nothing is left to send - it is sealed as sent mail at once,
+     * keeping its schedule (`sealMessage()`), and a restore still files it.
      */
     private static sendPending(message: Message, now: number, deletedDays: number): boolean {
         const lease: any = (message as any).scheduledSendLeaseExpiresAt;
@@ -398,6 +415,9 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
         if ((message as any).deleted !== true) {
             return true;
         }
+        if ((message as any).scheduledSendRelayedAt) {
+            return false;
+        }
         const since: number = Math.max(new Date(scheduledAt).getTime() || 0, new Date((message as any).dateModified ?? 0).getTime() || 0);
         return now < since + Math.max(0, Number(deletedDays) || 0) * 86_400_000;
     }
@@ -405,15 +425,20 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
     /**
      * Seals one message, as a draft when `isDraft`; `false` when zero-access is no longer active for its mailbox (nothing was changed). An
      * Outbox message (`inOutbox`) also loses its schedule and lapsed claim: sealed, it is nothing `ScheduledSendJob` could relay - one
-     * soft-deleted while scheduled and sealed after `deleted_scheduled_send_days` would otherwise come back due when restored.
+     * soft-deleted while scheduled and sealed after `deleted_scheduled_send_days` would otherwise come back due when restored. One already
+     * relayed keeps its schedule (a filing retry) and only loses the lapsed claim: `ScheduledSendJob` only files it into Sent Items, sealed
+     * as it is, so a restored one is filed.
      */
     private async sealMessage(mailbox: X, message: M, isDraft: boolean, inOutbox: boolean = false): Promise<boolean> {
         let raw: Buffer;
         try {
             raw = await this.blobStore!.get(message.bodyBlobKey);
+            this.goneBlobs.forget(message.bodyBlobKey);
         } catch (err: any) {
             if (await this.blobExists(message.bodyBlobKey)) {
                 this.logger?.warn(`ZeroAccessBackfillJob: message ${message.uid}'s body couldn't be read this run: ${err?.message ?? err}`);
+            } else if (!this.goneBlobs.confirmed(message.bodyBlobKey)) {
+                this.logger?.warn(`ZeroAccessBackfillJob: message ${message.uid}'s body isn't there; left until it has been missing for a while.`);
             } else {
                 await this.recordFailure(message, `The message body couldn't be read: ${err?.message ?? err}`);
             }
@@ -445,7 +470,11 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
                     bodyBlobKey: sealed.bodyBlobKey,
                     sanitizedHtmlBlobKey: null,
                     zeroAccess: sealed.zeroAccess,
-                    ...(inOutbox ? { scheduledSendTime: null, scheduledSendAttempts: null, scheduledSendLeaseExpiresAt: null } : {}),
+                    ...(inOutbox
+                        ? (message as any).scheduledSendRelayedAt
+                            ? { scheduledSendLeaseExpiresAt: null }
+                            : { scheduledSendTime: null, scheduledSendAttempts: null, scheduledSendLeaseExpiresAt: null }
+                        : {}),
                     // Indexed again, now as metadata only: the server-side search document still holds the readable text. Retries
                     // included (`SEARCH_REINDEX`): a message whose indexing retries had run out is otherwise never selected again.
                     ...SEARCH_REINDEX,

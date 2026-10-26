@@ -470,6 +470,29 @@ describe("fileDeliveryFailureNotice()", () => {
         const readable = await fileDeliveryFailureNotice({ ...sink, zeroAccessWriter }, input({ mailbox, key: "other" }));
         expect(readable.fields.subject).toBe("Undeliverable: Q3 plan");
     });
+
+    it("Leaves no sealed copy behind when the Inbox can't be found or created, retry after retry.", async () => {
+        // A sealRaw() that stores its copy where asked, as ZeroAccessWriter.seal() does.
+        const zeroAccessWriter = {
+            sealRaw: vi.fn().mockImplementation(async (_mailbox: any, raw: Buffer, _uid: string, _now: Date, options: { blobKey: string }) => {
+                await blobStore.put(options.blobKey, raw);
+                return { subject: "[...]", bodyPreview: "", bodyBlobKey: options.blobKey, zeroAccess: { keyFingerprint: "fp", sealedSummary: "s" }, indexEntryUid: "ix" };
+            }),
+            removeIndexEntry: vi.fn().mockResolvedValue(undefined),
+        };
+        const mailbox = { uid: "mailbox-1", zeroAccessKeys: [] } as any;
+        findOrCreate.mockRejectedValue(new Error("datastore down"));
+
+        await expect(fileDeliveryFailureNotice({ ...sink, zeroAccessWriter }, input({ mailbox }))).rejects.toThrow("datastore down");
+        await expect(fileDeliveryFailureNotice({ ...sink, zeroAccessWriter }, input({ mailbox }))).rejects.toThrow("datastore down");
+
+        for (const call of zeroAccessWriter.sealRaw.mock.calls) {
+            expect(await blobStore.exists(call[4].blobKey)).toBe(false);
+        }
+        // Nothing at all: no sealed copy under any key, and no readable one.
+        expect([...(blobStore as any).store.keys()]).toEqual([]);
+        expect(messageRepo.create).not.toHaveBeenCalled();
+    });
 });
 
 describe("tryFileDeliveryFailureNotice()", () => {

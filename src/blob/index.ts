@@ -3,5 +3,6 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 export * from "./BlobStore.js";
+export * from "./GoneBlobConfirmations.js";
 export * from "./LocalFsBlobStore.js";
 export * from "./S3BlobStore.js";

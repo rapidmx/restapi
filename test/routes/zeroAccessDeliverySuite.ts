@@ -58,8 +58,9 @@ export interface ZeroAccessDeliverySuiteContext {
     findMessage: (uid: string) => Promise<any>;
     /** The calendar event route, e.g. `/mongo/calendar-events`. */
     calendarEventsUrl: string;
-    /** Runs one pass of `ZeroAccessBackfillJob`. */
-    runBackfill: () => Promise<void>;
+    /** Runs one pass of `ZeroAccessBackfillJob`, by a fresh instance. `goneConfirmMs`: how long a body must have been missing to be
+     * gone (its `goneBlobs` window), the job's own day when unset. */
+    runBackfill: (options?: { goneConfirmMs?: number }) => Promise<void>;
     /** Runs one pass of `ScheduledSendJob`. */
     runScheduledSend: () => Promise<void>;
     updateMessage: (uid: string, fields: object) => Promise<void>;
@@ -813,7 +814,7 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
                 expect(JSON.stringify(send.body)).toContain("zero-access");
             });
 
-            it("keeps a soft-deleted scheduled Outbox message readable and scheduled until deleted_scheduled_send_days after its time and deletion, then seals it and clears its schedule (#604, #610)", async () => {
+            it("keeps a soft-deleted scheduled Outbox message readable and scheduled until deleted_scheduled_send_days after its time and deletion, then seals it and clears the schedule of one never relayed (#604, #610)", async () => {
                 const recipient = await makeKey();
                 const mailbox = await zeroAccessMailbox(recipient);
                 const outbox = await ctx.createFolder(mailbox.uid, "outbox");
@@ -847,7 +848,8 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
                 }
                 const relayedRow = await ctx.findMessage(relayed.message.uid);
                 expect(relayedRow.bodyBlobKey).toBe(`za/${mailbox.uid}/${relayed.message.uid}`);
-                expect(relayedRow.scheduledSendTime ?? null).toBeNull();
+                // Relayed: its filing is all that is left, which a restore still finishes (#802).
+                expect(relayedRow.scheduledSendTime).toBeTruthy();
                 for (const key of [relayed.bodyBlobKey, relayed.sanitizedHtmlBlobKey, relayed.attachmentBlobKey]) {
                     expect(await ctx.blobStore().exists(key), key).toBe(false);
                 }
@@ -910,13 +912,38 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
                 const { message, bodyBlobKey } = await stored(mailbox, inbox);
                 await ctx.blobStore().delete(bodyBlobKey);
 
-                await ctx.runBackfill();
+                // Missing long enough to be gone.
+                await ctx.runBackfill({ goneConfirmMs: 0 });
                 const marked = await ctx.findMessage(message.uid);
-                await ctx.runBackfill();
+                await ctx.runBackfill({ goneConfirmMs: 0 });
 
                 expect(marked.zeroAccessBackfillError).toContain("couldn't be read");
                 expect(marked.zeroAccess ?? undefined).toBeUndefined();
                 expect((await ctx.findMessage(message.uid)).version).toBe(marked.version);
+            });
+
+            it("doesn't give up on a body that isn't there at one look (a blob volume that isn't mounted), and seals it once it is back (round 8 review of #801)", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const inbox = await ctx.createFolder(mailbox.uid, "inbox");
+                const { message, bodyBlobKey } = await stored(mailbox, inbox);
+                const raw: Buffer = await ctx.blobStore().get(bodyBlobKey);
+                await ctx.blobStore().delete(bodyBlobKey);
+
+                await ctx.runBackfill();
+
+                const left = await ctx.findMessage(message.uid);
+                expect(left.zeroAccessBackfillError ?? undefined).toBeUndefined();
+                expect(left.zeroAccess ?? undefined).toBeUndefined();
+
+                // Back: sealed, not left readable for good.
+                await ctx.blobStore().put(bodyBlobKey, raw);
+                await ctx.runBackfill();
+
+                const sealed = await ctx.findMessage(message.uid);
+                expect(sealed.zeroAccess.keyFingerprint).toBe(recipient.key.fingerprint);
+                expect(sealed.subject).toBe("[...]");
+                expect(await ctx.blobStore().exists(bodyBlobKey)).toBe(false);
             });
         });
 
@@ -1111,6 +1138,65 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
                 expect(filed.zeroAccess.keyFingerprint).toBe(recipient.key.fingerprint);
                 expect(filed.sanitizedHtmlBlobKey ?? null).toBeNull();
                 expect(renders()).toEqual([]);
+                for (const [key, content] of blobs()) {
+                    expect(content.toString("latin1"), key).not.toContain(CANARY_BODY);
+                }
+            });
+
+            it("seals at once a relayed but unfiled message deleted from Outbox while its filing waits to be retried, and files it sealed once restored (round 8, #802)", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const { message, bodyBlobKey, attachmentBlobKey } = await draft(mailbox);
+                // A reply: the relayed copy, and so the sealed one's outer headers, carry its threading headers, so filing has nothing to add.
+                await ctx.updateMessage(message.uid, { inReplyTo: "parent@example.org", references: ["parent@example.org"] });
+                const auth = (req: any) => req.set("Authorization", "jwt " + ctx.tokenFor(mailbox.ownerUserUid));
+                // Sealing the Sent Items copy fails once, after the relay: the message stays in Outbox, relayed, its filing to be retried.
+                const store: any = ctx.blobStore();
+                const realPut = store.put.bind(store);
+                const put = vi.spyOn(store, "put").mockImplementation(async (key: any, ...rest: any[]) => {
+                    if (String(key).startsWith("za/")) {
+                        throw new Error("simulated store failure");
+                    }
+                    return realPut(key, ...rest);
+                });
+                const sent = await auth(request(ctx.app()).post(`${ctx.messagesUrl}/${message.uid}/send`)).send({});
+                put.mockRestore();
+                expect(sent.status, JSON.stringify(sent.body)).toBeGreaterThanOrEqual(500);
+                const relayed = await ctx.findMessage(message.uid);
+                expect(relayed.scheduledSendRelayedAt).toBeTruthy();
+                expect(relayed.scheduledSendTime).toBeTruthy();
+
+                // Deleted from Outbox before the retry: the message has gone out, so nothing is left to send.
+                expect([200, 204]).toContain((await auth(request(ctx.app()).delete(`${ctx.messagesUrl}/${message.uid}`))).status);
+                await ctx.runBackfill();
+
+                const sealed = await ctx.findMessage(message.uid);
+                expect(sealed.deleted).toBe(true);
+                expect(sealed.zeroAccess.keyFingerprint).toBe(recipient.key.fingerprint);
+                expect(sealed.bodyBlobKey).toBe(`za/${mailbox.uid}/${message.uid}`);
+                for (const key of [bodyBlobKey, attachmentBlobKey, relayed.sanitizedHtmlBlobKey].filter(Boolean)) {
+                    expect(await ctx.blobStore().exists(key), key).toBe(false);
+                }
+                for (const [key, content] of blobs()) {
+                    expect(content.toString("latin1"), key).not.toContain(CANARY_BODY);
+                }
+                // Its filing is still to be finished, should it be restored.
+                expect(sealed.scheduledSendRelayedAt).toBeTruthy();
+                expect(sealed.scheduledSendTime).toBeTruthy();
+                const sealedBlob: Buffer = await ctx.blobStore().get(sealed.bodyBlobKey);
+
+                await ctx.updateMessage(message.uid, { deleted: false });
+                await ctx.runScheduledSend();
+
+                const filed = await ctx.findMessage(message.uid);
+                expect(filed.folderUid).not.toBe(relayed.folderUid);
+                expect(filed.sentByServerAt).toBeTruthy();
+                expect(filed.scheduledSendTime ?? null).toBeNull();
+                expect(filed.scheduledSendRelayedAt ?? null).toBeNull();
+                expect(filed.zeroAccess.keyFingerprint).toBe(recipient.key.fingerprint);
+                // Filed as sealed, its sealed copy left exactly as the backfill wrote it.
+                expect((await ctx.blobStore().get(filed.bodyBlobKey)).equals(sealedBlob)).toBe(true);
+                expect((await openSealedMessage(sealedBlob, recipient)).toString("latin1")).toContain(CANARY_BODY);
                 for (const [key, content] of blobs()) {
                     expect(content.toString("latin1"), key).not.toContain(CANARY_BODY);
                 }

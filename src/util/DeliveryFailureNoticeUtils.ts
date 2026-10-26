@@ -358,6 +358,9 @@ export async function fileDeliveryFailureNotice(sink: DeliveryNoticeSink, input:
     }
     const notice: DeliveryFailureNotice = await buildDeliveryFailureNotice(input);
     const now: Date = input.now ?? new Date();
+    // Found (or created, which is harmless when nothing gets filed) before the notice is stored, so nothing that can fail sits between
+    // storing it and the create's catch, which removes this filing's sealed copy: an Inbox that can't be had leaves no copy behind.
+    const inbox: any = await findOrCreateWellKnownFolder(sink.folderRepo, sink.folderClass, input.mailboxUid, FolderType.INBOX);
     // Sealed under a key fresh to this filing, not the notice's own `zeroAccessBlobKey()`: the uid is derived, so a concurrent filer of the
     // same failure shares that key, and neither could remove a sealed copy its filing failed to name without the risk of taking the one the
     // other's row names. A fresh key is this filing's alone - `seal()` removes it when sealing fails, and the catch below when filing does.
@@ -369,7 +372,6 @@ export async function fileDeliveryFailureNotice(sink: DeliveryNoticeSink, input:
         await sink.blobStore.put(bodyBlobKey, notice.raw, { contentType: "message/rfc822" });
     }
 
-    const inbox: any = await findOrCreateWellKnownFolder(sink.folderRepo, sink.folderClass, input.mailboxUid, FolderType.INBOX);
     let message: any;
     try {
         message = await sink.messageRepo.create(

@@ -7,6 +7,7 @@ import { BackgroundService, BaseEntity, ModelUtils, ObjectFactory, RepoUtils, Si
 import { asEntity } from "../util/EntityUtils.js";
 import { findPagesByUid } from "../util/MailboxContentUtils.js";
 import { BlobStore } from "../blob/BlobStore.js";
+import { GoneBlobConfirmations } from "../blob/GoneBlobConfirmations.js";
 import { RecoverableRepoUtils } from "../util/RecoverableRepoUtils.js";
 import { Attachment, Mailbox, Message } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
@@ -54,6 +55,9 @@ export abstract class MailboxQuotaRecalcJob<MB extends Mailbox, M extends Messag
 
     /** Messages read per keyset page while summing one mailbox. */
     private messagePageSize: number = 500;
+
+    /** A body the store says isn't there counts as gone only once it has been missing for 6 hours (`bodySize()`). */
+    protected goneBlobs: GoneBlobConfirmations = new GoneBlobConfirmations(6 * 3_600_000);
 
     @Logger
     private logger: any;
@@ -250,18 +254,26 @@ export abstract class MailboxQuotaRecalcJob<MB extends Mailbox, M extends Messag
     /**
      * One message's stored body size, `undefined` (logged) when the blob store can't say - see `recalcMailbox()`. A body the store says
      * for certain is gone (`exists()` false: a purge that deleted the blob and failed before the row, a lost blob) takes no space, `0`:
-     * counted as unsized, one such row would keep the mailbox's figure from ever going down. A store that can't tell is not "gone".
+     * counted as unsized, one such row would keep the mailbox's figure from ever going down. A store that can't tell is not "gone", and
+     * neither is one missing for less than `goneBlobs`' window: a local blob volume that failed to mount (an empty mount point) answers
+     * "not there" for every body, which would otherwise drop every mailbox's figure to its attachments.
      */
     private async bodySize(message: M): Promise<number | undefined> {
         if (!message.bodyBlobKey) {
             return 0;
         }
         try {
-            return await this.blobStore!.size(message.bodyBlobKey);
+            const size: number = await this.blobStore!.size(message.bodyBlobKey);
+            this.goneBlobs.forget(message.bodyBlobKey);
+            return size;
         } catch (err: any) {
             if (!(await this.blobStore!.exists(message.bodyBlobKey).catch(() => true))) {
-                this.logger?.warn(`MailboxQuotaRecalcJob: body blob ${message.bodyBlobKey} of message ${message.uid} is gone; counted as no space.`);
-                return 0;
+                if (this.goneBlobs.confirmed(message.bodyBlobKey)) {
+                    this.logger?.warn(`MailboxQuotaRecalcJob: body blob ${message.bodyBlobKey} of message ${message.uid} is gone; counted as no space.`);
+                    return 0;
+                }
+                this.logger?.warn(`MailboxQuotaRecalcJob: body blob ${message.bodyBlobKey} of message ${message.uid} isn't there; not counted as gone until it has been missing for a while.`);
+                return undefined;
             }
             this.logger?.warn(`MailboxQuotaRecalcJob: failed to size body blob ${message.bodyBlobKey} for message ${message.uid}: ${err.message}`);
             return undefined;

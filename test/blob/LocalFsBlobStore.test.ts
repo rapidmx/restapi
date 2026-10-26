@@ -9,6 +9,7 @@ import * as os from "os";
 import * as path from "path";
 import { Readable } from "stream";
 import { LocalFsBlobStore, toBuffer } from "../../src/blob/LocalFsBlobStore.js";
+import { BROKEN_DIRECTORY_CODES, breakDirectory, restoreDirectory } from "../fsFaults.js";
 
 describe("LocalFsBlobStore Tests", () => {
     let tmpDir: string;
@@ -144,6 +145,27 @@ describe("LocalFsBlobStore Tests", () => {
 
         expect(await store.exists(key)).toBe(true);
         expect(await store.exists("nope")).toBe(false);
+    });
+
+    it("exists() also says false when a directory on the way is a file (ENOTDIR): nothing can be stored there.", async () => {
+        const file: string = path.join(tmpDir, `not-a-dir-${Math.random()}`);
+        await fs.writeFile(file, "x");
+        (store as any).root = file;
+        expect(await store.exists("anything")).toBe(false);
+    });
+
+    // A store that can't tell must not say "gone": the quota recalc counts a gone body as no space (round 8, #801).
+    it("exists() rejects, rather than saying false, when the blob's directory can't be reached (EACCES, EPERM, ELOOP).", async () => {
+        const key = "denied-key";
+        await store.put(key, Buffer.from("x"));
+        const shard: string = path.dirname((await store.localPath(key))!);
+        await breakDirectory(shard);
+        try {
+            await expect(store.exists(key)).rejects.toMatchObject({ code: expect.stringMatching(BROKEN_DIRECTORY_CODES) });
+        } finally {
+            await restoreDirectory(shard);
+        }
+        expect(await store.exists(key)).toBe(true);
     });
 
     it("size() returns the byte length of the stored blob.", async () => {

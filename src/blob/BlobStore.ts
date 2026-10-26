@@ -70,7 +70,8 @@ export interface BlobStore {
     delete(key: string): Promise<void>;
 
     /**
-     * Determines whether a blob exists at `key`.
+     * Determines whether a blob exists at `key`. `false` means the store is sure nothing is there; when it can't tell (an outage, a
+     * permission or I/O fault) it rejects instead, since callers treat `false` as "gone for good".
      */
     exists(key: string): Promise<boolean>;
 

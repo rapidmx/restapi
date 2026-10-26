@@ -9,10 +9,16 @@
 // from the connection's runtime type) - so this file has no MongoDB dependency at all.
 import { ACLUtils, AccessControlListSQL, ConnectionManager, ObjectFactory, isSqlDataSource } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
+import * as fs from "fs/promises";
+import * as os from "os";
+import * as path from "path";
 import * as uuid from "uuid";
 import { In, Repository } from "typeorm";
 import config from "../../config.sql.js";
 import { registerTestDoubles } from "../../testDoubles.js";
+import { breakDirectory, restoreDirectory } from "../../fsFaults.js";
+import { LocalFsBlobStore } from "../../../src/blob/LocalFsBlobStore.js";
+import { GoneBlobConfirmations } from "../../../src/blob/GoneBlobConfirmations.js";
 import { MailboxQuotaRecalcJobSQL } from "../../../src/jobs/sql/MailboxQuotaRecalcJobSQL.js";
 import { MailboxSQL } from "../../../src/models/sql/MailboxSQL.js";
 import { MessageSQL } from "../../../src/models/sql/MessageSQL.js";
@@ -109,6 +115,8 @@ describe("MailboxQuotaRecalcJobSQL Tests (real DB + DI)", () => {
         }
         // Restore the job's batch size to the configured default between tests, in case a test overrode it.
         (job as any).batchSize = config.get("mail:jobs:mailbox_quota_recalc:batch_size") ?? 100;
+        // A body the store says isn't there is gone at once unless a test says otherwise: the wait has its own test.
+        (job as any).goneBlobs = new GoneBlobConfirmations(0);
     });
 
     afterEach(() => {
@@ -326,6 +334,79 @@ describe("MailboxQuotaRecalcJobSQL Tests (real DB + DI)", () => {
         await job.run();
 
         expect((await mailboxRepo.findOne({ where: { uid: mailbox.uid } }))!.usedBytes).toBe(300);
+    });
+
+    it("Never lowers the figure when the local store can't read a body's directory: only a body that isn't there is gone (round 8, #801).", async () => {
+        const root: string = await fs.mkdtemp(path.join(os.tmpdir(), "quota-recalc-"));
+        const local = new LocalFsBlobStore();
+        (local as any).root = root;
+        const original = (job as any).blobStore;
+        (job as any).blobStore = local;
+        try {
+            const mailbox = await createMailbox({ usedBytes: 5000 });
+            const bodyKey = `body/${uuid.v4()}`;
+            await local.put(bodyKey, Buffer.alloc(300));
+            await createMessage(mailbox.uid, { bodyBlobKey: bodyKey });
+            // Never stored: really not there.
+            await createMessage(mailbox.uid, { bodyBlobKey: `body/${uuid.v4()}` });
+            // A restore or uid change left the body's directory unreadable to this process.
+            const shard: string = path.dirname((await local.localPath(bodyKey))!);
+            await breakDirectory(shard);
+            try {
+                await job.run();
+            } finally {
+                await restoreDirectory(shard);
+            }
+            expect((await mailboxRepo.findOne({ where: { uid: mailbox.uid } }))!.usedBytes).toBe(5000);
+
+            // Readable again, it is sized, and the one that isn't there takes no space.
+            await job.run();
+            expect((await mailboxRepo.findOne({ where: { uid: mailbox.uid } }))!.usedBytes).toBe(300);
+        } finally {
+            (job as any).blobStore = original;
+            await fs.rm(root, { recursive: true, force: true });
+        }
+    });
+
+    it("Never lowers the figure while the local blob volume isn't mounted, and counts a body as gone only once it has been missing for 6 hours (round 8 review of #801).", async () => {
+        const root: string = await fs.mkdtemp(path.join(os.tmpdir(), "quota-recalc-"));
+        const unmounted: string = await fs.mkdtemp(path.join(os.tmpdir(), "quota-recalc-unmounted-"));
+        const local = new LocalFsBlobStore();
+        (local as any).root = root;
+        const original = (job as any).blobStore;
+        (job as any).blobStore = local;
+        const gone = new GoneBlobConfirmations(6 * 3_600_000);
+        let now: number = Date.now();
+        gone.now = () => now;
+        (job as any).goneBlobs = gone;
+        try {
+            const mailbox = await createMailbox({ usedBytes: 5000 });
+            const bodyKey = `body/${uuid.v4()}`;
+            await local.put(bodyKey, Buffer.alloc(300));
+            await createMessage(mailbox.uid, { bodyBlobKey: bodyKey });
+            // Lost for real.
+            await createMessage(mailbox.uid, { bodyBlobKey: `body/${uuid.v4()}` });
+
+            // The volume failed to mount: the root is an empty mount-point directory, so every body reads as not there.
+            (local as any).root = unmounted;
+            await job.run();
+            expect(((await mailboxRepo.findOne({ where: { uid: mailbox.uid } }))!.usedBytes)).toBe(5000);
+
+            // Mounted again an hour later: what is stored is sized, and the lost body isn't counted as gone yet.
+            (local as any).root = root;
+            now += 3_600_000;
+            await job.run();
+            expect(((await mailboxRepo.findOne({ where: { uid: mailbox.uid } }))!.usedBytes)).toBe(5000);
+
+            // Missing for 6 hours: gone, taking no space.
+            now += 5 * 3_600_000;
+            await job.run();
+            expect(((await mailboxRepo.findOne({ where: { uid: mailbox.uid } }))!.usedBytes)).toBe(300);
+        } finally {
+            (job as any).blobStore = original;
+            await fs.rm(root, { recursive: true, force: true });
+            await fs.rm(unmounted, { recursive: true, force: true });
+        }
     });
 
     it("Sums the rest when one body blob is gone, counting it as no space.", async () => {
