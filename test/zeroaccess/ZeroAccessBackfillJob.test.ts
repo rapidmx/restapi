@@ -219,31 +219,54 @@ describe("ZeroAccessBackfillJob (isolated)", () => {
         expect(instance.messageRepo.update.mock.calls.map((call: any[]) => call[0].uid)).toEqual(["failed", "lapsed", "unfiled"]);
     });
 
-    it("seals a soft-deleted Outbox message whatever its schedule says, clearing the schedule, unless a send still holds it (round 6, #604, #610)", async () => {
+    it("keeps a soft-deleted scheduled Outbox message, which a restore sends, until deleted_scheduled_send_days after its time and deletion, then seals it and clears its schedule (#604, #610)", async () => {
+        const day = 86_400_000;
         const future = new Date(Date.now() + 60_000);
         const past = new Date(Date.now() - 60_000);
+        const longAgo = new Date(Date.now() - 31 * day);
         const { instance } = job({ messages: [message("inbox-mail")] });
         instance.folderRepo.find.mockResolvedValue([{ uid: "outbox", type: "outbox" }]);
         instance.messageRepo.findOne = vi.fn().mockResolvedValue(undefined);
         instance.messageRepo.find = vi.fn(async (query: any) =>
             query.deleted
                 ? [
-                      message("deleted-scheduled", { folderUid: "outbox", deleted: true, scheduledSendTime: future }),
-                      message("deleted-relayed", { folderUid: "outbox", deleted: true, scheduledSendTime: past, scheduledSendRelayedAt: past }),
+                      message("deleted-future", { folderUid: "outbox", deleted: true, scheduledSendTime: future, dateModified: longAgo }),
+                      message("deleted-recently", { folderUid: "outbox", deleted: true, scheduledSendTime: longAgo, dateModified: past }),
+                      message("deleted-unknown", { folderUid: "outbox", deleted: true, scheduledSendTime: longAgo, dateModified: undefined }),
+                      message("deleted-scheduled", { folderUid: "outbox", deleted: true, scheduledSendTime: longAgo, dateModified: longAgo }),
+                      message("deleted-relayed", { folderUid: "outbox", deleted: true, scheduledSendTime: longAgo, dateModified: longAgo, scheduledSendRelayedAt: longAgo }),
                       message("deleted-in-flight", { folderUid: "outbox", deleted: true, scheduledSendTime: null, scheduledSendLeaseExpiresAt: future }),
                   ]
                 : [message("inbox-mail")],
         );
         await instance.run();
-        expect(instance.zeroAccessWriter.sealDraft.mock.calls.map((call: any[]) => call[2])).toEqual(["deleted-scheduled"]);
+        expect(instance.zeroAccessWriter.sealDraft.mock.calls.map((call: any[]) => call[2])).toEqual(["deleted-unknown", "deleted-scheduled"]);
         expect(instance.zeroAccessWriter.sealRaw.mock.calls.map((call: any[]) => call[2])).toEqual(["inbox-mail", "deleted-relayed"]);
         const patches = Object.fromEntries(instance.messageRepo.update.mock.calls.map((call: any[]) => [call[0].uid, call[0]]));
-        expect(Object.keys(patches)).toEqual(["inbox-mail", "deleted-scheduled", "deleted-relayed"]);
+        expect(Object.keys(patches)).toEqual(["inbox-mail", "deleted-unknown", "deleted-scheduled", "deleted-relayed"]);
         for (const uid of ["deleted-scheduled", "deleted-relayed"]) {
             expect(patches[uid]).toMatchObject({ scheduledSendTime: null, scheduledSendAttempts: null, scheduledSendLeaseExpiresAt: null });
         }
         // Only an Outbox row's schedule is touched.
         expect("scheduledSendTime" in patches["inbox-mail"]).toBe(false);
+    });
+
+    it("seals a soft-deleted scheduled Outbox message once its time and deletion have passed when deleted_scheduled_send_days is 0", async () => {
+        const past = new Date(Date.now() - 60_000);
+        const { instance } = job({ messages: [] });
+        instance.deletedScheduledSendDays = 0;
+        instance.folderRepo.find.mockResolvedValue([{ uid: "outbox", type: "outbox" }]);
+        instance.messageRepo.findOne = vi.fn().mockResolvedValue(undefined);
+        instance.messageRepo.find = vi.fn(async (query: any) =>
+            query.deleted
+                ? [
+                      message("due", { folderUid: "outbox", deleted: true, scheduledSendTime: past, dateModified: past }),
+                      message("later", { folderUid: "outbox", deleted: true, scheduledSendTime: new Date(Date.now() + 60_000), dateModified: past }),
+                  ]
+                : [],
+        );
+        await instance.run();
+        expect(instance.zeroAccessWriter.sealDraft.mock.calls.map((call: any[]) => call[2])).toEqual(["due"]);
     });
 
     it("keeps a message sealed, and logs it, when its readable copies can't all be removed", async () => {

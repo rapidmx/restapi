@@ -521,4 +521,43 @@ export function backgroundSendSuite(ctx: BackgroundSendSuiteContext): void {
             expect(filed.encrypted).toBe(false);
         });
     });
+
+    describe("a scheduled message soft-deleted from Outbox, then restored (#604, #610)", () => {
+        it("is never relayed while it is deleted, keeps its schedule, and is relayed and filed once restored", async () => {
+            const message = await dueMessage({ subject: "Deleted then restored" });
+            await ctx.repo().delete(message.uid, { ignoreACL: true });
+
+            await ctx.job().run();
+            await ctx.job().enqueue(message.uid);
+
+            expect(ctx.transport().sent).toHaveLength(0);
+            const deleted = await ctx.findMessage(message.uid);
+            expect(deleted.deleted).toBe(true);
+            expect(deleted.scheduledSendTime).toBeTruthy();
+            expect(deleted.scheduledSendRelayedAt ?? null).toBeNull();
+            expect(deleted.folderUid).toBe(ctx.outboxUid());
+
+            await ctx.updateMessage(message.uid, { deleted: false });
+            await ctx.job().run();
+
+            expect(ctx.transport().sent).toHaveLength(1);
+            const filed = await ctx.findMessage(message.uid);
+            expect(filed.folderUid).toBe((await ctx.findFolder(FolderType.SENT_ITEMS)).uid);
+            expect(filed.scheduledSendTime ?? null).toBeNull();
+        });
+
+        it("waits for its scheduled time when restored before it", async () => {
+            const later = new Date(Date.now() + 3_600_000);
+            const message = await ctx.createMessage({ bodyBlobKey: await ctx.putBody(), scheduledSendTime: later });
+            await ctx.repo().delete(message.uid, { ignoreACL: true });
+            await ctx.updateMessage(message.uid, { deleted: false });
+
+            await ctx.job().run();
+
+            expect(ctx.transport().sent).toHaveLength(0);
+            const restored = await ctx.findMessage(message.uid);
+            expect(new Date(restored.scheduledSendTime).getTime()).toBe(later.getTime());
+            expect(restored.folderUid).toBe(ctx.outboxUid());
+        });
+    });
 }

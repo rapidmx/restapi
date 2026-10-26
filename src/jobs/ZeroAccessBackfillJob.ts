@@ -48,9 +48,12 @@ const RECORD_TYPES: readonly ZeroAccessDataType[] = ["calendar", "contacts", "ta
  *
  * Messages in Outbox are left alone while their send can still go ahead - due, scheduled or waiting out a retry (`scheduledSendTime`), or
  * claimed (a live `scheduledSendLeaseExpiresAt`) - since they are relayed from the readable copy and `ScheduledSendJob` seals the Sent
- * Items copy. One whose send failed for good, that was relayed but never filed, or that was soft-deleted (never sent, whatever its
- * schedule says) is nothing left to send: it is sealed, as a draft when it was never relayed (reopened and sent again like any sealed
- * draft) and as sent mail when it was, and its schedule is cleared. Mail the sender encrypted end
+ * Items copy. A soft-deleted one keeps its schedule: `ScheduledSendJob` never relays it while it is deleted, and a restore resumes the
+ * send (at its time, or at once when that has passed), so it stays readable under the same transient exception - but only until
+ * `deleted_scheduled_send_days` (30) after the later of its scheduled time and its deletion, since nothing else bounds it (deleted mail
+ * is purged only by a retention policy or an explicit purge). One whose send failed for good, that was relayed but never filed, or
+ * that was deleted longer ago than that is nothing left to send: it is sealed, as a draft when it was never relayed (reopened and sent
+ * again like any sealed draft) and as sent mail when it was, and its schedule is cleared. Mail the sender encrypted end
  * to end is left alone. Turning zero-access off never decrypts anything (the server can't): this job only ever seals.
  *
  * Calendar events, contacts and tasks are sealed the same way, per data type, once that type is protected for the mailbox (`specs/search.md`
@@ -100,6 +103,11 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
 
     @Config("mail:jobs:zero_access_backfill:batch_size", 100)
     private batchSize: number = 100;
+
+    /** How many days a soft-deleted, still-scheduled Outbox message stays readable (restorable to be sent) after the later of its
+     * scheduled time and its deletion, before it is sealed with its schedule cleared. */
+    @Config("mail:jobs:zero_access_backfill:deleted_scheduled_send_days", 30)
+    private deletedScheduledSendDays: number = 30;
 
     @Logger
     protected logger: any;
@@ -359,7 +367,7 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
                 break;
             }
             const inOutbox: boolean = outbox.has(message.folderUid);
-            if (message.encrypted || (inOutbox && ZeroAccessBackfillJob.sendPending(message, now))) {
+            if (message.encrypted || (inOutbox && ZeroAccessBackfillJob.sendPending(message, now, this.deletedScheduledSendDays))) {
                 continue;
             }
             attempted++;
@@ -375,19 +383,29 @@ export abstract class ZeroAccessBackfillJob<M extends Message, X extends Mailbox
 
     /**
      * Whether an Outbox message's send can still go ahead: it is due, scheduled or waiting out a retry, or a send holds a live claim. A
-     * soft-deleted one is never sent (`ScheduledSendJob` doesn't select it), whatever its `scheduledSendTime` says, so only a live claim -
-     * a delete that landed while it was being relayed - keeps it from being sealed.
+     * soft-deleted one isn't sent while deleted (`ScheduledSendJob` doesn't select it) but is again once restored, so its schedule counts
+     * until `deletedDays` after the later of its scheduled time and its deletion (`dateModified`, which a soft delete bumps).
      */
-    private static sendPending(message: Message, now: number): boolean {
+    private static sendPending(message: Message, now: number, deletedDays: number): boolean {
         const lease: any = (message as any).scheduledSendLeaseExpiresAt;
-        const claimed: boolean = !!lease && new Date(lease).getTime() > now;
-        return claimed || ((message as any).deleted !== true && !!message.scheduledSendTime);
+        if (!!lease && new Date(lease).getTime() > now) {
+            return true;
+        }
+        const scheduledAt: any = message.scheduledSendTime;
+        if (!scheduledAt) {
+            return false;
+        }
+        if ((message as any).deleted !== true) {
+            return true;
+        }
+        const since: number = Math.max(new Date(scheduledAt).getTime() || 0, new Date((message as any).dateModified ?? 0).getTime() || 0);
+        return now < since + Math.max(0, Number(deletedDays) || 0) * 86_400_000;
     }
 
     /**
      * Seals one message, as a draft when `isDraft`; `false` when zero-access is no longer active for its mailbox (nothing was changed). An
      * Outbox message (`inOutbox`) also loses its schedule and lapsed claim: sealed, it is nothing `ScheduledSendJob` could relay - one
-     * soft-deleted while scheduled would otherwise come back due when restored.
+     * soft-deleted while scheduled and sealed after `deleted_scheduled_send_days` would otherwise come back due when restored.
      */
     private async sealMessage(mailbox: X, message: M, isDraft: boolean, inOutbox: boolean = false): Promise<boolean> {
         let raw: Buffer;

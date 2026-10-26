@@ -813,18 +813,31 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
                 expect(JSON.stringify(send.body)).toContain("zero-access");
             });
 
-            it("seals a soft-deleted Outbox message whatever its schedule says, clearing it, but leaves one deleted mid-relay (round 6, #604, #610)", async () => {
+            it("keeps a soft-deleted scheduled Outbox message readable and scheduled until deleted_scheduled_send_days after its time and deletion, then seals it and clears its schedule (#604, #610)", async () => {
                 const recipient = await makeKey();
                 const mailbox = await zeroAccessMailbox(recipient);
                 const outbox = await ctx.createFolder(mailbox.uid, "outbox");
                 const later = new Date(Date.now() + 7 * 86_400_000);
-                // Scheduled for next week, then deleted: `ScheduledSendJob` never selects it again.
-                const scheduled = await stored(mailbox, outbox, { deleted: true, scheduledSendTime: later });
-                const relayed = await stored(mailbox, outbox, { deleted: true, scheduledSendTime: later, scheduledSendRelayedAt: new Date() });
+                const longAgo = new Date(Date.now() - 31 * 86_400_000);
+                // Scheduled for next week, then deleted: restorable, and a restore resumes its send, so it stays as it is.
+                const pending = (await stored(mailbox, outbox, { deleted: true, scheduledSendTime: later })).message;
+                // Deleted just now, though its time passed long ago: still restorable to be sent at once.
+                const overdue = (await stored(mailbox, outbox, { deleted: true, scheduledSendTime: longAgo })).message;
+                // Due long ago and deleted long ago: past the bound, nothing left to send.
+                const scheduled = await stored(mailbox, outbox, { deleted: true, scheduledSendTime: longAgo });
+                const relayed = await stored(mailbox, outbox, { deleted: true, scheduledSendTime: longAgo, scheduledSendRelayedAt: longAgo });
+                for (const { message } of [scheduled, relayed]) {
+                    await ctx.updateMessage(message.uid, { dateModified: longAgo });
+                }
                 const inFlight = (await stored(mailbox, outbox, { deleted: true, scheduledSendTime: null, scheduledSendLeaseExpiresAt: new Date(Date.now() + 600_000) })).message;
 
                 await ctx.runBackfill();
 
+                for (const uid of [pending.uid, overdue.uid, inFlight.uid]) {
+                    expect((await ctx.findMessage(uid)).zeroAccess ?? undefined, uid).toBeUndefined();
+                }
+                expect(new Date((await ctx.findMessage(pending.uid)).scheduledSendTime).getTime()).toBe(later.getTime());
+                expect((await ctx.findMessage(overdue.uid)).scheduledSendTime).toBeTruthy();
                 const scheduledRow = await ctx.findMessage(scheduled.message.uid);
                 expect(scheduledRow.zeroAccess.keyFingerprint).toBe(recipient.key.fingerprint);
                 expect(scheduledRow.bodyBlobKey).toMatch(new RegExp(`^za/${mailbox.uid}/drafts/`));
@@ -838,7 +851,6 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
                 for (const key of [relayed.bodyBlobKey, relayed.sanitizedHtmlBlobKey, relayed.attachmentBlobKey]) {
                     expect(await ctx.blobStore().exists(key), key).toBe(false);
                 }
-                expect((await ctx.findMessage(inFlight.uid)).zeroAccess ?? undefined).toBeUndefined();
             });
 
             it("removes the search document of restorable deleted mail it seals, which the search indexer never revisits", async () => {
@@ -962,6 +974,33 @@ export function zeroAccessDeliverySuite(ctx: ZeroAccessDeliverySuiteContext): vo
 
                 expect(result.status).toBeLessThan(300);
                 await expectSealedSentCopy(message.uid, recipient, [bodyBlobKey, attachmentBlobKey]);
+            });
+
+            it("never sends a scheduled message while it is soft-deleted, keeps it readable, and sends it sealed once it is restored (#604, #610)", async () => {
+                const recipient = await makeKey();
+                const mailbox = await zeroAccessMailbox(recipient);
+                const { message, bodyBlobKey, attachmentBlobKey } = await draft(mailbox);
+                const auth = (req: any) => req.set("Authorization", "jwt " + ctx.tokenFor(mailbox.ownerUserUid));
+
+                const scheduled = await auth(request(ctx.app()).post(`${ctx.messagesUrl}/${message.uid}/send`)).send({ scheduledSendTime: new Date(Date.now() + 3_600_000).toISOString() });
+                expect(scheduled.status).toBeLessThan(300);
+                expect([200, 204]).toContain((await auth(request(ctx.app()).delete(`${ctx.messagesUrl}/${message.uid}`))).status);
+                // Its time comes while it is deleted: not sent, not sealed, and its schedule kept for a restore.
+                await ctx.updateMessage(message.uid, { scheduledSendTime: new Date(Date.now() - 60_000) });
+                await ctx.runScheduledSend();
+                await ctx.runBackfill();
+                const deleted = await ctx.findMessage(message.uid);
+                expect(deleted.deleted).toBe(true);
+                expect(deleted.scheduledSendRelayedAt ?? null).toBeNull();
+                expect(deleted.zeroAccess ?? undefined).toBeUndefined();
+                expect(deleted.scheduledSendTime).toBeTruthy();
+                expect(await ctx.blobStore().exists(bodyBlobKey)).toBe(true);
+
+                await ctx.updateMessage(message.uid, { deleted: false });
+                await ctx.runScheduledSend();
+
+                await expectSealedSentCopy(message.uid, recipient, [bodyBlobKey, attachmentBlobKey]);
+                expect((await ctx.findMessage(message.uid)).scheduledSendTime ?? null).toBeNull();
             });
 
             it("sends the sealed Sent Items copy to be indexed again, so the search index drops the readable draft's text", async () => {
