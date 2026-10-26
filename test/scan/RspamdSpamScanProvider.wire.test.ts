@@ -61,6 +61,14 @@ describe("RspamdSpamScanProvider.learn() on the wire Tests", () => {
         expect(seen[0].body.equals(raw)).toBe(true);
     });
 
+    it("Sends an internationalized mailbox's report rather than throwing, its Deliver-To cleaned to printable ASCII as a scan's Rcpt is.", async () => {
+        await provider().learn(Buffer.from("x"), "spam", { recipient: "用户@例子.cn" });
+
+        expect(seen).toHaveLength(1);
+        expect(seen[0].url).toBe("/learnspam");
+        expect(seen[0].headers["deliver-to"]).toBe("??@??.cn");
+    });
+
     it("Sends ham to /learnham.", async () => {
         await provider().learn(Buffer.from("x"), "ham");
 

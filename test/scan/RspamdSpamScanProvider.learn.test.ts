@@ -69,6 +69,15 @@ describe("RspamdSpamScanProvider.learn() Tests", () => {
         });
     });
 
+    it("Cleans the Deliver-To value to bounded printable ASCII, as scoreMessage() cleans Rcpt, so an internationalized mailbox address can be sent.", async () => {
+        await provider.learn(Buffer.from("x"), "spam", { recipient: "用户é@例子.cn\r\n" + "a".repeat(2000) });
+
+        const deliverTo: string = mockFetch.mock.calls[0][1].headers["Deliver-To"];
+        expect(deliverTo.startsWith("???@??.cn??aaa")).toBe(true);
+        expect(deliverTo).toMatch(/^[\x20-\x7E]+$/);
+        expect(deliverTo).toHaveLength(998);
+    });
+
     it("Counts any 2xx as success - rspamd answers a message it already learned with 208.", async () => {
         mockFetch.mockResolvedValue({ ok: true, status: 208 });
 

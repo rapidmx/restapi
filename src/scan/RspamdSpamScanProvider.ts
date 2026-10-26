@@ -124,7 +124,9 @@ export class RspamdSpamScanProvider implements SpamScanProvider {
             headers["Password"] = this.controllerPassword;
         }
         if (options.recipient) {
-            headers["Deliver-To"] = options.recipient;
+            // Cleaned as scoreMessage() cleans Rcpt, so an internationalized mailbox address neither throws in `fetch` nor files
+            // its statistics under a different name than the scan's.
+            headers["Deliver-To"] = headerValue(options.recipient);
         }
 
         const controller = new AbortController();
