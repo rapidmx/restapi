@@ -466,15 +466,18 @@ export function mailRoutesReviewSuite(ctx: MailRoutesReviewSuiteContext): void {
             const sentItems = await createFolder(mine.uid, FolderType.SENT_ITEMS);
             const inbox = await createFolder(mine.uid);
             const sealed = { subject: "[...]", zeroAccess: { keyFingerprint: "fp", sealedSummary: "c2VhbGVk" } };
-            const sentDate = new Date(Date.UTC(2026, 9, 20, 9, 30));
-            const sent = await createMessage(mine, sentItems.uid, { ...sealed, sentByServerAt: new Date(), sentDate });
+            // The draft was started days before it was sent: its `sentDate` is still the draft's, and the notice names the relay time.
+            const sentDate = new Date(Date.UTC(2026, 9, 16, 9, 30));
+            const sentByServerAt = new Date(Date.UTC(2026, 9, 20, 14, 5));
+            const sent = await createMessage(mine, sentItems.uid, { ...sealed, sentByServerAt, sentDate });
 
             const before = ctx.transport().sent.length;
             expect((await auth(request(ctx.app()).post(url(`/messages/${sent.uid}/recall`)), owner)).status).toBe(200);
             const [recall] = ctx.transport().sent.slice(before);
             const notice: string = recall.raw.toString();
             expect(notice).toMatch(/^Subject: Recall\r?$/m);
-            expect(notice).toContain(sentDate.toUTCString());
+            expect(notice).toContain(sentByServerAt.toUTCString());
+            expect(notice).not.toContain(sentDate.toUTCString());
             expect(notice).not.toContain("[...]");
 
             // A read receipt sent as the message is marked read.

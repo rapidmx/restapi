@@ -281,9 +281,10 @@ async function keepHolderComponents(cert: import("openpgp").Key): Promise<void> 
 /**
  * `pinned`, an OpenPGP certificate on file, refreshed with what `observed` - the same certificate (its primary key's fingerprint) as it
  * is served now - adds: newer self-signatures (an extended expiry), new subkeys, subkey and primary key revocations. The two are merged
- * by OpenPGP.js (`Key.update()`) and the result is stripped to what verifies with the primary key (`keepHolderComponents()`), so nobody
- * but the key holder can add anything - no third-party certification, foreign subkey or forged revocation grows the pin - and a stale
- * copy, one without a revocation or a subkey already on file, takes nothing away. `publicKey`, `notBefore` and `notAfter` are read
+ * by OpenPGP.js (`Key.update()`) - `observed` stripped to what verifies with the primary key (`keepHolderComponents()`) first, and the result
+ * again after - so nobody but the key holder can add anything - no third-party certification, foreign subkey or forged revocation grows
+ * the pin, and no forged later-dated binding or self-certification displaces the pin's - and a stale copy, one without a revocation or a
+ * subkey already on file, takes nothing away. `publicKey`, `notBefore` and `notAfter` are read
  * again from the merged certificate, and a primary key revocation it now carries marks it revoked (as `"compromised"`, as
  * `sanitizeOpenPgpKey()` reads one) unless it already is; the pin itself is unchanged. `undefined` when there is nothing to store: not
  * the same certificate, unreadable, nothing new, or a merge larger than `MAX_OPENPGP_KEY_BYTES`.
@@ -293,6 +294,10 @@ export async function mergeOpenPgpCertificate(pinned: PublicKey, observed: Publi
     if (!pinnedCert || !observedCert || observedCert.isPrivate() || pinnedCert.getFingerprint() !== observedCert.getFingerprint()) {
         return undefined;
     }
+    // Stripped before the merge as well as after: `Key.update()` replaces the pin's binding or self-certification in place with a later-dated one
+    // from the same issuer without verifying it, so a forged copy would otherwise take the genuine one out (and its subkey or user ID with it,
+    // once the merged result is stripped) - a copy carrying a garbage binding would quietly leave the pin unable to encrypt.
+    await keepHolderComponents(observedCert);
     const merged = await orElse(pinnedCert.update(observedCert, new Date(now)), undefined);
     if (merged) {
         await keepHolderComponents(merged);

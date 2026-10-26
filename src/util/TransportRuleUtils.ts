@@ -206,8 +206,12 @@ export function evaluateTransportRules(
     return result;
 }
 
-/** Elements whose contents are never text of the message. */
+/** Elements whose contents are never text of the message - in HTML content. */
 const HTML_SKIPPED: ReadonlySet<string> = new Set(["script", "style"]);
+
+/** Foreign-content roots. `htmlparser2` reads a `<style>`/`<script>` inside one as raw text, as in HTML, but a browser parses its
+ * contents as markup there, and an HTML element in it (`<p>`, `<div>`) breaks out of the foreign content and renders. */
+const HTML_FOREIGN: ReadonlySet<string> = new Set(["svg", "math"]);
 
 /** Elements a reader sees as a break between words. Any other element - an unknown one too, which browsers lay out inline - joins the text
  * around it, so `wi<span></span>re` still reads "wire". */
@@ -222,47 +226,88 @@ const HTML_BREAKS: ReadonlySet<string> = new Set(
  * `html` as plain text for `bodyContains`, up to `BODY_TEXT_MAX_LENGTH` characters: every text node in document order, a break element a
  * space. It tokenizes (`htmlparser2`) and never builds a tree, so no nesting depth or width leaves text out - a converter that
  * recurses either fails on a deeply nested body or bounds it and drops what lies past the bound, which any sender could hide a phrase
- * behind (101 nested `<div>`s, 10,001 empty `<span>`s) while the reader's client still shows it.
+ * behind (101 nested `<div>`s, 10,001 empty `<span>`s) while the reader's client still shows it. Comment text, and the text of a
+ * `<style>`/`<script>` inside `<svg>`/`<math>`, follows the rest: a browser ends a comment where `htmlparser2` doesn't (`--!>`, a bogus
+ * `<![CDATA[` comment's first `>`) and renders an HTML element inside foreign content's `<style>`, so leaving either out would hide what
+ * the reader is shown. Such text is kept as it is and, read as HTML once more (`nested`), as the reader may see it: entities decoded,
+ * markup a space or nothing as above.
  */
-function htmlText(html: string): string {
+function htmlText(html: string, nested: boolean = false): string {
     const parts: string[] = [];
+    // Text `htmlparser2` and a browser may read differently - a comment's (`<!-- a --!> text`, `<![CDATA[ > text`, which a browser ends
+    // early), a `<style>`/`<script>`'s inside `<svg>`/`<math>` - kept after the text proper, each its own segment, so it can't split a
+    // phrase the reader sees whole. Matching may see more than the reader does, never less. Read as HTML one level deep only, so no
+    // nesting of comments or foreign styles recurses without bound (a deeper level is still kept as it is).
+    const extra: string[] = [];
     let length: number = 0;
     let skipped: number = 0;
+    let foreign: number = 0;
+    let foreignRaw: number = 0;
     const separate = (): void => {
         if (parts.length > 0 && parts[parts.length - 1] !== " ") {
             parts.push(" ");
             length++;
         }
     };
+    const keep = (into: string[], text: string): void => {
+        if (length < BODY_TEXT_MAX_LENGTH) {
+            into.push(text);
+            length += text.length;
+        }
+    };
+    const keepExtra = (text: string): void => {
+        keep(extra, ` ${text} `);
+        if (!nested && length < BODY_TEXT_MAX_LENGTH) {
+            keep(extra, ` ${htmlText(text, true)} `);
+        }
+    };
     const parser: Parser = new Parser(
         {
             onopentagname(name: string): void {
+                if (HTML_FOREIGN.has(name)) {
+                    foreign++;
+                }
+                // Nothing nests in raw text, so at most one of the two counts is ever above zero.
                 if (HTML_SKIPPED.has(name)) {
-                    skipped++;
+                    if (foreign > 0) {
+                        foreignRaw++;
+                    } else {
+                        skipped++;
+                    }
                 }
                 if (HTML_BREAKS.has(name)) {
                     separate();
                 }
             },
             onclosetag(name: string): void {
-                if (HTML_SKIPPED.has(name) && skipped > 0) {
-                    skipped--;
+                if (HTML_SKIPPED.has(name)) {
+                    if (foreignRaw > 0) {
+                        foreignRaw--;
+                    } else if (skipped > 0) {
+                        skipped--;
+                    }
+                }
+                if (HTML_FOREIGN.has(name) && foreign > 0) {
+                    foreign--;
                 }
                 if (HTML_BREAKS.has(name)) {
                     separate();
                 }
             },
             ontext(text: string): void {
-                if (skipped === 0 && length < BODY_TEXT_MAX_LENGTH) {
-                    parts.push(text);
-                    length += text.length;
+                if (foreignRaw > 0) {
+                    keepExtra(text);
+                } else if (skipped === 0) {
+                    keep(parts, text);
                 }
             },
+            // Outside XML mode a `<![CDATA[...]]>` section is a comment too.
+            oncomment: keepExtra,
         },
         { decodeEntities: true },
     );
     parser.end(html);
-    return parts.join("").replace(/\s+/g, " ");
+    return [...parts, ...extra].join("").replace(/\s+/g, " ");
 }
 
 /**

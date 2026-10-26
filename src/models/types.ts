@@ -519,8 +519,9 @@ export interface KeyDiscoveryResponse {
     escrow: boolean;
 
     /** The primary address the keys' certificates name, when the address that was asked for is an alias (or an alias domain's) of
-     * it. Absent when the certificates name the address asked for. A key is only pinned when its certificate names the address
-     * asked for or this one. */
+     * it. Absent when the certificates name the address asked for, and whenever `keys` is empty (so an answer about a mailbox
+     * without keys can't be told from one about a local part with no mailbox). A key is only pinned when its certificate names
+     * the address asked for or this one. */
     address?: string;
 }
 

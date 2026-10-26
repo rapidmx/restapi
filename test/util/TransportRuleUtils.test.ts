@@ -323,6 +323,34 @@ describe("TransportRuleUtils Tests", () => {
             expect(styled.bodyText).toBe("A&B C");
         });
 
+        it("Reads the text a browser shows but htmlparser2 reads as a comment or raw text, so a bodyContains rule can't be evaded through it.", async () => {
+            const rule: any = { enabled: true, sequence: 1, conditions: { bodyContains: ["wire transfer"] }, actions: [{ type: TransportRuleActionType.QUARANTINE }] };
+            const context = async (html: string) =>
+                buildTransportRuleContext(Buffer.from(["From: sender@example.com", "Content-Type: text/html", "", html, ""].join("\r\n")), "sender@example.com", ["a@example.com"], []);
+            for (const html of [
+                "<svg><style><p>wire transfer</p></style></svg>",
+                "<p>Hi</p><!-- x --!> Please send the wire transfer today",
+                "<![CDATA[ > wire transfer ]]>",
+                "<math><style><div>wire transfer</div></style></math>",
+                "<svg><script>wire transfer</script></svg>",
+                // What a browser renders of it is read as HTML too: entities decoded, inline markup joining the text around it.
+                "<svg><style><p>wire&#32;tr<b></b>ansfer</p></style></svg>",
+                "<p>Hi</p><!-- x --!><p>wire&nbsp;transfer</p>-->",
+            ]) {
+                expect(evaluateTransportRules([rule], await context(html)).quarantine, html).toBe(true);
+            }
+            // Kept after the text proper, so neither splits a phrase the reader sees whole.
+            for (const html of ["<p>wire <!-- note --> transfer</p>", "<p>wire <svg><style>x</style></svg>transfer</p>"]) {
+                expect(evaluateTransportRules([rule], await context(html)).quarantine, html).toBe(true);
+            }
+            // A top-level style or script is still no text of the message, and one inside foreign content stays its own once it closes.
+            expect((await context("<style>wire transfer</style><p>Hello</p>")).bodyText).toBe("Hello");
+            expect((await context("<svg><style>a</style></svg><style>b</style><p>Hello</p>")).bodyText).toBe("Hello a a");
+            // Read as HTML one level deep only: nesting can't recurse without bound.
+            const deep = await context("<svg><style>".repeat(20_000) + "deep" + "<!--".repeat(20_000));
+            expect(deep.bodyText).toContain("deep");
+        });
+
         it("anyRecipientExternal is false when mail:domains is unconfigured (empty).", async () => {
             const raw = Buffer.from("From: sender@example.com\r\n\r\nBody\r\n");
             const context = await buildTransportRuleContext(raw, "sender@example.com", ["a@outside.com"], []);

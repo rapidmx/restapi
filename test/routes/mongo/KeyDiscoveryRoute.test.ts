@@ -265,6 +265,24 @@ describe("Route:KeyDiscoveryMongo Tests", () => {
         expect(literal.body.address).toBeUndefined();
     });
 
+    it("Answers an alias-domain question about a mailbox that publishes no keys exactly as one about a local part with no mailbox, body and ETag, so it never names the primary address.", async () => {
+        await domainRepo.save(new DomainMongo({ uid: "powerlevel.gg", name: "powerlevel.gg", enabled: true, verified: true }));
+        await domainRepo.save(new DomainMongo({ uid: "plc.gg", name: "plc.gg", enabled: true, verified: true, aliasOf: "powerlevel.gg" }));
+        const localPart = `keyless-${uuid.v4()}`;
+        const hash = computeKeyDiscoveryHash(localPart);
+        await createMailbox({ primarySmtpAddress: `${localPart}@powerlevel.gg`, keyDiscoveryHash: hash, keys: [] });
+        const missingHash = computeKeyDiscoveryHash(`missing-${uuid.v4()}`);
+
+        const existing = await request(server.getApplication()).get(`${baseUrl}/${hash}?domain=plc.gg`);
+        const missing = await request(server.getApplication()).get(`${baseUrl}/${missingHash}?domain=plc.gg`);
+
+        expect(existing.status).toBe(200);
+        expect(missing.status).toBe(200);
+        expect(existing.body).toEqual({ encryptPreference: { preferEncrypt: "nopreference" }, keys: [], escrow: false });
+        expect(existing.body).toEqual(missing.body);
+        expect(existing.headers.etag).toBe(missing.headers.etag);
+    });
+
     it("Never leaks a disabled/dangling alias domain into a match - falls back to the all-defaults response.", async () => {
         await domainRepo.save(new DomainMongo({ uid: "powerlevel.gg", name: "powerlevel.gg", enabled: true, verified: true }));
         await domainRepo.save(

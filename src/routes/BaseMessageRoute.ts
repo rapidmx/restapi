@@ -748,8 +748,8 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
     }
 
     /**
-     * A non-trusted update never changes `sentDate`/`receivedDate` (a draft's dates are the compose/send path's, which
-     * writes through the repository directly) - otherwise a held message could be re-dated out of its hold's range,
+     * A non-trusted update never changes `sentDate`/`receivedDate` (a draft keeps the dates it was created with; the send
+     * path records when it was relayed in `sentByServerAt`, written through the repository directly) - otherwise a held message could be re-dated out of its hold's range,
      * or moved to Drafts, re-dated and moved back. `dispositionNotificationTo` stays settable on a message currently
      * in Drafts only.
      *
@@ -1860,7 +1860,9 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
         const envelopeTo: string[] = envelopeRecipientsOf(message);
         // `from.displayName` is ordinary client-writable data - an address-like one is left out (`safeDisplayName()`).
         const fromName: string | undefined = safeDisplayName(message.from.displayName);
-        // A zero-access message's row holds only the placeholder subject: its notice names the message by its date instead.
+        // A zero-access message's row holds only the placeholder subject: its notice names the message by the time the server relayed it
+        // (`sentByServerAt`, which the check above guarantees) instead - not `sentDate`, which the send path never moves off the draft's
+        // creation date, so a draft started days before it was sent would name a day no recipient's copy is dated.
         const subject: string | undefined = quotableSubject(message);
         const composed: Buffer = await new MailComposer({
             from: { address: message.from.address, name: fromName },
@@ -1870,7 +1872,7 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
             text:
                 subject !== undefined
                     ? `${fromName ?? message.from.address} is attempting to recall the message: "${subject}".`
-                    : `${fromName ?? message.from.address} is attempting to recall the message sent ${new Date(message.sentDate).toUTCString()}.`,
+                    : `${fromName ?? message.from.address} is attempting to recall the message sent ${new Date((message as any).sentByServerAt).toUTCString()}.`,
             headers: { "X-RapidMX-Recall-Of": message.messageId },
         })
             .compile()

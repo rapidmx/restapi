@@ -198,6 +198,39 @@ describe("OpenPgpKeyUtils", () => {
             expect(cleanedCert.revocationSignatures).toEqual([]);
         });
 
+        it("lets no forged, later-dated subkey binding or self-certification replace the pin's, so a forged copy never strips its encryption subkey", async () => {
+            const pinned = await openPgpKey(ADDRESS, { created: new Date(Date.now() - 10 * DAY) });
+            // Newer binding and self-certification packets, with the primary key's issuer key ID, whose signatures don't verify.
+            const later = await reexpired(pinned, 0);
+            const forge = (signature: openpgp.SignaturePacket): openpgp.SignaturePacket => {
+                const forged: openpgp.SignaturePacket = Object.assign(Object.create(Object.getPrototypeOf(signature)), signature);
+                forged.signedHashValue = new Uint8Array(forged.signedHashValue!.map((b) => b ^ 0xff));
+                return forged;
+            };
+            const copy = (mutate: (cert: openpgp.PublicKey) => void): string => {
+                const cert = pinned.publicKey.clone(true);
+                mutate(cert);
+                return Buffer.from(cert.write()).toString("base64");
+            };
+            const forgedBinding = copy((cert) => {
+                cert.subkeys[0].bindingSignatures = [forge(later.publicKey.subkeys[0].bindingSignatures[0])];
+            });
+            const forgedSelfCertification = copy((cert) => {
+                cert.users[0].selfCertifications = [forge(later.publicKey.users[0].selfCertifications[0])];
+            });
+            for (const publicKey of [forgedBinding, forgedSelfCertification]) {
+                expect(await mergeOpenPgpCertificate(pinned.key, { ...pinned.key, publicKey })).toBeUndefined();
+            }
+
+            // The pin was refreshed with both anyway, alongside a genuine extended expiry: it keeps its subkey and can still encrypt.
+            const extended = await reexpired(pinned, 800 * 86_400);
+            const both = extended.publicKey.clone(true);
+            both.subkeys[0].bindingSignatures.push(forge(later.publicKey.subkeys[0].bindingSignatures[0]));
+            const merged = (await mergeOpenPgpCertificate(pinned.key, { ...pinned.key, publicKey: Buffer.from(both.write()).toString("base64") }))!;
+            expect(merged.notAfter).toBe(extended.key.notAfter);
+            expect((await parseOpenPgpCertificate(merged.publicKey))!.canEncrypt).toBe(true);
+        });
+
         it("dates a revocation by one that verifies, not a forged one listed first", async () => {
             const pinned = await openPgpKey(ADDRESS, { created: new Date(Date.now() - 10 * DAY) });
             const mallory = await openPgpKey("mallory@example.com", { created: new Date(Date.now() - 10 * DAY) });

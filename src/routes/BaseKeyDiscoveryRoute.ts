@@ -188,8 +188,9 @@ export abstract class BaseKeyDiscoveryRoute<M extends Mailbox, K extends KeyVaul
         }
         const body: KeyDiscoveryResponse = await buildKeyDiscoveryResponse(this.keyVaultRepo!, match, await this.openPgpPolicy!.allowed());
         // The certificates name the mailbox's primary address, not the alias-domain address that was asked about: say so, so the asking server can check
-        // the certificate against it (`KeyDiscoveryResponse.address`).
-        if (viaAliasDomain && match?.primarySmtpAddress) {
+        // the certificate against it (`KeyDiscoveryResponse.address`). Only when a certificate is listed - an answer with no keys must stay identical to
+        // `NOT_PUBLISHED_RESPONSE`, body and ETag, or an alias-domain question would tell a mailbox without keys from a local part with none.
+        if (viaAliasDomain && match?.primarySmtpAddress && body.keys.length > 0) {
             body.address = match.primarySmtpAddress;
         }
 
