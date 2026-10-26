@@ -7,7 +7,7 @@
 // callers who may not see them - identical on both backends. `test/routes/{mongo,sql}/MessagePurge.test.ts` supply a started server
 // and raw row helpers.
 import { request } from "@rapidrest/service-core/test";
-import { ACLAction, RepoUtils } from "@rapidrest/service-core";
+import { ACLAction, ModelUtils, RepoUtils } from "@rapidrest/service-core";
 import * as uuid from "uuid";
 import { AuditAction, FolderType, IngestStatus, MessageImportance, QuarantineReason, RecipientType } from "../../src/models/types.js";
 import type { InMemoryBlobStore } from "../testDoubles.js";
@@ -300,6 +300,87 @@ export function messagePurgeSuite(ctx: MessagePurgeSuiteContext): void {
             for (const key of first.blobKeys) {
                 expect(await exists(key), key).toBe(false);
             }
+        });
+
+        describe("of the soft-deleted messages (?deleted=true)", () => {
+            const truncateDeleted = (folderUid: string) =>
+                request(ctx.app()).delete(`${ctx.baseUrl}?folderUid=${folderUid}&deleted=true`).set("Authorization", auth(owner));
+            /** Makes the message repository's delete of soft-deleted rows leave `keep` (all of them when empty): a record whose state
+             * changed between the two deletes. */
+            const leaveSoftDeleted = (keep?: string) => {
+                const original = RepoUtils.prototype.truncate;
+                vi.spyOn(RepoUtils.prototype, "truncate").mockImplementation(function (this: any, query: any, ...rest: any[]) {
+                    if (query?.deleted === true && Array.isArray(query.uid?.value)) {
+                        if (!keep) {
+                            return Promise.resolve();
+                        }
+                        query = { ...query, uid: ModelUtils.literal(query.uid.value.filter((uid: string) => uid !== keep), "in") };
+                    }
+                    return (original as any).call(this, query, ...rest);
+                });
+            };
+
+            it("Deletes them with their attachments and blobs, leaves the live ones, and audits what it removed.", async () => {
+                const w = await world();
+                const gone = await seed(w, { attachments: 1, fields: { deleted: true } });
+                const live = await seed(w, { attachments: 1 });
+
+                const res = await truncateDeleted(w.folder.uid);
+
+                expect(res.status).toBeLessThan(300);
+                expect(await ctx.findMessage(gone.message.uid)).toBeFalsy();
+                expect(await ctx.findAttachments(gone.message.uid)).toHaveLength(0);
+                for (const key of gone.blobKeys) {
+                    expect(await exists(key), key).toBe(false);
+                }
+                expect(await ctx.findMessage(live.message.uid)).toBeTruthy();
+                expect(await ctx.findAttachments(live.message.uid)).toHaveLength(1);
+                for (const key of live.blobKeys) {
+                    expect(await exists(key), key).toBe(true);
+                }
+                const entries = (await ctx.auditEntries(AuditAction.MESSAGE_TRUNCATE)).filter((entry) => entry.targetUid === w.folder.uid);
+                expect(entries).toHaveLength(1);
+                expect(entries[0].details).toEqual({ folderUid: w.folder.uid, count: 1 });
+            });
+
+            it("Keeps the attachments and blobs of a message its delete left, and counts only what went.", async () => {
+                const w = await world();
+                const kept = await seed(w, { attachments: 1, fields: { deleted: true } });
+                const gone = await seed(w, { attachments: 1, fields: { deleted: true } });
+                leaveSoftDeleted(kept.message.uid);
+
+                const res = await truncateDeleted(w.folder.uid);
+
+                expect(res.status).toBeLessThan(300);
+                expect(await ctx.findMessage(kept.message.uid)).toBeTruthy();
+                expect(await ctx.findAttachments(kept.message.uid)).toHaveLength(1);
+                for (const key of kept.blobKeys) {
+                    expect(await exists(key), key).toBe(true);
+                }
+                expect(await ctx.findMessage(gone.message.uid)).toBeFalsy();
+                expect(await ctx.findAttachments(gone.message.uid)).toHaveLength(0);
+                for (const key of gone.blobKeys) {
+                    expect(await exists(key), key).toBe(false);
+                }
+                const entries = (await ctx.auditEntries(AuditAction.MESSAGE_TRUNCATE)).filter((entry) => entry.targetUid === w.folder.uid);
+                expect(entries).toHaveLength(1);
+                expect(entries[0].details).toEqual({ folderUid: w.folder.uid, count: 1 });
+            });
+
+            it("Writes no audit entry and keeps everything when its delete left every message.", async () => {
+                const w = await world();
+                const kept = await seed(w, { attachments: 1, fields: { deleted: true } });
+                leaveSoftDeleted();
+
+                const res = await truncateDeleted(w.folder.uid);
+
+                expect(res.status).toBeLessThan(300);
+                expect(await ctx.findAttachments(kept.message.uid)).toHaveLength(1);
+                for (const key of kept.blobKeys) {
+                    expect(await exists(key), key).toBe(true);
+                }
+                expect((await ctx.auditEntries(AuditAction.MESSAGE_TRUNCATE)).filter((entry) => entry.targetUid === w.folder.uid)).toHaveLength(0);
+            });
         });
 
         it("Writes no audit entry for an empty folder.", async () => {

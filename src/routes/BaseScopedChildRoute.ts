@@ -770,12 +770,30 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
         //
         // A literal `in` list matches each uid exactly: a (legacy, client-chosen) uid holding `,` or `()` can't widen the
         // delete to records outside this scope, as a parsed `in(a,b,...)` would. Batched to keep each SQL `IN` bounded.
+        //
+        // `RepoUtils.truncate()` adds `deleted: false` to a query naming no `deleted`, so a recoverable model's records are deleted in
+        // each state explicitly: a soft-deleted record matched above (`?deleted=true`, which `listFilter()` keeps for a caller with
+        // DELETE and UPDATE) is deleted too. Only what is gone afterwards is passed on to `afterPurge()`, the search index and the
+        // audit: a record left (its state changed between the two deletes) keeps its attachments, blobs and search document.
+        const recoverable: boolean = this.repoUtils.instantiateObject({}) instanceof RecoverableBaseEntity;
+        const removed: T[] = [];
         for (let i = 0; i < matched.length; i += TRUNCATE_BATCH_SIZE) {
             const batch: T[] = matched.slice(i, i + TRUNCATE_BATCH_SIZE);
             const uids: string[] = batch.map((existing) => existing.uid);
             const prepared: unknown = await this.beforePurge(batch);
-            await this.repoUtils.truncate({ uid: ModelUtils.literal(uids, "in") } as any, { user, ignoreACL: true });
-            await this.afterPurge(batch, prepared);
+            for (const state of recoverable ? [{ deleted: false }, { deleted: true }] : [{}]) {
+                await this.repoUtils.truncate({ uid: ModelUtils.literal(uids, "in"), ...state } as any, { user, ignoreACL: true });
+            }
+            const left: Set<string> = await this.remainingOf(uids, recoverable);
+            const gone: T[] = left.size === 0 ? batch : batch.filter((existing) => !left.has(existing.uid));
+            if (gone.length > 0) {
+                // What `beforePurge()` found for the whole batch would take a remaining record's attachments and blobs with it.
+                await this.afterPurge(gone, gone === batch ? prepared : await this.beforePurge(gone));
+            }
+            removed.push(...gone);
+        }
+        if (removed.length === 0) {
+            return;
         }
         if (this.searchEntityType) {
             // `truncate()` is always a hard, permanent delete (see this method's own doc comment above) - same
@@ -783,11 +801,29 @@ export abstract class BaseScopedChildRoute<T extends BaseEntity> extends CRUDRou
             await removeFromSearchIndex(
                 this.searchProvider,
                 this.searchEntityType,
-                matched.map((existing) => existing.uid),
+                removed.map((existing) => existing.uid),
                 this.logger,
             );
         }
-        await this.afterTruncate(scopeUid!, matched.length, user, req);
+        await this.afterTruncate(scopeUid!, removed.length, user, req);
+    }
+
+    /** Which of `uids` (one `truncate()` batch) still exist, soft-deleted or not, after their delete. */
+    private async remainingOf(uids: string[], recoverable: boolean): Promise<Set<string>> {
+        const left: Set<string> = new Set();
+        for (const state of recoverable ? [{ deleted: false }, { deleted: true }] : [{}]) {
+            // `limit` in the query too: the SQL backend reads it from there alone (see `AttachmentExtractionJob.run()`). Never a cached
+            // result, which could predate the delete.
+            const rows: T[] = await this.repoUtils!.find({ uid: ModelUtils.literal(uids, "in"), ...state, limit: uids.length } as any, {
+                ignoreACL: true,
+                limit: uids.length,
+                skipCache: true,
+            });
+            for (const row of rows) {
+                left.add(row.uid);
+            }
+        }
+        return left;
     }
 
     @Put("/:id")

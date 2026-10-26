@@ -38,6 +38,7 @@ import {
 import { addressDomainOf, normalizeAddress, stripPlusTag } from "../util/AddressUtils.js";
 import { DomainUtils } from "../util/DomainUtils.js";
 import {
+    BUSY_TITLE,
     MAX_EVENT_ATTENDEES,
     MAX_REQUESTED_GUESTS,
     effectiveVisibility,
@@ -301,7 +302,17 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                     delete obj[field];
                 }
                 if (creating) {
-                    Object.assign(obj, { sealedContent: { ...sealed }, title: PROTECTED_SUBJECT, location: null, description: null, descriptionHtml: null });
+                    // A series whose sealed content names no title holds it in `sealedFields.title` alone (`sealInvite()`), which the
+                    // occurrence takes too, or it would open untitled.
+                    const sealedTitle: string | undefined = (existing as any).sealedFields?.title;
+                    Object.assign(obj, {
+                        sealedContent: { ...sealed },
+                        ...(sealedTitle ? { sealedFields: { title: sealedTitle } } : {}),
+                        title: PROTECTED_SUBJECT,
+                        location: null,
+                        description: null,
+                        descriptionHtml: null,
+                    });
                 }
                 return;
             }
@@ -625,6 +636,10 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         const existing: T | undefined = await this.repoUtils.findOne(id, { ignoreACL: true });
         if (existing && this.isSchedulingRelevantChange(existing, obj)) {
             (obj as any).sequence = existing.sequence + 1;
+        } else if (existing && (existing as any).sealedContent && !(typeof (obj as any).sequence === "number" && (obj as any).sequence > existing.sequence)) {
+            // Content sealed whole: the server can't see a change of its location, so a client that opened it raises the sequence itself
+            // when it changes it. Any other value it sends (the one it read back) is dropped, never lowering the stored one.
+            delete (obj as any).sequence;
         }
         const stored: T = await super.update(id, obj, req, user);
         // Without invitationContent, an event this write sealed for the first time is invited for from what it held readable (`prepareUpdate()`).
@@ -638,7 +653,10 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
 
     /** `true` if any of `startDate`/`endDate`/`location`/`attendees`/`status`/`recurrenceRule` in `obj`
      * differs from `existing`'s current value - fields `obj` doesn't touch at all are ignored, matching
-     * this route family's ordinary partial-update semantics. */
+     * this route family's ordinary partial-update semantics. The `location` of an event whose content is sealed whole
+     * (`sealedContent`) is not compared: the stored one is a placeholder, and every save of the opened event sends the real one,
+     * which would otherwise raise the sequence each time (an attendee's copy then ignoring the organizer's next revision as stale,
+     * an organizer's meeting re-inviting everyone). Its client raises the sequence itself for a real change (`update()`). */
     private isSchedulingRelevantChange(existing: T, obj: UpdateObject<T>): boolean {
         const incoming: any = obj;
         // `new Date()` on the stored side too - a row saved before dates were coerced on write can hold a string.
@@ -648,7 +666,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         if (incoming.endDate !== undefined && new Date(incoming.endDate).getTime() !== new Date(existing.endDate).getTime()) {
             return true;
         }
-        const fields: (keyof CalendarEvent)[] = ["location", "attendees", "status", "recurrenceRule"];
+        const fields: (keyof CalendarEvent)[] = (existing as any).sealedContent ? ["attendees", "status", "recurrenceRule"] : ["location", "attendees", "status", "recurrenceRule"];
         for (const field of fields) {
             if (incoming[field] !== undefined && JSON.stringify(incoming[field]) !== JSON.stringify((existing as any)[field])) {
                 return true;
@@ -1229,7 +1247,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
     /** The `MessageInvite` for `context`, with the schedule around it read from the mailbox's calendar. `overrides` replaces the calendar row or message it describes. */
     private async describe(context: InviteContext, overrides?: { existing?: CalendarEvent | undefined; message?: any }): Promise<MessageInvite> {
         const existing: CalendarEvent | undefined = overrides && "existing" in overrides ? overrides.existing : context.existing;
-        const schedule: InviteScheduleEntry[] = await this.loadSchedule(context.mailbox, context.parsed, context.addresses);
+        const schedule: InviteScheduleEntry[] = await this.loadSchedule(context);
         return describeInvite(context.parsed, context.addresses, existing, overrides?.message ?? context.message, schedule);
     }
 
@@ -1237,8 +1255,13 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
      * The reader's own events from 12 hours before the invitation starts to 12 hours after it ends, recurring series expanded, without the
      * meeting itself. Bounded reads (200 rows each of what overlaps the window and of the recurring masters): a mailbox with more than that
      * gets a partial schedule, never a failure - it only decorates the card.
+     *
+     * Each event is shown as the caller may see it on its calendar: in a calendar they can't read (a grantee of the Inbox alone) only as
+     * a busy window without a title, which free/busy already shows; a private or confidential one, to a reader without `UPDATE` on its
+     * calendar, as `BUSY_TITLE` (`redactReadRecords()`). The owner and delegates with `UPDATE` see every title.
      */
-    private async loadSchedule(mailbox: Mailbox, parsed: ParsedIcsEvent, addresses: Set<string>): Promise<InviteScheduleEntry[]> {
+    private async loadSchedule(context: InviteContext): Promise<InviteScheduleEntry[]> {
+        const { mailbox, parsed, addresses, user } = context;
         if (!parsed.startDate) {
             return [];
         }
@@ -1259,11 +1282,26 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
             for (const row of [...overlapping, ...masters.filter((row) => !row.recurrenceId)]) {
                 rows.set(row.uid, row);
             }
+            const access: Map<string, Promise<{ read: boolean; details: boolean }>> = new Map();
+            const accessTo = (folderUid: string): Promise<{ read: boolean; details: boolean }> => {
+                if (!access.has(folderUid)) {
+                    access.set(
+                        folderUid,
+                        (async () => {
+                            const read: boolean = await this.hasMailAccess(user, folderUid, ACLAction.READ);
+                            return { read, details: read && (await this.seesEventDetails(user, folderUid)) };
+                        })(),
+                    );
+                }
+                return access.get(folderUid)!;
+            };
             const entries: InviteScheduleEntry[] = [];
             for (const row of rows.values()) {
                 if (row.icalUid === own || row.status === CalendarEventStatus.CANCELLED) {
                     continue;
                 }
+                const seen: { read: boolean; details: boolean } = await accessTo(row.folderUid);
+                const title: string = !seen.read ? "" : hidesDetailsFromReaders(row) && !seen.details ? BUSY_TITLE : (row.title ?? "");
                 const isMaster: boolean = !!row.recurrenceRule && !row.recurrenceId;
                 const exclude: Date[] | undefined = isMaster
                     ? [
@@ -1280,7 +1318,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
                 )) {
                     entries.push({
                         uid: row.uid,
-                        title: row.title ?? "",
+                        title,
                         startDate: occurrence.start.toISOString(),
                         endDate: occurrence.end.toISOString(),
                         allDay: !!row.allDay,
@@ -1351,6 +1389,7 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
         }
         return {
             verifiedSender: verifiedFromAddress(raw, this.trustedAuthservId),
+            user,
             message,
             mailbox,
             parsed,
@@ -1586,6 +1625,8 @@ export abstract class BaseCalendarEventRoute<T extends CalendarEvent> extends Ba
 interface InviteContext {
     /** The message's `From` address when its raw source carries a passing, aligned DKIM result from this deployment's trusted MTA hop. */
     verifiedSender: string | undefined;
+    /** Who is acting on the invitation: the schedule around it is shown as they may see the calendar (`loadSchedule()`). */
+    user: JWTUser | undefined;
     message: any;
     mailbox: Mailbox;
     parsed: ParsedIcsEvent;

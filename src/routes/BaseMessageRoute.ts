@@ -3019,10 +3019,16 @@ export abstract class BaseMessageRoute<T extends Message> extends BaseScopedChil
      * `fetch()`/XHR (`Sec-Fetch-Dest: empty`) gets `keep` and everything else - a browser opening the URL, curl - gets `attachment`.
      */
     private async sanitizedHtmlOf(message: T, req?: HttpRequest): Promise<string> {
+        const key: string = message.sanitizedHtmlBlobKey!;
         const html: string = await this.sanitizedBodyLoader!.load({
             uid: message.uid,
             bodyBlobKey: message.bodyBlobKey,
-            sanitizedHtmlBlobKey: message.sanitizedHtmlBlobKey!,
+            sanitizedHtmlBlobKey: key,
+            // A re-sanitized blob is kept only while the message, read again, is readable and still names it (`SanitizedBodyLoader`).
+            stillNamed: async () => {
+                const row: any = await this.repoUtils!.findOne(message.uid, { ignoreACL: true, includeDeleted: true, skipCache: true });
+                return !!row && !row.zeroAccess && row.sanitizedHtmlBlobKey === key;
+            },
         });
         if (!html.includes("cid:")) {
             return html;

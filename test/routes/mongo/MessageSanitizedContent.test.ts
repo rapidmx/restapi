@@ -135,6 +135,9 @@ describe("Route:MessageMongo sanitized content Tests", () => {
                     ...data,
                 }),
             ),
+        updateMessage: async (uid, fields) => {
+            await messageRepo.updateOne({ uid } as any, { $set: fields });
+        },
         createAttachment: async (message, data) =>
             await attachmentRepo.save(
                 new AttachmentMongo({

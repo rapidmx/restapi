@@ -488,6 +488,7 @@ Processing rules:
 - Only inbound messages are processed, keyed on the `From` address.
 - Unknown attributes prefixed with `_` MUST be ignored. Unknown attributes without the prefix MUST invalidate the whole header. This permits forward-compatible extension.
 - The header MUST be included in the sending server's DKIM `h=` tag and **oversigned** (listed twice), so that a header cannot be injected into a message that did not carry one. Receiving servers MUST verify DKIM before acting on the header and MUST treat an unverified header as absent.
+- A copy of inbound mail the server relays out again (to a distribution list's external members, or by a forward rule) MUST NOT carry the original's `RapidMX-Key` header, nor its `Autocrypt` header when the copy's `From` is rewritten to the list or the mailbox: the server's own signature would vouch for a key announced for an address the sender doesn't own.
 
 The header is a hop-authenticated routing hint, not an end-to-end assertion. For RapidMX-to-RapidMX correspondence the discovery endpoint is authoritative, because it is authenticated by TLS and works before any message has been exchanged. The header exists to reach non-participating correspondents and to propagate rotations to active correspondents ahead of cache expiry.
 

@@ -123,6 +123,9 @@ describe("Route:MessageSQL sanitized content Tests", () => {
                     ...data,
                 }),
             ),
+        updateMessage: async (uid, fields) => {
+            await messageRepo.update({ uid }, fields);
+        },
         createAttachment: async (message, data) =>
             await attachmentRepo.save(
                 new AttachmentSQL({

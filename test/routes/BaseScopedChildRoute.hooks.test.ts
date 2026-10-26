@@ -98,7 +98,14 @@ describe("BaseScopedChildRoute purge and truncate hooks Tests", () => {
 
         await route.truncate({}, { folderUid: "folder-1" }, user, {} as any);
 
-        expect(truncate).toHaveBeenCalledTimes(2);
+        // Each batch deleted in both states of the soft delete (`RepoUtils.truncate()` would otherwise add `deleted: false`).
+        expect(truncate).toHaveBeenCalledTimes(4);
+        expect(truncate.mock.calls.map(([criteria]) => [criteria.uid.value.length, criteria.deleted])).toEqual([
+            [500, false],
+            [500, true],
+            [1, false],
+            [1, true],
+        ]);
         expect(route.calls.filter((call) => !call.startsWith("hold:"))).toEqual([
             `before:${matched.slice(0, 500).map((m) => m.uid).join(",")}`,
             'after:500:{"prepared":500}',
@@ -131,6 +138,6 @@ describe("BaseScopedChildRoute purge and truncate hooks Tests", () => {
         await expect(route.truncate({}, { folderUid: "folder-1" }, user)).rejects.toThrow("held");
 
         expect(del).toHaveBeenCalledTimes(1);
-        expect(truncate).toHaveBeenCalledTimes(1);
+        expect(truncate).toHaveBeenCalledTimes(2);
     });
 });

@@ -8,6 +8,7 @@
 // recording transport and raw row access; every case goes through real HTTP against a real database.
 import { request } from "@rapidrest/service-core/test";
 import { NotificationUtils } from "@rapidrest/service-core";
+import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import * as uuid from "uuid";
 import { AttendeeResponseStatus, AttendeeRole, FolderType, RecipientType } from "../../src/models/types.js";
 import { MAX_EVENT_DESCRIPTION_HTML_LENGTH, MAX_EVENT_DESCRIPTION_LENGTH } from "../../src/util/EventDescriptionUtils.js";
@@ -451,6 +452,76 @@ export function calendarEventDialogSuite(ctx: CalendarEventDialogSuiteContext): 
             expect((await owner(request(ctx.app()).get(url("title=Private")))).body).toHaveLength(1);
             expect((await other(request(ctx.app()).get(url("status=confirmed")))).status).toBe(200);
             expect((await other(request(ctx.app()).get(url("visibility=private")))).body.map((event: any) => event.title)).toEqual(["Busy"]);
+        });
+
+        describe("the schedule around an invitation in a shared Inbox", () => {
+            /** The owner's Inbox shared with `other` (`inboxActions`), an invitation in it, and two events around its time in the Calendar. */
+            const invited = async (inboxActions: string[], calendarActions?: string[]) => {
+                const { mailbox, calendar, me } = await setup();
+                const inbox = await ctx.createFolder(mailbox.uid, FolderType.INBOX);
+                await ctx.grantFolder(inbox.uid, ctx.otherUid, inboxActions);
+                if (calendarActions) {
+                    await ctx.grantFolder(calendar.uid, ctx.otherUid, calendarActions);
+                }
+                const near = { startDate: new Date(start.getTime() - 2 * HOUR), endDate: new Date(start.getTime() - HOUR) };
+                await ctx.createCalendarEvent(mailbox.uid, calendar.uid, { title: "Termination meeting", visibility: "confidential", ...near });
+                await ctx.createCalendarEvent(mailbox.uid, calendar.uid, { title: "Team lunch", ...near });
+                const stamp = (date: Date): string => date.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+                const content = [
+                    "BEGIN:VCALENDAR",
+                    "VERSION:2.0",
+                    "PRODID:-//Someone Else//Mail//EN",
+                    "METHOD:REQUEST",
+                    "BEGIN:VEVENT",
+                    `UID:${uuid.v4()}@boss.example.com`,
+                    `DTSTAMP:${stamp(new Date())}`,
+                    `DTSTART:${stamp(start)}`,
+                    `DTEND:${stamp(end)}`,
+                    "SUMMARY:Review",
+                    "SEQUENCE:0",
+                    `ORGANIZER;CN=Boss:mailto:${BOSS}`,
+                    `ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION:mailto:${me}`,
+                    "END:VEVENT",
+                    "END:VCALENDAR",
+                ].join("\r\n");
+                const raw: Buffer = await new MailComposer({
+                    from: BOSS,
+                    to: me,
+                    subject: "Invitation: Review",
+                    text: "You have been invited",
+                    icalEvent: { method: "request", content },
+                })
+                    .compile()
+                    .build();
+                const bodyBlobKey = `bodies/${uuid.v4()}`;
+                await ctx.blobStore().put(bodyBlobKey, raw);
+                const message = await ctx.createMessage(mailbox.uid, inbox.uid, {
+                    bodyBlobKey,
+                    from: { address: BOSS, type: RecipientType.TO },
+                    hasAttachments: true,
+                });
+                return `${ctx.baseUrl}/invite/${message.uid}`;
+            };
+            const titles = (result: any): string[] => result.body.schedule.map((entry: any) => entry.title).sort();
+
+            it("Gives a grantee of the Inbox alone the busy windows without a title, and the owner every title.", async () => {
+                const url = await invited(["read", "list"]);
+
+                const shown = await other(request(ctx.app()).get(url));
+
+                expect(shown.status).toBe(200);
+                expect(titles(shown)).toEqual(["", ""]);
+                expect(shown.body.schedule.every((entry: any) => entry.busy)).toBe(true);
+                expect(titles(await owner(request(ctx.app()).get(url)))).toEqual(["Team lunch", "Termination meeting"]);
+            });
+
+            it("Shows a confidential event to a reader of the calendar without UPDATE as a busy block, and in full with UPDATE.", async () => {
+                expect(titles(await other(request(ctx.app()).get(await invited(["read", "list"], ["read", "list"]))))).toEqual(["Busy", "Team lunch"]);
+                expect(titles(await other(request(ctx.app()).get(await invited(["read", "list"], ["read", "list", "update"]))))).toEqual([
+                    "Team lunch",
+                    "Termination meeting",
+                ]);
+            });
         });
     });
 

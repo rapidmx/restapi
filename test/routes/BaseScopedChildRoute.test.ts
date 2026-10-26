@@ -131,9 +131,11 @@ describe("BaseScopedChildRoute Tests (truncate() TOCTOU-scoping fix only)", () =
             { uid: "msg-2", folderUid: "folder-1" },
         ];
         const truncateSpy = vi.fn().mockResolvedValue(undefined);
+        // A model without soft delete: one delete per batch, then nothing of it left (`remainingOf()`).
         (route as any).repoUtils = {
-            find: vi.fn().mockResolvedValue(matched),
+            find: vi.fn().mockResolvedValueOnce(matched).mockResolvedValue([]),
             truncate: truncateSpy,
+            instantiateObject: () => ({}),
         };
         (route as any).aclUtils = { hasPermission: vi.fn().mockResolvedValue(true) };
 
@@ -155,7 +157,7 @@ describe("BaseScopedChildRoute Tests (truncate() TOCTOU-scoping fix only)", () =
         const route = objectFactory.newInstance<TestScopedRouteForTruncate>(TestScopedRouteForTruncate, { initialize: false });
         const matched = Array.from({ length: 501 }, (_, i) => ({ uid: `msg-${i}`, folderUid: "folder-1" }));
         const truncateSpy = vi.fn().mockResolvedValue(undefined);
-        (route as any).repoUtils = { find: vi.fn().mockResolvedValueOnce(matched).mockResolvedValue([]), truncate: truncateSpy };
+        (route as any).repoUtils = { find: vi.fn().mockResolvedValueOnce(matched).mockResolvedValue([]), truncate: truncateSpy, instantiateObject: () => ({}) };
         (route as any).aclUtils = { hasPermission: vi.fn().mockResolvedValue(true) };
 
         await route.truncate({}, { folderUid: "folder-1" }, { uid: "user-1" } as any);

@@ -20,6 +20,8 @@ export interface SanitizedContentSuiteContext {
     createMailbox: (ownerUid: string) => Promise<any>;
     createFolder: (mailboxUid: string, type: FolderType) => Promise<any>;
     createMessage: (mailboxUid: string, folderUid: string, data?: any) => Promise<any>;
+    /** Writes `fields` to the stored message row as they are. */
+    updateMessage: (uid: string, fields: any) => Promise<void>;
     createAttachment: (message: any, data: { contentId?: string; filename?: string; mimeType?: string }) => Promise<any>;
 }
 
@@ -62,6 +64,10 @@ export function sanitizedContentSuite(ctx: SanitizedContentSuiteContext): void {
     beforeEach(async () => {
         mailbox = await ctx.createMailbox(ctx.ownerUid);
         inbox = await ctx.createFolder(mailbox.uid, FolderType.INBOX);
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
     });
 
     /** A message whose sanitized blob was written by the current sanitizer and refers to `logo@example.com` and a missing part. */
@@ -196,6 +202,26 @@ export function sanitizedContentSuite(ctx: SanitizedContentSuiteContext): void {
             // Fails closed: the old blob goes through the current sanitizer (which writes a whole document), never out as stored.
             expect(result.text).toBe(sanitizeMailHtml("<table><tr><td>Sale</td></tr></table>"));
             expect((await ctx.blobStore().get(key)).toString()).toBe("<table><tr><td>Sale</td></tr></table>");
+        });
+
+        it("leaves no readable blob behind when the message is sealed zero-access while it is re-sanitized", async () => {
+            const { message, key } = await oldMessage();
+            const store = ctx.blobStore();
+            const exists = store.exists.bind(store);
+            // The backfill seals the message (the row first, then its sanitized blob) between the loader's check and its write.
+            vi.spyOn(store, "exists").mockImplementation(async (candidate: string) => {
+                const found: boolean = await exists(candidate);
+                if (candidate === key) {
+                    await ctx.updateMessage(message.uid, { sanitizedHtmlBlobKey: null, zeroAccess: { keyFingerprint: "ab".repeat(32), sealedSummary: "s" } });
+                    await store.delete(key);
+                }
+                return found;
+            });
+
+            const result = await get(message.uid);
+
+            expect(result.status).toBe(200);
+            expect(await exists(key)).toBe(false);
         });
     });
 

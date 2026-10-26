@@ -327,7 +327,35 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
                 const row: any = (await ctx.findEvents(mailbox.uid)).find((event: any) => event.uid !== series.uid);
                 expect(row.title).toBe("[...]");
                 expect(row.sealedContent).toEqual(series.sealedContent);
+                expect(row.sealedFields ?? null).toBeNull();
                 expect((await openSealedField(row.sealedContent.sealed, keys.get(mailbox.uid)!)).title).toBe("Video Test");
+            });
+
+            it("Gives such an occurrence the title's sealed copy too when the series' sealed content names no title", async () => {
+                const { mailbox, calendar, me } = await setup();
+                const key = await keyOf(mailbox.uid);
+                // What a revision without SUMMARY over a copy sealed field by field leaves: content sealed with an empty title, and the
+                // title's per-field copy.
+                const series = await ctx.createCalendarEvent(mailbox.uid, calendar.uid, {
+                    icalUid: eventUid,
+                    title: "[...]",
+                    startDate: start,
+                    endDate: end,
+                    recurrenceRule: { freq: "daily", interval: 1, exceptions: [] },
+                    sealedContent: { keyFingerprint: key.key.fingerprint, sealed: "eA==" },
+                    sealedFields: { title: "c2VhbGVkIHRpdGxl" },
+                    organizer: { address: "boss@boss.example.com", type: RecipientType.TO },
+                    attendees: [{ address: me, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.ACCEPTED, isOrganizer: false }],
+                });
+
+                const result = await owner(request(ctx.app()).post(ctx.baseUrl)).send(
+                    occurrence(mailbox, calendar, me, { title: "[...]", location: null, description: null }),
+                );
+
+                expect(result.status).toBeLessThan(300);
+                const row: any = (await ctx.findEvents(mailbox.uid)).find((event: any) => event.uid !== series.uid);
+                expect(row.sealedContent).toEqual(series.sealedContent);
+                expect(row.sealedFields).toEqual({ title: "c2VhbGVkIHRpdGxl" });
             });
 
             it("Leaves a create of another icalUid, or of another mailbox's series, to the calendar's own setting", async () => {
@@ -393,6 +421,53 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
             });
         });
 
+        describe("an update of an event filed from a zero-access invitation by a client that opened it", () => {
+            const acceptedMeeting = async () => {
+                const context = await setup();
+                const message = await receiveSealed(context.mailbox.uid, context.inbox.uid);
+                const answer = async (file: string) =>
+                    await owner(request(ctx.app()).post(inviteUrl(message.uid, "/respond"))).send({ responseStatus: "accepted", ics: file });
+                expect((await answer(requestFor(context.me, { extra: ["LOCATION:Room 9"] }))).status).toBe(200);
+                const [row] = await ctx.findEvents(context.mailbox.uid);
+                expect(row.location ?? null).toBeNull();
+                return { ...context, row, answer };
+            };
+            /** A save of the event dialog: the opened content, whatever else changed. */
+            const save = async (row: any, fields: any) =>
+                await owner(request(ctx.app()).put(`${ctx.baseUrl}/${row.uid}`)).send({ uid: row.uid, version: row.version, title: "Video Test", location: "Room 9", ...fields });
+
+            it("Keeps the sequence for a save that changes only the reminder, so the organizer's next revision is applied", async () => {
+                const { mailbox, me, row, answer } = await acceptedMeeting();
+
+                expect((await save(row, { reminderMinutesBeforeStart: 5, sequence: 0 })).status).toBe(200);
+
+                const [saved] = await ctx.findEvents(mailbox.uid);
+                expect(saved.sequence).toBe(0);
+                expect(saved.reminderMinutesBeforeStart).toBe(5);
+                expect(saved.location ?? null).toBeNull();
+                const later = new Date(start.getTime() + 4 * HOUR);
+                expect((await answer(requestFor(me, { sequence: 1, start: later, end: new Date(later.getTime() + HOUR), extra: ["LOCATION:Room 9"] }))).status).toBe(200);
+                const [moved] = await ctx.findEvents(mailbox.uid);
+                expect(moved.sequence).toBe(1);
+                // To the second, as the calendar file carries it.
+                expect(new Date(moved.startDate).getTime()).toBe(Math.floor(later.getTime() / 1000) * 1000);
+            });
+
+            it("Takes a sequence the client raised for a changed location, and drops one that isn't higher than the stored one", async () => {
+                const { mailbox, row } = await acceptedMeeting();
+
+                expect((await save(row, { location: "CANARY Room 10", sequence: 1 })).status).toBe(200);
+                const [raised] = await ctx.findEvents(mailbox.uid);
+                expect(raised.sequence).toBe(1);
+                expect(JSON.stringify(raised)).not.toContain("CANARY");
+
+                expect((await save(raised, { location: "CANARY Room 10", reminderMinutesBeforeStart: 30, sequence: 0 })).status).toBe(200);
+                const [kept] = await ctx.findEvents(mailbox.uid);
+                expect(kept.sequence).toBe(1);
+                expect(kept.reminderMinutesBeforeStart).toBe(30);
+            });
+        });
+
         describe("a meeting the mailbox organizes whose content is sealed whole", () => {
             const GUEST = "guest@elsewhere.example";
             const organized = async () => {
@@ -449,6 +524,35 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
                 expect(stored.sequence).toBe(1);
                 expect(stored.inviteSequenceSent).toBe(0);
                 expect(stored.sealedContent).toEqual(row.sealedContent);
+            });
+
+            it("Invites no one for a save of the opened meeting that changes only its reminder, and everyone when its client raises the sequence", async () => {
+                const { mailbox, row } = await organized();
+                const before = ctx.transport().sent.length;
+                const opened = { uid: row.uid, title: "CANARY Board review", location: "CANARY Room 2" };
+
+                const reminder = await owner(request(ctx.app()).put(`${ctx.baseUrl}/${row.uid}`)).send({ ...opened, version: row.version, reminderMinutesBeforeStart: 15 });
+
+                expect(reminder.status).toBe(200);
+                expect(ctx.transport().sent.length).toBe(before);
+                const [saved] = await ctx.findEvents(mailbox.uid);
+                expect(saved.sequence).toBe(0);
+
+                const relocated = await owner(request(ctx.app()).put(`${ctx.baseUrl}/${row.uid}`)).send({
+                    ...opened,
+                    version: saved.version,
+                    location: "CANARY Room 3",
+                    sequence: 1,
+                });
+
+                expect(relocated.status).toBe(200);
+                const sent = ctx.transport().sent.slice(before);
+                expect(sent).toHaveLength(1);
+                expect(decoded(sent[0].raw)).toContain("LOCATION:CANARY Room 3");
+                const [stored] = await ctx.findEvents(mailbox.uid);
+                expect(stored.sequence).toBe(1);
+                expect(stored.inviteSequenceSent).toBe(1);
+                expect(JSON.stringify(stored)).not.toContain("CANARY");
             });
         });
 
@@ -1282,6 +1386,11 @@ export function calendarInviteSuite(ctx: CalendarInviteSuiteContext): void {
 
     describe("the reader's schedule around an invitation", () => {
         const attendee = (address: string, responseStatus: AttendeeResponseStatus) => ({ address, role: AttendeeRole.REQUIRED, responseStatus, isOrganizer: false });
+
+        afterEach(() => {
+            // The spy of a test below that fails the calendar's reads would otherwise outlive it, emptying every later schedule.
+            vi.restoreAllMocks();
+        });
 
         it("Expands recurring events, honors moved occurrences, and leaves out cancelled events, declined ones and free time.", async () => {
             const { mailbox, inbox, calendar, me } = await setup();

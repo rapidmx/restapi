@@ -519,7 +519,10 @@ function formatDisplayName(name: string): string {
  * - `RELAY_STRIPPED_HEADERS` are always removed.
  * - The original `From` is kept only when it's authenticated (`verifiedFromAddress()`). Otherwise - DMARC-style - it
  * becomes `options.rewriteFrom`, any `Sender` is dropped, the original value is kept in `X-Original-From`, and with
- * `options.replyToOriginalFrom` a `Reply-To` pointing at it is added when there's none.
+ * `options.replyToOriginalFrom` a `Reply-To` pointing at it is added when there's none. Any `Autocrypt` header is
+ * dropped too: it announces a key for the `From` address, which is now the list's or the mailbox's, so kept it would let
+ * anyone plant a key for that address under this server's signature (which oversigns `Autocrypt`). An authenticated
+ * sender's own `Autocrypt` is kept, its `addr` having to match the `From` it is still sent under.
  * - A message whose `From` isn't authenticated and that carries calendar content (`containsCalendarContent()`) isn't
  * relayed at all (`undefined`): an iTIP request, reply or cancel must never go out under an identity (the list's or
  * the mailbox's) that didn't write it.
@@ -550,7 +553,7 @@ export function prepareRelayCopy(raw: Buffer, options: RelayCopyOptions): Buffer
         if (RELAY_STRIPPED_HEADERS.includes(name)) {
             return false;
         }
-        return fromVerified || (name !== "from" && name !== "sender" && name !== "x-original-from");
+        return fromVerified || (name !== "from" && name !== "sender" && name !== "x-original-from" && name !== "autocrypt");
     });
     const added: string[] = [];
     if (!fromVerified) {

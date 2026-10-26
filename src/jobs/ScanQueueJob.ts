@@ -1727,7 +1727,7 @@ export abstract class ScanQueueJob<
      * - **No laundering** - the copy is built by `prepareRelayCopy()`, the same policy distribution-list relays use: the
      * MTA DKIM-signs the forward as this server's domain, so trust-bearing headers (`Authentication-Results`,
      * `RapidMX-Key`, `X-RapidMX-Recall-Of`, `Disposition-Notification-To`) are stripped, an unauthenticated `From` is
-     * rewritten to this mailbox (the original kept in `X-Original-From` and `Reply-To`), and unauthenticated calendar
+     * rewritten to this mailbox (the original kept in `X-Original-From` and `Reply-To`, its `Autocrypt` dropped), and unauthenticated calendar
      * content isn't forwarded at all. Without this, a forged `From: ceo@<our domain>` forwarded back into this server
      * would arrive with `dkim=pass` for our own domain and pass every recall/key/iTIP trust check.
      *

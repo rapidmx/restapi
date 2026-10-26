@@ -70,7 +70,7 @@ const { Get, Post, Query, Request, Response } = RouteDecorators;
  *
  * A list with `restrictSenders` only accepts a message whose `From` is DKIM-verified (`verifiedFromAddress()`) and names
  * a member. The copy relayed to external members goes through `prepareRelayCopy()` (see `deliver()`), so the MTA's
- * signature on it can't launder a spoofed `From`, recall/key headers or an iTIP request.
+ * signature on it can't launder a spoofed `From`, recall/key headers (an unauthenticated sender's `Autocrypt` among them) or an iTIP request.
  *
  * !!Note!! that, like `BasePushRoute`/`BaseStatusRoute`, this class is not automatically registered with a
  * server — the consuming application must apply `@Route("/internal/mta")` to its own subclass. The
@@ -901,7 +901,7 @@ export abstract class BaseMailIngestRoute<M extends Mailbox, Q extends IngestQue
             }
 
             // External members get a copy the MTA signs as this server's domain, so it must not launder a spoofed message
-            // (`prepareRelayCopy()`): trust-bearing headers stripped, an unauthenticated `From` rewritten to the list, and
+            // (`prepareRelayCopy()`): trust-bearing headers stripped, an unauthenticated `From` rewritten to the list (its `Autocrypt` dropped), and
             // unauthenticated calendar content not relayed at all. Internal members keep `listRaw` - their copies are
             // judged by `ScanQueueJob` against the `Authentication-Results` this server's MTA stamped on arrival.
             const externalRaw: Buffer | undefined =

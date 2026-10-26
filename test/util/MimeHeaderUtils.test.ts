@@ -390,6 +390,38 @@ describe("MimeHeaderUtils Tests", () => {
             expect(copy).not.toMatch(/rapidmx-key/i);
         });
 
+        it("Drops an unauthenticated sender's Autocrypt (folded or not), which would announce a key for the list's own address.", () => {
+            const raw = Buffer.from(
+                [
+                    "From: m@evil.example",
+                    "Autocrypt: addr=list@ours.example; keydata=QUFBQQ==",
+                    "autocrypt :\r\n addr=list@ours.example; prefer-encrypt=mutual;\r\n\tkeydata=QkJCQg==",
+                    "Subject: x",
+                    "",
+                    "Body",
+                ].join("\r\n"),
+            );
+            const copy = prepareRelayCopy(raw, { trustedAuthservId: TRUSTED, rewriteFrom })!.toString();
+            const headers = copy.slice(0, copy.indexOf("\r\n\r\n"));
+            expect(headers).not.toMatch(/autocrypt/i);
+            expect(headers).not.toContain("keydata");
+            expect(headers).toContain("Subject: x");
+        });
+
+        it("Keeps an authenticated sender's own Autocrypt, sent on under its own From.", () => {
+            const raw = Buffer.from(
+                [
+                    "Authentication-Results: mx.example.com; dkim=pass header.d=partner.example",
+                    "From: bob@partner.example",
+                    "Autocrypt: addr=bob@partner.example; keydata=QUFBQQ==",
+                    "",
+                    "Body",
+                ].join("\r\n"),
+            );
+            const copy = prepareRelayCopy(raw, { trustedAuthservId: TRUSTED, rewriteFrom })!.toString();
+            expect(copy).toContain("Autocrypt: addr=bob@partner.example; keydata=QUFBQQ==");
+        });
+
         it("Omits an address-like list or mailbox name from the rewritten From.", () => {
             const copy = prepareRelayCopy(Buffer.from("From: m@evil.example\r\n\r\nBody"), {
                 trustedAuthservId: TRUSTED,

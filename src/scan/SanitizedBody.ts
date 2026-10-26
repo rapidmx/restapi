@@ -20,7 +20,9 @@ const { Config, Inject, Logger } = ObjectDecorators;
  *
  * *Race-safe and idempotent.* Sanitizing is a pure function of the raw MIME, so concurrent readers (in this process: one shared
  * run per blob; in another: the same result) write the same bytes, and a blob store replaces atomically - a reader sees the old blob
- * or the new one, never a mix. The blob is only rewritten while it still exists, so a message erased meanwhile is not brought back.
+ * or the new one, never a mix. The blob is only rewritten while it still exists, so a message erased meanwhile is not brought back, and
+ * once rewritten it is deleted again unless the message still names it (`SanitizedBodySource.stillNamed`): zero-access sealing, a send's
+ * discard and an erasure all change the row before they delete the blob, so whichever of the two deletes comes last removes it.
  *
  * *Bounded.* A raw message over `maxRawBytes` is not re-parsed, and a run that takes over `timeoutMs` is left to finish in the
  * background while the reader is answered with what is stored.
@@ -43,6 +45,8 @@ export interface SanitizedBodySource {
     uid: string;
     bodyBlobKey?: string;
     sanitizedHtmlBlobKey: string;
+    /** Whether the message, read again, is still readable and still names `sanitizedHtmlBlobKey`; asked after the blob is rewritten. */
+    stillNamed?: () => Promise<boolean>;
 }
 
 export class SanitizedBodyLoader {
@@ -121,6 +125,12 @@ export class SanitizedBodyLoader {
                 return this.giveUp(key);
             }
             await this.blobStore.put(key, Buffer.from(html, "utf-8"), { contentType: "text/html" });
+            if (message.stillNamed && !(await message.stillNamed().catch(() => false))) {
+                // Sealed, sent or erased while this ran, after the check above: the row dropped the key, so what was just written is
+                // plaintext nothing names, which nothing else would ever delete.
+                await this.blobStore.delete(key).catch(() => undefined);
+                return this.giveUp(key);
+            }
             return html;
         } catch (err) {
             this.logger?.warn(`Could not re-sanitize message ${message.uid}, serving its stored HTML: ${(err as Error).message}`);
