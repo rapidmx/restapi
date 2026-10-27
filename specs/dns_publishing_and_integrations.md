@@ -1,13 +1,13 @@
 # RapidMX: DNS Publishing and Admin-Console Integrations
 
-This document is the technical design for linked features across `@rapidmx/restapi`, `@rapidmx/server`, `@rapidmx/web-client`, `postfix-bridge` and `@rapidmx/meet-plugin`:
+This document is the technical design for linked features across `@rapidmx/restapi`, `@rapidmx/server`, `@rapidmx/web-client`, `postfix-bridge`, `@rapidmx/meet-plugin` and a new project, `rapidmx/dns-controller` (§7):
 
 1. **DNS publishing.** RapidMX publishes every DNS record a deployment and its domains need, through [external-dns](https://github.com/kubernetes-sigs/external-dns), using per-domain DNS provider configurations an administrator manages in the admin console.
 2. **DKIM rotation.** Each domain's DKIM key rotates on a schedule (and on demand), with the new selector published and observed live before signing switches to it.
 3. **Integrations.** Third-party services an administrator chooses (DNS providers, Giphy, STUN, the S/MIME signing CA, the DNS resolver, the plugin registry) move from deployment-only configuration to typed, audited, live-applied settings in the admin console, with their secrets held outside the database.
 4. **Domain seeding.** The domains a deployment is installed for exist in the server from its first start, instead of being added again by hand in the admin console.
 
-The decisions this document implements were made with JP on 2026-10-27 and are not re-litigated here (see *Resolved Decisions*). It supersedes the beta.46 stopgap that made the `openpgpkey.<domain>` host opt-in.
+The decisions this document implements were made with JP on 2026-10-27 and are not re-litigated here (see *Resolved Decisions*). It supersedes the beta.46 stopgap that made the `openpgpkey.<domain>` host opt-in. One design point is still a proposal awaiting JP and is marked **PROPOSED** where it appears: the opt-in takeover of a domain's apex TXT set for SPF (§9.4).
 
 ## 1. Why
 
@@ -25,7 +25,7 @@ Grounding for the design below. Paths are relative to each repo.
 
 | `DnsRecordType` | Kind | Name | Recommended value | Configured when |
 | --- | --- | --- | --- | --- |
-| `ownership` | TXT | `<domain>` | `rapidmx-domain-verification=<verificationToken>` | always |
+| `ownership` | TXT | `<domain>` (today; moves to `_rapidmx-verify.<domain>`, §6.5) | `rapidmx-domain-verification=<verificationToken>` | always |
 | `mx` | MX | `<domain>` | `10 <mail:dns:mx_hostname>` | `mail:dns:mx_hostname` set |
 | `spf` | TXT | `<domain>` | `v=spf1 mx ~all` | always |
 | `dkim` | TXT | `<dkimSelector>._domainkey.<domain>` | `v=DKIM1; k=rsa; p=<dkimPublicKey>` | selector and key set |
@@ -43,7 +43,7 @@ Grounding for the design below. Paths are relative to each repo.
 - `uid` is the normalized `name`. A rename is refused (delete and re-create).
 - `verified`, `verificationToken`, `verifiedAt` and `lastCheckedAt` are server-managed (`SERVER_MANAGED_DOMAIN_FIELDS`). `verified` is never flipped back once true.
 - `create()` mints a `verificationToken` and calls `ensureDkimFields()`, which asks the injected `DkimKeyProvider` for a key pair unless the caller sent both `dkimSelector` and `dkimPublicKey`.
-- `POST /:id/verify` and `DomainVerificationJob` (`mail:jobs:domain_verification:schedule`, every 5 minutes) flip `verified` when the TXT record is found.
+- `POST /:id/verify` and `DomainVerificationJob` (`mail:jobs:domain_verification:schedule`, every 5 minutes) flip `verified` when the TXT record is found (`checkDomainVerification()` in `src/util/DomainVerificationUtils.ts`: any apex TXT record equal to `rapidmx-domain-verification=<token>`).
 - `GET /:id/dns-setup` backfills a missing DKIM key pair, then returns `checkDnsSetup()`.
 - Every create, update, delete and verification writes an `AuditLogEntry` (`DOMAIN_CREATE`/`UPDATE`/`DELETE`/`VERIFIED`).
 - A pure alias domain (`aliasOf`) has its own ownership proof and DKIM key, and its own DNS records.
@@ -97,7 +97,7 @@ Nothing reads `mail:domains` at runtime. It is on the protected-namespace lists,
 - **DNS provider config** (`DnsProvider`): a named, admin-managed configuration of one DNS hosting account: its type (`cloudflare`, `route53`, ...), non-secret options, the zones it may touch, and a reference to its credentials in the secret store.
 - **Assignment**: each `Domain` has `dnsProviderUid`, naming a provider config, or nothing ("manual": the admin publishes records by hand, exactly as today).
 - **Desired state**: what the server says must be published: provider configs, their assignments and the desired records for each domain and for the deployment's own hosts. The server computes and stores it; it never writes to Kubernetes.
-- **DNS controller**: a separate, single-replica pod with its own ServiceAccount and namespace Role. It reads the desired state from the server and is the only RapidMX component that creates or changes Kubernetes objects (§7).
+- **DNS controller**: a separate, single-replica pod with its own ServiceAccount and namespace Role, built from its own project and image (`rapidmx/dns-controller`). It reads the desired state from the server through a versioned internal API and is the only RapidMX component that creates or changes Kubernetes objects (§7).
 - **Publication**: the controller writes the desired records as `DNSEndpoint` custom resources. One external-dns instance per provider config reads only the ones labelled for it and applies them at the provider.
 - **Secret store**: where credentials live. OpenBao KV when the deployment has OpenBao, else Kubernetes Secrets in the release namespace. Never the database.
 
@@ -164,7 +164,8 @@ Facts checked against external-dns v0.23.0's source and docs (2026-10-26):
 - **DigitalOcean is not offered**: its in-tree provider was removed in v0.21.0 and is only reachable through a third-party webhook provider. DigitalOcean and webhook providers come later.
 - **Record kinds per provider.** MX is supported by cloudflare, aws, google and azure. **rfc2136 cannot manage MX or SRV**: it writes them but its AXFR reader skips them, so they can never be updated or deleted. For an rfc2136 config the controller publishes A/AAAA/CNAME/TXT only, and the MX and SRV records show as **manual** (with the reason) for the admin to keep by hand.
 - MX targets are `"<preference> <host>"`; SRV targets must end with `.`; A/AAAA targets must not end with `.`.
-- TXT values are passed to the provider raw. Whether Route 53 needs them quoted is unverified, and is covered by its unit tests against recorded API fixtures plus a warning on the type until it is live-tested.
+- **TXT targets are written quoted** in a `DNSEndpoint` (`"\"v=spf1 mx ~all\""`, i.e. the target string itself begins and ends with `"`), the same form the TXT registry writes its own ownership records in. Proven on Cloudflare by the takeover spike (2026-10-27, §9.3); Route 53 is expected to need the same and is covered by unit tests against recorded API fixtures plus the "not yet live-tested" badge until it is live-tested. One helper (`quoteTxtTarget()`, in the controller) does it, and the golden manifests test it.
+- **Cloudflare tokens with a client-IP restriction** must list every address the cluster egresses from, IPv4 **and** IPv6: the spike's token was restricted to the node's IPv4 address and its calls failed whenever the pod went out over IPv6. The console's Cloudflare form and the installer's documentation say so.
 
 ### 4.3 `Domain` additions
 
@@ -175,6 +176,7 @@ Facts checked against external-dns v0.23.0's source and docs (2026-10-26):
 | `dnsPublication?: DnsPublicationStatus` | Written from the controller's status reports and the live check, see 4.4. Server-managed. |
 | `dkimRotation?: DkimRotationState` | Rotation state, see 6.2. Server-managed. |
 | `dkimManaged?: boolean` | `true` when the current key came from the `DkimKeyProvider` (rotation possible), `false` when an admin imported `dkimSelector`/`dkimPublicKey` by hand (never rotated automatically). Server-managed. |
+| `apexTxt?: { managed: boolean; keep: string[] }` | **PROPOSED (§9.4).** Whether RapidMX owns the domain's apex TXT set to publish SPF, and the foreign values it keeps in that set. Set only through `PUT /:id/apex-txt` (trusted role and elevation, audited). Unset means not managed. |
 
 All of them join `SERVER_MANAGED_DOMAIN_FIELDS` (refused by plain `PUT` and `PUT /:id/:property`).
 
@@ -186,8 +188,6 @@ export interface DnsPublicationStatus {
     endpoints: { name: string; generation: number; observedGeneration?: number }[];
     /** Per record (same identity as DnsRecordCheck: type + recordName). */
     records: DnsRecordPublication[];
-    /** Foreign values kept in the apex TXT set after a takeover (9.3). */
-    preservedTxt?: string[];
     lastReconciledAt?: Date;
     lastError?: string;
 }
@@ -200,7 +200,7 @@ export interface DnsRecordPublication {
      * "conflict": a record at this name exists that this deployment does not own (9); "manual": the admin publishes it,
      * with `manualReason`. */
     state: "published" | "pending" | "conflict" | "manual";
-    manualReason?: "no_provider" | "kind_unsupported" | "outside_zones";
+    manualReason?: "no_provider" | "kind_unsupported" | "outside_zones" | "apex_txt_unmanaged";
 }
 ```
 
@@ -301,7 +301,8 @@ For each enabled `Domain` with `dnsProviderUid`, exactly the records `checkDnsSe
 
 | Record | Name | Type | Value |
 | --- | --- | --- | --- |
-| Ownership + SPF | `<domain>` | TXT | one endpoint with both targets: `rapidmx-domain-verification=<token>` and `v=spf1 mx ~all`, plus any preserved foreign values (9.3) |
+| Ownership | `_rapidmx-verify.<domain>` | TXT | `rapidmx-domain-verification=<token>` (§6.5) |
+| SPF | `<domain>` | TXT | **only when `apexTxt.managed`** (PROPOSED, §9.4): one endpoint holding `v=spf1 mx ~all` plus every value on `apexTxt.keep`; otherwise SPF is shown as manual (`apex_txt_unmanaged`) |
 | MX | `<domain>` | MX | `10 <mx host>` |
 | DKIM (active) | `<dkimSelector>._domainkey.<domain>` | TXT | `v=DKIM1; k=rsa; p=<key>` |
 | DKIM (next / previous) | `<selector>._domainkey.<domain>` | TXT | during a rotation only (6.2) |
@@ -313,7 +314,7 @@ For each enabled `Domain` with `dnsProviderUid`, exactly the records `checkDnsSe
 Rules:
 
 - A record whose `configured` would be false is not published (no DKIM before a key exists).
-- TXT at the same name is one endpoint: external-dns manages a name and type as one record set, so ownership and SPF MUST be published together, never as two endpoints.
+- TXT at the same name is one endpoint: external-dns manages a name and type as one record set, and once it owns a set it owns **all** of it (§9.3). That is why ownership verification has its own name (§6.5) and the apex TXT set is never touched without the admin's opt-in.
 - The ownership TXT keeps being published after verification (it costs nothing and lets a re-verification work); it is removed with the domain.
 - A disabled domain (`enabled: false`) keeps its records; deleting a domain removes them.
 - An alias domain publishes its own full set, like any other.
@@ -399,19 +400,49 @@ The host list is not hard-coded in the server: the chart renders it into `mail:d
 
 The A/AAAA targets come from `mail:dns:publish:addresses` (JSON list of IPv4/IPv6 literals), which the chart takes from `dns.publicAddresses`. The installer detects them: the node's global unicast addresses (`ip -j addr`), and, when the node has only private addresses (NAT, cloud), the address seen from outside, the way coturn's `detect-external-ip` does. It prints what it found, and `--public-address <ip>` (repeatable) overrides detection. The server validates the list (global unicast only; private, loopback, link-local and CGNAT ranges refused) and publishes nothing for the hosts while it is empty, saying so in the console.
 
+### 6.5 Ownership verification name (DECIDED)
+
+**Decided by JP (2026-10-27):** the ownership TXT moves from the apex to a dedicated name, `_rapidmx-verify.<domain>`, so RapidMX never takes over a domain's apex TXT set to verify it. The takeover spike (§9.3) showed that owning a set means owning every value in it, so publishing the token at the apex would have put every site-verification and SPF value of every domain under RapidMX's control.
+
+- **Value unchanged:** `rapidmx-domain-verification=<verificationToken>` (`buildVerificationTxtValue()`), only the name changes. A new helper `buildVerificationRecordName(domain)` returns `_rapidmx-verify.<domain>`; `DOMAIN_VERIFICATION_RECORD_LABEL = "_rapidmx-verify"`.
+- **Recommended and published: only the new name.** `checkDnsSetup()`'s `ownership` row and `buildDesiredDnsRecords()` both use `_rapidmx-verify.<domain>`. The label starts with `_`, so it can never collide with a host name and needs no CNAME exception.
+- **Migration: both locations are accepted during a transition.** `checkDomainVerification()` resolves `_rapidmx-verify.<domain>` first and, while `mail:domains:verification:accept_legacy_apex` is true (default true), also the apex, and verifies on an exact token match at either. The result says where it was found (`location: "record" | "legacy_apex"`), and `DOMAIN_VERIFIED`'s audit details carry it.
+- **Console:** an unverified domain whose token is found only at the apex is verified as today, and its `ownership` row says "Found at the domain's root (the old location). Publish it at `_rapidmx-verify.<domain>`; the root value can then be removed." A verified domain stays verified (`verified` never flips back), so existing domains need no action; the hint about removing the old apex value is shown while it is still present.
+- **Ending the transition:** the default of `accept_legacy_apex` flips to false in a later minor release, announced in the release notes one release ahead. Only unverified domains are affected by the flip.
+- **Takeover interaction:** when an admin opts a domain into apex TXT management (§9.4), any `rapidmx-domain-verification=` value at the apex is **not** carried into `apexTxt.keep`; it is dropped, since verification no longer reads it there once the domain is verified.
+- Tests (restapi): verification at the new name, at the legacy apex with the flag on, refused at the legacy apex with it off, chunked TXT at both, NXDOMAIN at one location and a match at the other, the `location` reported, and the checklist recommending only the new name.
+
 ## 7. The DNS Controller
 
 ### 7.1 Why a separate pod
 
 Creating Deployments, Secrets and Jobs is a namespace-admin-like right: whoever holds it can run arbitrary pods in the namespace. The mail server is the large, internet-facing process. It therefore keeps **only its existing read-only Kubernetes access** (the Diagnostics Role) and records desired state; a small controller holds the write rights and nothing else (no database, no Redis, no plugins, no mail).
 
-### 7.2 Where it lives
+### 7.2 A dedicated project: `rapidmx/dns-controller`
 
-- **Same image as the server, separate command** (`node dist/dns-controller/main.js`), source in `server/src/dns-controller/`. Server and controller always run the same version (lock-step), share the `KubeClient`, manifest builders and types, and there is no second image to build, scan and pin. The controller's entrypoint loads none of the server's routes, datastores or plugins.
-- Chart template `helm/templates/1_deployments/dns-controller.yaml`, rendered when `dns.publishing.enabled`: a Deployment with `replicas: 1` (not configurable), `strategy: Recreate`, its own ServiceAccount `<fullname>-dns-controller`, a hardened pod (non-root, read-only root filesystem, no capabilities, `RuntimeDefault` seccomp, small requests/limits), and a ClusterIP Service on port 8080 for the server's calls (7.3), with a NetworkPolicy admitting only the server pods.
-- **Single writer.** One replica with `Recreate`, plus a `coordination.k8s.io` `Lease` (`<fullname>-dns-controller`, renewed every 10 s, 30 s duration) that the controller must hold before writing, so a stuck old pod and a new one can never write together.
+**Decided by JP (2026-10-27):** the controller is its own project, repository `rapidmx/dns-controller` (`D:/github/rapidmx/dns-controller`), published as the container image `ghcr.io/rapidmx/dns-controller:<version>`. It is **not** the server image with another command: an image that holds the whole mail server (its routes, datastore drivers, plugin host and every dependency of them) in the one pod that can create Deployments, Secrets and Jobs would defeat the point of a separate controller. It follows how `postfix-bridge`, `ses-bridge` and `acme` are separate repositories.
 
-### 7.3 How it gets desired state: an internal API on the server
+**Runtime.**
+
+- TypeScript on Node.js 24, like `postfix-bridge` (the closest sibling: a small, standalone Node service with one job). Built with `tsc`, linted and tested with the siblings' eslint and vitest setup, 100 % coverage thresholds.
+- **No runtime dependencies.** Kubernetes REST through `node:https` with the pod's ServiceAccount token (re-read on every request; bound tokens rotate) and the cluster CA from the ServiceAccount mount, as the server's `KubeClient` does. Not `@kubernetes/client-node` (a large dependency tree in the most privileged pod, for a handful of verbs on six resource types). Not the global `fetch` for Kubernetes either: `fetch` cannot take a per-request CA without the `undici` package's dispatcher, and `NODE_EXTRA_CA_CERTS` would make the cluster CA trusted for every outbound call the process makes; `node:https` keeps the cluster CA scoped to the API server. The server's internal API is called with the global `fetch`. JWT verification (7.3) uses `node:crypto` (JWK import, RS256/ES256), logging is a small JSON-lines logger, and the health and internal endpoints are `node:http`.
+- **Image:** multi-stage; built on `node:24-trixie-slim`, shipped on `gcr.io/distroless/nodejs24-debian13:nonroot` (Node only: no shell, no package manager, uid 65532), containing only `dist/` and `package.json`. The pod runs non-root with a read-only root filesystem, all capabilities dropped, `RuntimeDefault` seccomp and `allowPrivilegeEscalation: false`; it writes nothing to disk.
+- **Phases of the controller project** (each a reviewed, tested commit series in that repository):
+  - **C1 skeleton** (scaffolded 2026-10-27, not yet released): configuration from the environment, JSON logging, `/healthz` and `/readyz`, the Kubernetes REST client, the Lease-based single writer, the versioned API types and the startup handshake (7.3). No reconcile logic.
+  - **C2 auth and secrets:** projected-token verification of the server's calls against the in-cluster JWKS, the controller's own projected token on its calls, `PUT`/`DELETE /v1/secrets/:path` (Kubernetes-Secret backend, 5.2).
+  - **C3 reconcile:** the desired-state long poll, manifests (external-dns Deployments, `DNSEndpoint`s, `ExternalSecret`s) with server-side apply, image-pin enforcement, status reports.
+  - **C4 operations:** the takeover, test and restore Jobs (§9).
+  - **C5 health:** external-dns metrics scraping and per-provider health in the status report.
+
+**Packaging: a plain image the server chart templates, not a subchart** (recommended). `postfix-bridge` is a subchart because it is a product of its own: it runs its own Postfix, is documented to run without the server chart, and its values make sense alone. The controller has no standalone use. Everything it is configured with derives from the server release: the desired-state URL, the server's ServiceAccount subject it accepts calls from, the token audiences, the Lease and resource names (`<fullname>-...`), the external-dns ServiceAccount and Role, the OpenBao role, the NetworkPolicy selecting the server pods. A subchart would need all of that passed down through `global` values, and the controller's Role, the most security-sensitive object in the release, would live in another repository, outside the server chart's `helm template` tests (server Role has no write verbs; controller Role is namespaced and minimal). So the controller repository publishes **only the image** (its publish job mirrors `postfix-bridge`'s `publish-docker-image`, without the chart job), and the server chart owns its templates: `helm/templates/1_deployments/dns-controller.yaml` (Deployment, Service), `0_config/dns-controller-rbac.yaml` (ServiceAccount, Role, RoleBinding, and the external-dns ServiceAccount/Role of 7.4), `2_services/dns-controller-networkpolicy.yaml`. The Lease is not templated: the controller creates it.
+
+**Version pin, lock-step.** The server chart pins the controller image to an exact released version, `dns.controller.image.tag` (and optionally `digest`), the way it pins `postfix-bridge` through its `Chart.yaml` dependency version. Releasing a server version that needs a controller change means releasing the controller first and moving the pin in a reviewed commit, edited by YAML key path, never by matching version text. The API handshake (7.3) catches an override that pairs incompatible versions.
+
+**Deployment shape** (rendered when `dns.publishing.enabled`): `replicas: 1` (not configurable), `strategy: Recreate`, its own ServiceAccount `<fullname>-dns-controller` with a projected token volume for the audience `rapidmx-internal-dns` (in addition to the default token used for the Kubernetes API), small requests/limits, a ClusterIP Service exposing port 8080 (internal API) to the server, health on port 8081, and a NetworkPolicy admitting only the server pods on 8080.
+
+**Single writer.** One replica with `Recreate`, plus a `coordination.k8s.io/v1` `Lease` (`<fullname>-dns-controller`, renewed every 10 s, 30 s duration) that the controller must hold before writing, so a stuck old pod and a new one can never write together. Expiry is judged the way client-go's leader election does: by the local time at which this process last saw the Lease record change, not by comparing `renewTime` with its own clock, so clock skew between nodes cannot make two holders. A controller that fails to renew before the duration elapses stops writing at once.
+
+### 7.3 How it gets desired state: a versioned internal API on the server
 
 The controller reads desired state **through the server's internal API**, not from the database:
 
@@ -419,16 +450,36 @@ The controller reads desired state **through the server's internal API**, not fr
 - **One source of record-building logic.** `buildDesiredDnsRecords()`, assignment rules and the rotation state stay in restapi and the server; the controller only turns desired state into manifests.
 - Both backends (Mongo, SQL) work without the controller knowing either.
 
+**Versioning.** The controller and the server ship from different repositories, so their contract is explicitly versioned:
+
+- Every route is under a version path, `/internal/dns/v1/...`, and **every payload, request and response, carries `apiVersion: "dns.rapidmx.io/v1"` and a `kind`**. A receiver refuses a payload whose `apiVersion` it does not speak (`400 { "reason": "unsupported_api_version", "supported": [...] }`) and never guesses.
+- Within `v1`, changes are additive only: new optional fields, new `kind`s, new routes. Receivers ignore unknown fields. A breaking change is `v2`, under `/internal/dns/v2`, and the server serves the previous version as well for at least one release, so either side can be upgraded first.
+- The types live in the controller repository (`src/api/v1.ts`) and are mirrored in restapi (`src/dns/DnsDesiredStateApiV1.ts`); a contract test in each repository checks the same recorded JSON fixtures.
+
+**Startup handshake.** Before it does anything else, and again every 60 s while it is incompatible, the controller calls the one route whose shape never changes:
+
+| Route | Body | Answer |
+| --- | --- | --- |
+| `POST /internal/dns/handshake` (unversioned on purpose) | `{ kind: "Handshake", controllerVersion, apiVersions: ["dns.rapidmx.io/v1"] }` | `{ kind: "HandshakeResult", serverVersion, apiVersions: [...], selected?: "dns.rapidmx.io/v1", compatible: boolean, reason? }` |
+
+- The server picks the highest version both list. With none in common it answers `compatible: false` with the reason, and **records the controller's report** (versions, the reason, the time) so the console's DNS providers page and Diagnostics show, for example, "DNS controller 0.4.0 speaks dns.rapidmx.io/v2; this server speaks v1. Install matching versions."
+- An incompatible controller **refuses to act**: it does not take the Lease, writes nothing to Kubernetes, serves no secret writes, logs `dns_api_incompatible` at error level, reports not ready on `/readyz` (visible in `kubectl get pods` and in Diagnostics), and retries the handshake every 60 s, since a rolling upgrade of the other side may fix it. A server that cannot be reached is not a mismatch: the controller keeps retrying with backoff and stays ready.
+- The controller sends its `apiVersion` on every later call, and the server re-checks it, so a server rolled back underneath a running controller is caught on the next call, which sends the controller back to the handshake.
+
 Routes (restapi `BaseDnsDesiredStateRoute`, mounted by the server under `/internal/dns`, outside the public Gateway like `/internal/mta`):
 
 | Route | Purpose |
 | --- | --- |
-| `GET /internal/dns/desired-state?since=<version>` | The full desired state: provider configs (with `SecretRef`s, never values), endpoints per domain and for the hosts, the owner id, the image pin, and queued operations (test, takeover). With `since`, a long poll that answers when the version moves past it, or after 55 s. |
-| `PUT /internal/dns/status` | The controller's report: per provider (Deployment readiness, metrics, last error) and per endpoint (applied generation, `observedGeneration`), per operation (result). |
+| `POST /internal/dns/handshake` | Above. |
+| `GET /internal/dns/v1/desired-state?since=<version>` | `kind: "DesiredState"`: provider configs (with `SecretRef`s, never values), endpoints per domain and for the hosts, the owner id, the image pin, and queued operations (test, takeover, restore). With `since`, a long poll that answers when the version moves past it, or after 55 s. |
+| `PUT /internal/dns/v1/status` | `kind: "StatusReport"`: per provider (Deployment readiness, metrics, last error), per endpoint (applied generation, `observedGeneration`), per operation (result), and the controller's Lease state. |
 
-In the other direction, the controller serves `PUT /secrets/:path` and `DELETE /secrets/:path` on its Service, used only for the Kubernetes-Secret backend (5.2).
+In the other direction, the controller serves `PUT /v1/secrets/:path` and `DELETE /v1/secrets/:path` on its Service, with the same `apiVersion` rules, used only for the Kubernetes-Secret backend (5.2).
 
-**Authentication: projected ServiceAccount tokens, no shared secrets.** Each side presents a projected ServiceAccount token with a dedicated audience (controller to server: `rapidmx-internal-dns`; server to controller: `rapidmx-dns-controller`; 1 hour, rotated by the kubelet). The receiver verifies the signature against the cluster's service-account issuer keys (`GET /openid/v1/jwks` on the API server, readable by every ServiceAccount through Kubernetes's default `system:service-account-issuer-discovery` binding), the audience, the expiry, and the exact subject (`system:serviceaccount:<namespace>:<fullname>-dns-controller`, or the server's). Keys are cached and refetched on an unknown `kid`. No TokenReview (it would need a ClusterRole) and no long-lived secret.
+**Authentication: projected ServiceAccount tokens, no shared secrets.** Each side presents a projected ServiceAccount token with a dedicated audience (controller to server: `rapidmx-internal-dns`; server to controller: `rapidmx-dns-controller`; 1 hour, rotated by the kubelet, re-read from the file on every call). The receiver verifies the signature against the cluster's service-account issuer keys, the issuer, the audience, the expiry, and the exact subject (`system:serviceaccount:<namespace>:<fullname>-dns-controller`, or the server's). Keys are cached and refetched on an unknown `kid` (at most once a minute). No TokenReview (it would need a ClusterRole) and no long-lived secret.
+
+- **The keys are fetched in-cluster:** `GET https://kubernetes.default.svc/openid/v1/jwks` (and the issuer from `/.well-known/openid-configuration` on the same host), authenticated with the pod's own ServiceAccount token and verified with the cluster CA. The `jwks_uri` the discovery document advertises is **not** used: on k3s it is the node's public address on port 6443, which a pod may not be able to reach and which the in-cluster certificate name does not cover.
+- **Checked on powerlevel.gg's k3s v1.36.4 (2026-10-27):** the default `system:service-account-issuer-discovery` ClusterRoleBinding exists and grants every ServiceAccount (`system:serviceaccounts`) read access to `/openid/v1/jwks` and the discovery document, so neither side needs extra RBAC. On other distributions the installer checks for the binding and reports it missing instead of failing later.
 
 Reconcile triggers on the server side only bump the desired-state version, which ends the controller's long poll:
 
@@ -483,11 +534,11 @@ restapi raises these through an injected `DnsPublisher` (DI token, `NullDnsPubli
 - One `DNSEndpoint` per domain (`<fullname>-domain-<domain uid with dots as hyphens, hashed suffix when too long>`) holding all of its records, and one for the hosts (`<fullname>-hosts-<provider uid>`).
 - Labels: `rapidmx.io/dns-provider: <provider uid>` (what `--label-filter` selects), `rapidmx.io/domain: <domain uid>`, `app.kubernetes.io/managed-by: rapidmx-dns-controller`, `app.kubernetes.io/instance: <release>`.
 - Reassigning a domain to another provider rewrites the label: the old instance deletes the records it owns (sync policy), the new one creates them. The console warns that this briefly removes them.
-- `spec.endpoints[]`: `dnsName`, `recordType`, `targets`, `recordTTL` (`mail:dns:publish:ttl`, default 300; Cloudflare needs at least 120), and `providerSpecific` only where needed (Cloudflare `cloudflare/proxied: "false"` on A/AAAA/CNAME).
-- Writes use server-side apply (`fieldManager=rapidmx-dns-controller`), so every write is idempotent. `KubeClient` gains `PATCH` (apply), `PUT`, `POST` and `DELETE`, used only by the controller.
+- `spec.endpoints[]`: `dnsName`, `recordType`, `targets` (TXT targets quoted, 4.2), `recordTTL` (`mail:dns:publish:ttl`, default 300; Cloudflare needs at least 120), and `providerSpecific` only where needed (Cloudflare `cloudflare/proxied: "false"` on A/AAAA/CNAME). The registry's own ownership TXT records carry no TTL (9.3).
+- Writes use server-side apply (`fieldManager=rapidmx-dns-controller`), so every write is idempotent. The controller's own Kubernetes client (in its repository, 7.2) has `GET`, `POST`, `PUT`, apply `PATCH` and `DELETE`; the server's `KubeClient` stays GET-only.
 - `status.observedGeneration` is written by external-dns when it **reads** the resource, not when the provider has applied it. "Published" therefore means observed **and** seen by the server's live check. Observed but not live is "pending"; still not live after several intervals is shown with the instance's last error.
 
-Deletion: a deleted domain's endpoint is deleted; external-dns removes what it owns on its next sync. A provider config can be deleted only when no domain is assigned to it (409 otherwise); the controller then deletes its hosts endpoint, waits one interval, and deletes the Deployment and its credentials.
+Deletion: a deleted domain's endpoint is deleted; external-dns removes what it owns on its next sync, and a managed apex TXT set is restored afterwards (9.5). A provider config can be deleted only when no domain is assigned to it (409 otherwise); the controller then deletes its hosts endpoint, waits one interval, and deletes the Deployment and its credentials.
 
 ### 7.6 RBAC
 
@@ -528,6 +579,11 @@ dns:
     image: registry.k8s.io/external-dns/external-dns:v0.23.0@sha256:<digest>
     resources: {}
   controller:
+    image:                    # pinned to an exact rapidmx/dns-controller release (7.2), moved in lock-step
+      registry: ghcr.io
+      repository: rapidmx/dns-controller
+      tag: <x.y.z>
+      digest: ""              # optional sha256:...; used instead of the tag when set
     resyncMinutes: 10
     resources: {}
   ttl: 300
@@ -542,27 +598,56 @@ mail:
 external-dns's TXT registry only changes records it owns, and it has no adopt flag or annotation (`--migrate-from-txt-owner` only moves records between two of its own owner ids). Its planner (`plan.go`, v0.23.0):
 
 - Updates and deletes of records with another owner, or none, are silently filtered out.
-- **Creates are skipped for the whole name** when any existing record of a managed type at that name is not owned. An unowned SPF TXT at the apex therefore also blocks the MX at the apex. The skip is logged at debug level only; a metric counts it.
+- **Creates are skipped for the whole name** when any existing record of a managed type at that name is not owned. An unowned SPF TXT at the apex therefore also blocks the creation of the MX at the apex. The skip is logged at debug level only; a metric counts it.
 - A TXT value that is not an ownership record is never deleted.
 
 ### 9.2 Rule
 
 Takeover is **opt-in per provider config** (`allowTakeover`, default false; installer flag `--dns-takeover`) and only for names this deployment wants to publish. Without it, a conflicting record's state is `conflict`, and the console shows the existing value next to the wanted one with a "Take over" action for that domain (trusted role and elevation, audited `DNS_TAKEOVER`).
 
-### 9.3 Mechanism
+The apex TXT set is never taken over by `allowTakeover` alone: it needs the per-domain opt-in of 9.4.
+
+### 9.3 Mechanism (proven on Cloudflare, 2026-10-27)
 
 1. **Detection (server).** For each desired name, the server resolves the current records of every managed kind and the ownership TXT (`rmx-<type>.<name>`). A record present without this deployment's ownership value is a conflict.
-2. **Foreign values are preserved where a set is shared.** external-dns replaces a name and type as one set, so a value left out of the desired endpoint is deleted on takeover. At the apex TXT set, every value that is not SPF and not a `rapidmx-domain-verification=` value (site verifications, other tokens) is kept as a preserved target (`dnsPublication.preservedTxt`) until an admin removes it in the console. An existing SPF is replaced only when it lacks `mx`; otherwise it is kept verbatim. An existing MX set is replaced (its old targets go in the audit entry).
-3. **Apply (controller).** The controller runs a one-shot `Job` from the pinned image with the provider's credentials and arguments, `--registry=noop --policy=upsert-only --once`, a dedicated label filter, and a temporary `DNSEndpoint` holding the desired records **plus the ownership TXT records the TXT registry would have written**: name `rmx-<lowercase type>.<name>`, value `"heritage=external-dns,external-dns/owner=rapidmx-<installationId>,external-dns/resource=crd/<namespace>/<regular DNSEndpoint name>"`. With the noop registry, external-dns treats every record as its own and upserts them.
-4. The Job and the temporary endpoint are deleted. The regular instance now sees the records as owned.
+2. **Apply (controller).** The controller runs a one-shot `Job` from the pinned image with the provider's credentials and arguments, `--registry=noop --policy=upsert-only --once`, a dedicated label filter, and a temporary `DNSEndpoint` holding the desired records **plus the ownership TXT records the TXT registry would have written**. With the noop registry, external-dns treats every record as its own and upserts it.
+3. The Job and the temporary endpoint are deleted. The regular instance (`--registry=txt --policy=sync`) now sees the records as owned and manages them from then on.
+4. The same Job creates a record at a name where creation is blocked by an unowned record of **another** type (9.1: the MX at an apex whose TXT set RapidMX does not manage). It only creates the wanted record and its ownership TXT; the unowned set is not touched.
 
-**Proving it early.** This mechanism is inferred from v0.23.0's source, not documented, so it is the **first thing proven on powerlevel.gg** (Phase server-3, before the rest of the server work). If it does not work on Cloudflare, the fallback is a per-provider "delete the conflicting records" call in the controller (Cloudflare first), after which the regular instance creates them. The ownership-record format is re-checked against `registry/txt` and `registry/mapper` whenever the pin moves.
+**Spike results** (hand-run on powerlevel.gg against Cloudflare with external-dns v0.23.0, JP's scoped token, 2026-10-27):
 
-### 9.4 Uninstall
+- **The noop-registry takeover works.** The one-shot `--registry=noop --policy=upsert-only --once` Job overwrote the hand-made, unowned records, and afterwards a `--registry=txt --policy=sync` instance with the same owner id treated them as its own (updates and deletes applied). The fallback (a per-provider delete call) is not needed.
+- **Ownership record format**, which the Job must write exactly: name `rmx-<lowercase record type>.<record name>` (for example `rmx-mx.powerlevel.gg`, `rmx-cname.openpgpkey.powerlevel.gg`); value, including the surrounding double quotes, `"heritage=external-dns,external-dns/owner=rapidmx-<installationId>,external-dns/resource=crd/<namespace>/<regular DNSEndpoint name>"`. The `resource` must name the **regular** endpoint, not the temporary one, so the regular instance does not see a resource change.
+- **No TTL on ownership TXT records.** The registry writes them without `recordTTL` (the provider's default/automatic TTL); the Job's ownership endpoints carry none either, so the regular instance finds nothing to update. Only the wanted records carry `mail:dns:publish:ttl`.
+- **TXT targets must be quoted** (4.2): the wanted TXT records in both the temporary and the regular endpoint are written as `"\"...\""`; unquoted targets differ from what the provider returns and are rewritten on every sync.
+- **After a takeover the whole set is owned.** external-dns manages a name and type as one set: a value added at the provider by hand afterwards is **removed** on the next sync, and deleting the endpoint removes **every** value of the set, including foreign values that were deliberately carried over. This is what drives 6.5 (ownership verification off the apex), 9.4 (the apex TXT only on opt-in, edited only in the console) and 9.5 (restoring kept values).
+- To verify before the controller's C4 phase: whether an unowned apex TXT set also blocks **updates and deletes** of an owned MX at the apex (the spike took over both together). If it does, the MX at an unmanaged apex is maintained through the same one-shot Job on every change.
+
+The ownership-record format is re-checked against `registry/txt` and `registry/mapper`, and the spike re-run, whenever the external-dns pin moves.
+
+### 9.4 The apex TXT set and SPF (PROPOSED, pending JP)
+
+Because owning a set means owning every value in it (9.3), RapidMX does **not** publish anything into a domain's apex TXT set unless an admin opts that domain in:
+
+- **Default: not managed.** The SPF record is shown in the DNS checklist as manual (`manualReason: "apex_txt_unmanaged"`), exactly as today, with the recommended value. Ownership verification is unaffected (6.5). The MX at the apex is still published (9.3, step 4).
+- **Opt-in per domain** (`PUT mail/domains/:id/apex-txt` with `{ managed: true, keep: string[] }`; trusted role and elevation; audited `DNS_TAKEOVER` with the old values): the console first shows every value currently at the apex and pre-fills an **editable "values to keep" list** with all of them except SPF records and `rapidmx-domain-verification=` values. The admin removes what should go and adds what should be there. RapidMX then owns the set: it publishes `v=spf1 mx ~all` (or the existing SPF verbatim when it already includes `mx`; an SPF without `mx` is replaced, the old value in the audit entry) plus every value on `keep`, through the Job of 9.3 the first time and the regular instance afterwards.
+- **While managed, the console is the only place to edit the apex TXT values.** It says so prominently ("Values added at your DNS host are removed within a minute; add them here"), and `keep` is editable (same elevation and audit) at any time; each edit bumps the desired-state version.
+- **Opting out** (`managed: false`) or deleting the domain restores the kept values (9.5) before the set is released.
+- `Domain.apexTxt` replaces the earlier `dnsPublication.preservedTxt` design, which preserved foreign values silently; this makes them visible and editable instead.
+
+### 9.5 Uninstall and restoring kept values
+
+Deleting a `DNSEndpoint` makes external-dns delete every value of each set it owns (9.3), so a set RapidMX took over is restored, not just deleted. For each managed apex TXT set (opt-out, domain deletion, uninstall):
+
+1. The domain's endpoint (or the apex TXT entry in it) is removed and the controller waits until the regular instance has synced: the set and its ownership record `rmx-txt.<domain>` are gone.
+2. The controller runs the one-shot noop Job (`--registry=noop --policy=upsert-only --once`) with a temporary endpoint holding **only the kept values**, quoted, and **no ownership record**, so the restored set is unowned again, as it was before RapidMX. With an empty `keep` list nothing is restored.
+3. The status report confirms the restored set with a live lookup; a failure is shown in the console and logged, with the values to re-add by hand.
+
+The apex TXT set is absent for up to one sync interval plus the Job's run between steps 1 and 2; the console and the installer say so.
 
 `single_node_install.sh --uninstall` removes only RapidMX's values:
 
-1. For each name in a shared TXT set (the apex), the controller runs the same noop Job that re-publishes the set with only the preserved foreign values. A name with nothing left is deleted.
+1. Every managed apex TXT set is restored as above.
 2. Every `DNSEndpoint` of the release is deleted; the installer waits (bounded) until each external-dns instance has synced, checking the live DNS for the hosts' records.
 3. The release is removed.
 
@@ -581,7 +666,7 @@ All routes: `@RequiresTrustedRole()` plus `assertAdminScope()` (elevation) for e
 | `POST /` | Create. Body: `name`, `type`, `zones`, `options`, `credentials` (write-only), `allowTakeover`. Validates the type schema; zones must be valid host names; credentials written to the `SecretStore` before the row; 400 when no secret store. |
 | `PUT /:id` | Update; `credentials` keys omitted or given as the mask are unchanged, `null` clears. `type` cannot change. Narrowing `zones` is refused while an assigned domain falls outside them. |
 | `POST /:id/test` | Queues a test operation: the controller runs a short `--dry-run --once` Job and reports whether it authenticated and found the zones. |
-| `POST /:id/takeover` | Body: `domainUid`, optional record list; queues 9.3. |
+| `POST /:id/takeover` | Body: `domainUid`, optional record list; queues 9.3. Never includes the apex TXT set, which only `PUT mail/domains/:id/apex-txt` (9.4) manages. |
 | `DELETE /:id` | 409 while any domain is assigned; then 7.5 deletion. |
 
 ### 10.2 `system/integrations`
@@ -642,13 +727,13 @@ No setting requires a restart. Each consumer gets a test proving a change applie
 - Credentials: `--dns-credentials-file <path>` (a `KEY=value` file, read once) or the provider's own environment variables (`CF_API_TOKEN`, `AWS_ACCESS_KEY_ID` ...), never a command-line value. The installer writes them to OpenBao (`kv/<fullname>/integrations/dns/bootstrap`) or to the provider's Kubernetes Secret, and passes only the reference to the chart (`mail:dns:bootstrap_provider`, JSON: `{ name, type, zones, options, secretRef }`), which the server turns into the `DnsProvider` row once (`origin: "installer"`) at startup, idempotently.
 - `--dns-takeover`: sets `allowTakeover` on that config.
 - `--public-address <ip>` (repeatable): overrides address detection (6.4).
-- `--keep-dns` for `--uninstall` (9.4).
+- `--keep-dns` for `--uninstall` (9.5).
 
 ### 12.2 OpenBao
 
 `prepareOpenbao` additionally: enables the `kubernetes` auth method (pointing at the in-cluster API, using OpenBao's own ServiceAccount for token review, which the OpenBao chart already grants); creates the roles and policies of 5.2; issues the listener certificate and switches the listener to TLS (5.2), restarting and unsealing through the existing `openbao-unsealer`; copies the CA into the release namespace; migrates the ESO and PKI tokens and revokes them. On an upgrade of an existing installation it does the same idempotently.
 
-Renewal: cert-manager renews the leaf certificate (1 year, renewed 30 days before expiry). OpenBao re-reads its listener certificate on `SIGHUP`. The proposal is a small sidecar in the OpenBao pod (shared process namespace) that sends `SIGHUP` when the mounted certificate changes; the fallback is a restart with automatic unseal by the existing `openbao-unsealer` (*Open Questions*).
+Renewal (**decided by JP: a reload sidecar, no restarts**): cert-manager renews the leaf certificate (1 year, renewed 30 days before expiry), and OpenBao re-reads its listener certificate on `SIGHUP`. The installer adds a small sidecar to the OpenBao pod (`shareProcessNamespace: true`), running the already-pinned OpenBao image (so no new image) with a short shell loop: every 30 s it hashes the mounted `tls.crt` and `tls.key` (the kubelet swaps the Secret volume's `..data` link when cert-manager writes the renewed Secret) and, when the hash changes, sends `SIGHUP` to the `bao server` process. It runs as OpenBao's own uid (signalling needs no capability), read-only root filesystem, all capabilities dropped. A sealed or restarted OpenBao is never involved: `SIGHUP` reloads the listener without sealing. The installer's check after an upgrade verifies the served certificate's expiry matches the Secret's.
 
 ### 12.3 Final message
 
@@ -656,7 +741,7 @@ With a provider: the records being published, the hosts and records that stay ma
 
 ### 12.4 Uninstall
 
-As in 9.4, then the existing uninstall steps; the CRD is removed only when the installer installed it and no other release uses it.
+As in 9.5, then the existing uninstall steps; the CRD is removed only when the installer installed it and no other release uses it.
 
 ### 12.5 The openpgpkey host
 
@@ -722,13 +807,14 @@ With a provider, the ownership TXT is published with the other records, so `Doma
 
 ## 15. Security Considerations
 
-- **Kubernetes rights are isolated.** The internet-facing server keeps read-only Kubernetes access. The controller holds the write rights, but has no database or Redis access, accepts only the server's authenticated calls, runs only the pinned external-dns image, and has a NetworkPolicy admitting only the server.
+- **Kubernetes rights are isolated.** The internet-facing server keeps read-only Kubernetes access. The controller holds the write rights, but runs its own minimal image (no server code, no runtime dependencies, distroless, non-root, read-only root filesystem), has no database or Redis access, accepts only the server's authenticated calls, runs only the pinned external-dns image, and has a NetworkPolicy admitting only the server.
 - **Credential exposure.** DNS credentials can redirect a domain's mail and obtain certificates for it. They live only in the secret store, are never readable back by the server (OpenBao policy without `read`), are absent from logs, audit entries, Diagnostics and Deployment specs, and reach only their own external-dns pod. With the Kubernetes-Secret backend they cross the cluster network once, from server to controller, as the existing internal mail traffic does. Recommend scoped tokens; for Cloudflare: Zone:Zone:Read and Zone:DNS:Edit on the one zone, with its zone id in the config.
 - **OpenBao** is reached over TLS with a pinned CA, and every client logs in with a short-lived, audience-bound ServiceAccount token to a policy scoped to its own paths. No long-lived tokens remain.
 - **Who can publish.** Creating providers, changing credentials, assigning a domain, taking over records, rotating DKIM and changing integrations all need a trusted role and an elevated token, and are audited. Adding a domain (trusted role, as today) can now create public DNS records automatically, but only inside zones an elevated admin attached to a provider config.
 - **Zone confinement.** A provider config can only touch its zones: `--domain-filter`, the zone check on assignment and seeding, and the credentials' own scope. The TXT registry and the per-deployment owner id keep each deployment to its own records in a shared zone.
-- **Ownership verification.** When RapidMX publishes its own verification TXT, verification proves that this deployment holds credentials able to edit the zone, which is at least as strong as pasting the record by hand. It no longer proves that a separate human acted; that is acceptable because attaching the provider already required an elevated admin. Verification is still only by public DNS lookup.
-- **Takeover** can overwrite records other systems depend on: opt-in per provider, per-domain confirmation, preserved foreign TXT values, and the old values in the audit entry.
+- **Ownership verification.** When RapidMX publishes its own verification TXT, verification proves that this deployment holds credentials able to edit the zone, which is at least as strong as pasting the record by hand. It no longer proves that a separate human acted; that is acceptable because attaching the provider already required an elevated admin. Verification is still only by public DNS lookup. The record lives at `_rapidmx-verify.<domain>` (6.5), so verifying never puts the apex TXT set under RapidMX's control.
+- **Takeover** can overwrite records other systems depend on, and a taken-over set is owned whole (9.3): opt-in per provider, per-domain confirmation, the apex TXT set only on its own opt-in with an explicit, editable list of values to keep (9.4), kept values restored on opt-out, deletion and uninstall (9.5), and the old values in the audit entry.
+- **Version skew.** The controller and the server refuse to act on an API version they do not both speak (7.3), so a mismatched pair cannot misread desired state into wrong records.
 - **DKIM rotation** never switches signing to a key whose record is not live, so a rotation cannot break DKIM; a compromised key is retired as soon as signing has switched.
 - **SSRF.** URL fields are validated as in 10.3.
 
@@ -738,6 +824,9 @@ With a provider, the ownership TXT is published with the other records, so `Doma
 | --- | --- |
 | CRD not installed | Publishing reported unavailable; domains behave as manual. |
 | Controller down | Desired state keeps accumulating; nothing is published or removed until it is back; the console shows the controller as down. |
+| Controller and server API versions incompatible | The controller refuses to act (no Lease, no writes), reports not ready, retries the handshake every 60 s; the server records the mismatch and the console shows both versions. |
+| Lease lost (API server unreachable, pod paused) | The controller stops writing at once and re-acquires before writing again. |
+| Restoring kept apex values fails | Shown in the console with the values to re-add by hand; logged. |
 | Controller cannot verify the server's token (JWKS unreachable) | It refuses the call; the console shows the error; the Kubernetes-Secret backend cannot save credentials meanwhile. |
 | Bad credentials / provider API down | external-dns retries; the provider shows Error with the last error; records keep their last state. |
 | Record conflict | `conflict` with the existing value; nothing overwritten unless takeover. |
@@ -751,45 +840,48 @@ With a provider, the ownership TXT is published with the other records, so `Doma
 
 ## 17. Testing
 
-- **restapi unit + real DB (Mongo and SQL)**: `DnsProvider` CRUD and validation per type; masks and write-only behaviour; elevation and audit on every write; `buildDesiredDnsRecords()` equals `checkDnsSetup()`'s recommendations for every combination (DKIM missing, rotation phases, autodiscover on/off, alias, rfc2136 kinds); apex TXT merge with preserved values; `IntegrationSettings` seed/defaults/reset; assignment rules; the desired-state route (version, long poll, no secret values) and status route (subject check); `DkimRotationJob` through every phase, including the manual-domain wait, cancel, compromised, a missing acknowledgement and two replicas racing; `DomainSeeder` (create once, never after delete or purge, never overwrite, skip invalid entries, comma-separated input, concurrent seeding); `toStatus()` with seeded domains; plugin secret migration.
-- **server unit**: controller manifests golden-tested per provider (no credential in any manifest or log, image pin enforced); lease handling; token verification both ways against a fake JWKS; the Kubernetes-Secret and OpenBao backends against a fake API server and fake OpenBao (Kubernetes login, a write without read on DNS paths); `FsDkimKeyProvider` per-selector files, `activate()` atomicity and `signingSelector()`; each live consumer changes without restart; metric parsing against a recorded v0.23.0 `/metrics` page.
+- **restapi unit + real DB (Mongo and SQL)**: `DnsProvider` CRUD and validation per type; masks and write-only behaviour; elevation and audit on every write; `buildDesiredDnsRecords()` equals `checkDnsSetup()`'s recommendations for every combination (DKIM missing, rotation phases, autodiscover on/off, alias, rfc2136 kinds); the `_rapidmx-verify` verification name and the legacy apex transition (6.5); apex TXT opt-in, keep-list editing and restore operations (9.4, 9.5); the handshake route (version selection, mismatch recorded, `apiVersion` rejected per call) against shared contract fixtures; `IntegrationSettings` seed/defaults/reset; assignment rules; the desired-state route (version, long poll, no secret values) and status route (subject check); `DkimRotationJob` through every phase, including the manual-domain wait, cancel, compromised, a missing acknowledgement and two replicas racing; `DomainSeeder` (create once, never after delete or purge, never overwrite, skip invalid entries, comma-separated input, concurrent seeding); `toStatus()` with seeded domains; plugin secret migration.
+- **dns-controller unit** (its own repository, 100 % coverage thresholds like the siblings): configuration, logging, health endpoints, the Kubernetes client against a fake transport (token re-read, CA, error mapping), Lease acquisition, renewal, loss and the skew-safe expiry rule, the handshake and refusal on mismatch, the shared contract fixtures; later phases: manifests golden-tested per provider (no credential in any manifest or log, image pin enforced, quoted TXT, ownership records without TTL), token verification against a fake JWKS, Job specs for takeover and restore, metric parsing against a recorded v0.23.0 `/metrics` page. `docker build` in CI.
+- **server unit**: token verification of the controller's calls against a fake JWKS; the Kubernetes-Secret and OpenBao backends against a fake API server and fake OpenBao (Kubernetes login, a write without read on DNS paths); `FsDkimKeyProvider` per-selector files, `activate()` atomicity and `signingSelector()`; each live consumer changes without restart.
 - **postfix-bridge**: `dkim-sync.sh` tests (per-domain selector, fallback to the global one, acknowledgement written only after a reload).
 - **chart**: `helm template` tests that the server's Role has no write verbs, the controller Role is namespaced, `mail__domains` and `mail__dns__publish__*` render, and the openpgpkey two-step defaults.
-- **CI**: a kind cluster job with the CRD, the chart, the controller and external-dns pointed at an in-cluster bind9 (`rfc2136` with TSIG and AXFR): create, update, DKIM rotation end to end (with a test hook shortening the grace and overlap), delete, reassignment, conflict, takeover with preserved TXT values, uninstall cleanup. rfc2136 cannot manage MX or SRV, so CI covers A/AAAA/CNAME/TXT and the manual state; MX and SRV are covered by the Cloudflare e2e.
+- **CI**: a kind cluster job with the CRD, the chart, the controller and external-dns pointed at an in-cluster bind9 (`rfc2136` with TSIG and AXFR): create, update, DKIM rotation end to end (with a test hook shortening the grace and overlap), delete, reassignment, conflict, takeover, apex TXT opt-in with kept values and their restore, uninstall cleanup, and a deliberately mismatched controller version refusing to act. rfc2136 cannot manage MX or SRV, so CI covers A/AAAA/CNAME/TXT and the manual state; MX and SRV are covered by the Cloudflare e2e.
 - **Other providers** (route53, google, azure): unit tests only, against recorded API fixtures; marked "not yet live-tested".
 - **e2e on powerlevel.gg** with Cloudflare, local helm package first, release only after it passes:
-  1. **First, prove takeover** (9.3) on the existing hand-made records, before the rest of the server work.
+  1. ~~First, prove takeover~~ (9.3): **done 2026-10-27**, the noop-registry takeover works on Cloudflare. Still to check: the open point at the end of 9.3 (an unowned apex TXT blocking MX updates).
   2. Install with `--dns-provider cloudflare --dns-takeover`, credentials from a file on the host only.
-  3. Verify takeover (MX, apex TXT with SPF and other values preserved, `_dmarc`, hosts), automatic verification of the seeded domain, and the openpgpkey host on and certified.
+  3. Verify takeover (MX, `_dmarc`, hosts), the apex TXT opt-in with its keep list (if 9.4 is accepted), automatic verification of the seeded domain through `_rapidmx-verify`, and the openpgpkey host on and certified.
   4. Rotate DKIM ("Rotate now" with a shortened grace and overlap), check that mail sent before, during and after the switch verifies at an external receiver.
   5. Add and delete a second domain; change DMARC; reassign to manual.
   6. Check the controller and external-dns logs and metrics after deploy.
-  7. Uninstall with and without `--keep-dns`, checking that only RapidMX's values were removed.
+  7. Uninstall with and without `--keep-dns`, checking that only RapidMX's values were removed and kept apex values were restored.
   The token is never committed or stored anywhere but the test host's OpenBao/Secret, and JP rotates it afterwards.
 
 ## 18. Implementation Plan
 
-Process per the 2026-10-27 rules: reproduce or test first, an independent review of each diff before commit, CI green before release. Order: spec, restapi, server (the takeover proof first), postfix-bridge, web-client, meet-plugin, powerlevel.gg e2e, release (restapi minor, web-client minor, server beta; postfix-bridge and meet-plugin at the level their changes need).
+Process per the 2026-10-27 rules: reproduce or test first, an independent review of each diff before commit, CI green before release. Order: spec, restapi, dns-controller, server, postfix-bridge, web-client, meet-plugin, powerlevel.gg e2e, release (restapi minor, dns-controller first release, web-client minor, server beta pinning that controller release; postfix-bridge and meet-plugin at the level their changes need).
 
 **restapi**
 1. `SecretStore` interface + `NullSecretStore`; `SecretRef`; masks shared with plugin settings; `HostConfig`.
 2. `DnsProvider` model, types registry, `BaseDnsProviderRoute`; `Domain` fields and `PUT /:id/dns-provider`; `DeploymentIdentity`; audit actions.
-3. `buildDesiredDnsRecords()` and the `checkDnsSetup()` refactor (with `dkim_next`/`dkim_previous`, manual reasons); `DnsPublisher` + `NullDnsPublisher`; `BaseDnsDesiredStateRoute` (desired state, status, operations).
+3. `buildDesiredDnsRecords()` and the `checkDnsSetup()` refactor (with `dkim_next`/`dkim_previous`, manual reasons); `_rapidmx-verify` verification with the legacy apex transition (6.5); `DnsPublisher` + `NullDnsPublisher`; `BaseDnsDesiredStateRoute` (handshake, `/v1` desired state, status, operations) with the `v1` API types and the contract fixtures shared with dns-controller; `Domain.apexTxt` and `PUT /:id/apex-txt` if 9.4 is accepted.
 4. DKIM rotation: `DkimKeyProvider` additions, `Domain.dkimRotation`/`dkimManaged`, `DkimRotationJob`, rotate/cancel/pause routes.
 5. `IntegrationSettings` model and `BaseIntegrationsRoute`; `integrations` in `CORE_CONFIG_NAMESPACES`.
 6. `DomainSeeder` over `mail:domains`, `SetupState.seededDomains`, `Domain.origin`, `toStatus()` change; stale `mail:domains` comments corrected.
 7. Plugin-setting secret references and the migration helper.
 
+**dns-controller** (new repository, 7.2): phases C1 (skeleton: config, logging, health, Kubernetes client, Lease, `v1` types and handshake; scaffolded locally 2026-10-27) to C5, each released only when the server needs it; the first release precedes the server release that pins it.
+
 **server**
-1. Takeover proof on powerlevel.gg: a hand-run noop Job from v0.23.0 against the existing records, before the controller is built. Decide noop takeover or per-provider delete from the result.
-2. OpenBao: Kubernetes-auth clients for the secret store and the PKI CA, CA-bundle support; installer `prepareOpenbao` changes (auth method, roles, TLS listener, CA copy, token migration and revocation).
-3. DNS controller: entrypoint, `KubeClient` write verbs, lease, token verification, desired-state long poll, manifests, external-dns Deployments, `DNSEndpoint`s, Kubernetes-Secret writes, `ExternalSecret`s, takeover and test Jobs, metrics scraping, status reports.
+1. ~~Takeover proof on powerlevel.gg~~: done 2026-10-27, noop takeover chosen (9.3).
+2. OpenBao: Kubernetes-auth clients for the secret store and the PKI CA, CA-bundle support; installer `prepareOpenbao` changes (auth method, roles, TLS listener, the `SIGHUP` reload sidecar, CA copy, token migration and revocation).
+3. (moved to the dns-controller repository.)
 4. Server side: `DnsPublisher` (version counter), token verification for `/internal/dns`, `SecretStore` backends, hidden settings.
 5. `FsDkimKeyProvider` rotation methods.
 6. Integrations config layer, `HostConfig.install()`, propagation, and the live consumers.
 7. Run the seeder at startup; bootstrap provider from `mail:dns:bootstrap_provider`; `yarn dev` seeding.
-8. Chart: values, controller Deployment/Service/NetworkPolicy/ServiceAccount/Role, external-dns ServiceAccount/Role, `mail__domains`, hosts/addresses config, OpenBao CA mount, openpgpkey defaults.
-9. Installer: `--dns-provider`, credentials, `--dns-zone`, `--dns-takeover`, `--public-address` and detection, CRD install, two-step openpgpkey, uninstall (9.4) and `--keep-dns`, final message.
+8. Chart: values (including the pinned `dns.controller.image`), controller Deployment/Service/NetworkPolicy/ServiceAccount/Role/RoleBinding and its projected-token volume, external-dns ServiceAccount/Role, `mail__domains`, hosts/addresses config, OpenBao CA mount, openpgpkey defaults.
+9. Installer: `--dns-provider`, credentials, `--dns-zone`, `--dns-takeover`, `--public-address` and detection, CRD install, two-step openpgpkey, uninstall (9.5) and `--keep-dns`, final message.
 10. Remove the beta.46 opt-in note from README/release notes as appropriate.
 
 **postfix-bridge**: per-domain selectors and the `<domain>.signing` acknowledgement in `dkim-sync.sh` and the init container; the server chart's `postfixBridge` dependency moves to that release.
@@ -806,9 +898,11 @@ Then the powerlevel.gg e2e (17), then the releases.
 
 ## Open Questions
 
-1. **OpenBao certificate reload** (12.2): a `SIGHUP` sidecar in the OpenBao pod, or accept a yearly restart with automatic unseal?
-2. **JWKS access on k3s.** The design relies on Kubernetes's default `system:service-account-issuer-discovery` binding letting every ServiceAccount read `/openid/v1/jwks`. Confirm on powerlevel.gg's k3s early in server Phase 3; if it is missing, the fallback is a chart-generated shared secret between server and controller (a long-lived secret, so JP's call).
-3. **Route 53 TXT quoting**: settled only when Route 53 is live-tested; until then the type carries the "not yet live-tested" badge.
+1. **Apex TXT set and SPF (9.4), PROPOSED:** apex SPF taken over only on the admin's per-domain opt-in, with an editable "values to keep" list in the console, kept values restored on opt-out, deletion and uninstall. Pending JP.
+2. **Route 53 TXT quoting**: expected to match Cloudflare's (quoted), settled only when Route 53 is live-tested; until then the type carries the "not yet live-tested" badge.
+3. **Unowned apex TXT and the apex MX** (end of 9.3): whether it also blocks updates and deletes of the owned MX; checked on powerlevel.gg before controller phase C4.
+
+Settled since the first draft: the OpenBao certificate reload (sidecar, 12.2) and JWKS access on k3s (in-cluster fetch, confirmed, 7.3).
 
 ## Resolved Decisions
 
@@ -818,15 +912,18 @@ From JP, 2026-10-27:
 - Records: exactly what `checkDnsSetup()` recommends, plus the deployment's hosts (A/AAAA for the mail host to the public addresses; CNAMEs for auth, autodiscover, openpgpkey).
 - Domain add/remove and DKIM changes publish automatically.
 - Per-domain provider ("manual" allowed), configured in the console; one external-dns Deployment per provider config, with a pinned image, a credentials Secret and a label filter.
-- **Kubernetes writes go through a separate DNS controller pod** with its own ServiceAccount and namespace Role; the server keeps only its read-only access and records desired state (§7). The controller reuses the server image with a separate command, reads desired state through an internal API authenticated with projected ServiceAccount tokens, runs as one replica with a lease, and reports status back through the same API.
+- **Kubernetes writes go through a separate DNS controller pod** with its own ServiceAccount and namespace Role; the server keeps only its read-only access and records desired state (§7). The controller is a **dedicated project and image**, `rapidmx/dns-controller` (`ghcr.io/rapidmx/dns-controller`), not the server image with another command, so the one pod that can create Deployments, Secrets and Jobs carries no server code; the server chart templates it and pins its image in lock-step. It reads desired state through a **versioned** internal API (`/internal/dns/v1`, `apiVersion` in every payload, startup handshake, refusal on mismatch) authenticated with projected ServiceAccount tokens verified against the in-cluster JWKS, runs as one replica with a lease, and reports status back through the same API.
 - **OpenBao**: Kubernetes auth for every client, narrowly scoped policies, TLS on the in-cluster listener with an installer-issued certificate, no new long-lived tokens (and the existing ones migrated).
 - **openpgpkey certificate**: two-step HTTP-01 install.
 - **DKIM rotation is built now** (6.2): scheduled and on demand, new selector published and observed live before signing switches, old selector kept for the overlap, then retired; manual domains wait for the admin.
-- Takeover: proven early on powerlevel.gg with the noop-registry Job; fallback per-provider delete in the controller.
+- Takeover: the noop-registry Job, **proven on powerlevel.gg with Cloudflare on 2026-10-27** (9.3); the per-provider delete fallback is dropped.
+- **Ownership verification at `_rapidmx-verify.<domain>`** (6.5), never in the apex TXT set; existing domains migrate with both locations accepted during a transition, only the new name recommended and published.
+- **OpenBao listener certificate**: reloaded by a `SIGHUP` sidecar on change, no restarts (12.2).
+- **JWKS** fetched in-cluster at `https://kubernetes.default.svc/openid/v1/jwks`; the issuer-discovery binding was confirmed on k3s v1.36.4.
 - rfc2136 stays, with MX/SRV shown as manual. Cloudflare is the e2e-tested provider; the others are unit-tested and marked not yet live-tested. DigitalOcean and webhook providers come later.
 - The installer detects public addresses, with `--public-address` to override.
 - Hosts outside every provider's zones stay manual and are marked so.
-- Uninstall removes only RapidMX's values from shared TXT sets.
+- Uninstall removes only RapidMX's values and restores kept values of sets it took over (9.5).
 - Health comes from external-dns's metrics endpoint.
 - Integrations: DNS providers, Giphy, STUN, signing CA, DNS resolver, plugin registry; TURN stays in Meet; infrastructure stays Helm/config. Typed, trusted role and elevation, audited, live-applied, reset to deployment default.
 - STUN reaches the meet plugin as `integrations:stun:urls` through restapi's `HostConfig` (plugins may already read core keys; `@Config` is only a startup snapshot).
@@ -836,4 +933,4 @@ From JP, 2026-10-27:
 
 ## Status
 
-Design. No code yet.
+Design, revised 2026-10-27 (dedicated dns-controller project, versioned API, spike results, `_rapidmx-verify`). The dns-controller C1 skeleton exists in its own repository; no restapi or server code yet.
