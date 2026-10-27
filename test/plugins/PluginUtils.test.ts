@@ -591,6 +591,13 @@ describe("isPluginSettingKeyAllowed", () => {
     it.each(["integrations", "integrations:stun:urls", "INTEGRATIONS__STUN__URLS", "giphy:enabled"])("refuses the Integrations key %s", (key) => {
         expect(isPluginSettingKeyAllowed(key)).toBe(false);
     });
+    // The configuration encryption's keyring and settings (spec 5.3): a plugin can never declare, save or shadow where the keys come from.
+    it.each(["config_encryption", "config_encryption:keyring", "config_encryption:keyring_file", "CONFIG_ENCRYPTION__KEYRING_STORE__BACKEND", "config_encryption:plugin_secrets:wait_for_rollout"])(
+        "refuses the configuration encryption key %s",
+        (key) => {
+            expect(isPluginSettingKeyAllowed(key)).toBe(false);
+        },
+    );
     it.each(["trusted_roles", "AUTH:jwt", "datastores__mongo__url", "mail:transport:ingest:secret", "mail:transport", "System:Plugins", "system", "mail__blob__localfs__path", "Cookies", "shutdown", "mail:default_quota_bytes", "rateLimit:x", "mail:escrow", "cookie_secret"])("refuses %s", (key) => {
         expect(isPluginSettingKeyAllowed(key)).toBe(false);
     });

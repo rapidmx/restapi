@@ -23,7 +23,7 @@ import {
     type DnsProviderTypeInfo,
     type DnsProviderTypeSpec,
 } from "../dns/DnsProviderTypes.js";
-import { maskSecretRef, toSecretPatch, type SecretMask } from "../secrets/SecretMask.js";
+import { maskCredentials, toSecretPatch, type SecretMask } from "../secrets/SecretMask.js";
 import type { SecretStore } from "../secrets/SecretStore.js";
 import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import {
@@ -325,7 +325,8 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
             type: provider.type,
             zones: [...provider.zones],
             options: { ...provider.options },
-            credentials: maskSecretRef(provider.secretRef ?? undefined),
+            // The reference lists the fields that are set; R2 replaces it with the row's own `credentials` envelopes.
+            credentials: maskCredentials(Object.fromEntries((provider.secretRef?.keys ?? []).map((key) => [key, true]))),
             ...(provider.origin ? { origin: provider.origin } : {}),
             enabled: provider.enabled,
             allowTakeover: provider.allowTakeover,

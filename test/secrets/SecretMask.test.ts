@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError } from "@rapidrest/core";
-import { isSecretMask, maskSecretRef, secretMask, toSecretPatch } from "../../src/secrets/SecretMask.js";
-import { SecretRef } from "../../src/models/types.js";
+import { isSecretMask, maskCredentials, secretMask, toSecretPatch } from "../../src/secrets/SecretMask.js";
+import { ConfigEnvelope } from "../../src/models/types.js";
 
 /** What `call` throws, which it must. */
 function thrownBy(call: () => unknown): any {
@@ -49,15 +49,29 @@ describe("isSecretMask()", () => {
     });
 });
 
-describe("maskSecretRef()", () => {
-    it("shows each key the reference says is set as the mask, and never a value", () => {
-        const ref: SecretRef = { backend: "kubernetes", path: "dns/cf1", keys: ["accessKeyId", "secretAccessKey"], generation: 3 };
-        expect(maskSecretRef(ref)).toEqual({ accessKeyId: { secret: true }, secretAccessKey: { secret: true } });
+describe("maskCredentials()", () => {
+    const envelope = (kid: string): ConfigEnvelope => ({ $enc: 1, kid, iv: "aXY=", ct: "Y3Q=", tag: "dGFn" });
+
+    it("shows each field that is set as the mask, and never an envelope", () => {
+        const credentials = { accessKeyId: envelope("a1b2c3d4"), secretAccessKey: envelope("a1b2c3d4") };
+        const masked = maskCredentials(credentials);
+        expect(masked).toEqual({ accessKeyId: { secret: true }, secretAccessKey: { secret: true } });
+        expect(JSON.stringify(masked)).not.toContain("a1b2c3d4");
     });
 
-    it("shows nothing when no credentials were saved", () => {
-        expect(maskSecretRef(undefined)).toEqual({});
-        expect(maskSecretRef({ backend: "openbao", path: "server/giphy", keys: [], generation: 1 })).toEqual({});
+    it("gives each field a mask of its own, so no response shares one another can change", () => {
+        const masked = maskCredentials({ a: envelope("k"), b: envelope("k") });
+        expect(masked.a).not.toBe(masked.b);
+    });
+
+    it("shows nothing when no credentials were saved, or all were cleared", () => {
+        expect(maskCredentials(undefined)).toEqual({});
+        expect(maskCredentials(null)).toEqual({});
+        expect(maskCredentials({})).toEqual({});
+    });
+
+    it("leaves out a field that holds nothing", () => {
+        expect(maskCredentials({ apiToken: envelope("k"), cleared: null, missing: undefined })).toEqual({ apiToken: { secret: true } });
     });
 });
 

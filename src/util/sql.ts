@@ -2,5 +2,6 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+export * from "./sql/ConfigCipherSQL.js";
 export * from "./sql/DomainSeederSQL.js";
 export * from "./sql/PluginSecretMigratorSQL.js";

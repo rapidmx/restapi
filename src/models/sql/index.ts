@@ -8,6 +8,7 @@ export * from "./CalendarShareLinkSQL.js";
 export * from "./ContactSQL.js";
 export * from "./ContactListSQL.js";
 export * from "./CorrespondentSQL.js";
+export * from "./ConfigKeyStateSQL.js";
 export * from "./DataExportRequestSQL.js";
 export * from "./DataSubjectErasureRequestSQL.js";
 export * from "./DeploymentIdentitySQL.js";

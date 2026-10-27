@@ -322,6 +322,7 @@ export const CORE_CONFIG_NAMESPACES: readonly string[] = [
     "telemetry_services",
     "system",
     "system:plugins",
+    "config_encryption",
     "mail:transport",
     "mail:internal",
     "mail:escrow",

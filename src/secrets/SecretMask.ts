@@ -4,11 +4,10 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
-import { SecretRef } from "../models/types.js";
 
 /**
  * What a response shows in place of a secret that is set, and what a form sends back for a secret it left alone. One shape for plugin secret settings
- * (`maskSecretSettings()`) and for every credential held in the `SecretStore`, so the console has one write-only control for both.
+ * (`maskSecretSettings()`) and for every credential held on a row (`maskCredentials()`), so the console has one write-only control for both.
  */
 export interface SecretMask {
     secret: true;
@@ -24,11 +23,14 @@ export function isSecretMask(value: unknown): value is SecretMask {
     return typeof value === "object" && value !== null && !Array.isArray(value) && (value as any).secret === true && Object.keys(value).length === 1;
 }
 
-/** The mask for each key `ref` says is set, keyed as the form's fields are: what a route returns for saved credentials. Nothing when none were saved. */
-export function maskSecretRef(ref: SecretRef | undefined): Record<string, SecretMask> {
+/** The mask for each field of `credentials` that is set, keyed as the form's fields are: what a route returns for saved credentials. Nothing when none were saved
+ * (or all were cleared). The values - an envelope each - never appear. */
+export function maskCredentials(credentials: Record<string, unknown> | null | undefined): Record<string, SecretMask> {
     const masked: Record<string, SecretMask> = {};
-    for (const key of ref?.keys ?? []) {
-        masked[key] = secretMask();
+    for (const [field, value] of Object.entries(credentials ?? {})) {
+        if (value !== undefined && value !== null) {
+            masked[field] = secretMask();
+        }
     }
     return masked;
 }

@@ -2508,6 +2508,69 @@ export interface DeploymentIdentity extends BaseEntity {
 }
 
 /**
+ * The encrypted form of one configuration secret (spec 5.2), stored in the field where the plaintext would be: AES-256-GCM, bound by its associated data
+ * to the record type, the row's `uid` and the field path (`ConfigCipher`), so an envelope copied to another row or field doesn't decrypt. Exactly these
+ * five keys (`isConfigEnvelope()`).
+ */
+export interface ConfigEnvelope {
+    /** The format version. */
+    $enc: 1;
+    /** The keyring entry that encrypted it. */
+    kid: string;
+    /** Base64, 12 bytes. */
+    iv: string;
+    /** Base64 ciphertext of the UTF-8 JSON of the value, so a plugin's number or flag comes back as one. */
+    ct: string;
+    /** Base64, 16 bytes. */
+    tag: string;
+}
+
+/** Where a configuration-key rotation is (spec 5.5). */
+export type ConfigKeyRotationPhase = "adding" | "activating" | "reencrypting" | "retiring" | "done" | "failed";
+
+/** The current or last configuration-key rotation, as `ConfigKeyState.rotation` records it for the server copies and the console. */
+export interface ConfigKeyRotation {
+    /** The new key, once it is in the keyring. */
+    kid?: string;
+    /** The keys it replaces. */
+    previousKids: string[];
+    compromised: boolean;
+    /** The uid of the administrator who asked for it. */
+    requestedBy: string;
+    requestedAt: Date;
+    phase: ConfigKeyRotationPhase;
+    activationStartedAt?: Date;
+    /** The server copies (pod name and process id) that haven't yet reported loading the new key while `phase` is `activating`, and, once activated, those
+     * that don't yet encrypt with it. */
+    waitingFor?: string[];
+    activatedAt?: Date;
+    /** Set by "Activate anyway" with the copies that hadn't loaded the key then. */
+    activationForced?: { by: string; at: Date; staleCopies: string[] };
+    finishedAt?: Date;
+    /** What failed (a keyring write refused, for example), never a value. */
+    lastError?: string;
+}
+
+/**
+ * The configuration keyring's progress, never key material (spec 4.9): one singleton row (`CONFIG_KEY_STATE_UID`), deny-all class ACL. The server copies read
+ * `activeKid` to know which key encrypts, and the console reads the rest.
+ */
+export interface ConfigKeyState extends BaseEntity {
+    /** The key new values are encrypted with, set when a new key is activated. Unset on a deployment that has never rotated, where the keyring's only
+     * (newest) key encrypts. */
+    activeKid?: string | null;
+    /** The current or last rotation. */
+    rotation?: ConfigKeyRotation | null;
+    /** The envelopes per `kid` at the end of the last full re-encryption pass. */
+    kidUsage?: Record<string, number> | null;
+    countedAt?: Date;
+    reencryption?: { targetKid: string; complete: boolean; startedAt: Date; finishedAt?: Date } | null;
+    /** The plugin secret settings' encryption (spec 5.7): `encryptedAt` is the first completed run of `PluginSecretEncryptor`, until which secret settings are
+     * saved in plaintext, and `reason` says why the run is still waiting for the server's rollout. */
+    pluginSecrets?: { encryptedAt?: Date; waitingForRollout?: boolean; checkedAt?: Date; reason?: string } | null;
+}
+
+/**
  * An admin-managed domain this mail server accepts mail on, and restricts `Mailbox`/`DistributionList`
  * addresses to. A newly created domain starts unverified with a generated `verificationToken` - an admin
  * must prove DNS ownership by adding it as a TXT record before the domain is usable anywhere this
