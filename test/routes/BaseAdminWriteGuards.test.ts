@@ -15,6 +15,7 @@ import { BaseMatterRoute } from "../../src/routes/BaseMatterRoute.js";
 
 class TestDomainRoute extends BaseDomainRoute<any> {
     protected auditLogClass: any = class {};
+    protected dnsProviderClass: any = class {};
 }
 
 class TestEscrowScopeRoute extends BaseEscrowScopeRoute<any> {

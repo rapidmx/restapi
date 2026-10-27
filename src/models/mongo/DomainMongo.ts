@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BaseMongoEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
-import { Domain } from "../types.js";
+import { DnsPublicationStatus, Domain } from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Column, Entity } = PersistenceDecorators;
@@ -81,6 +81,16 @@ export class DomainMongo extends BaseMongoEntity implements Domain {
     @Nullable
     public aliasOf?: string;
 
+    @Column()
+    @Description("The DNS provider config publishing this domain's records; unset means manual.")
+    @Nullable
+    public dnsProviderUid?: string | null;
+
+    @Column()
+    @Description("What the DNS controller and the live check last said about this domain's published records.")
+    @Nullable
+    public dnsPublication?: DnsPublicationStatus;
+
     constructor(other?: Partial<DomainMongo>) {
         super(other);
 
@@ -96,6 +106,8 @@ export class DomainMongo extends BaseMongoEntity implements Domain {
             this.dmarcPolicy = "dmarcPolicy" in other ? other.dmarcPolicy : this.dmarcPolicy;
             this.dmarcReportEmail = "dmarcReportEmail" in other ? other.dmarcReportEmail : this.dmarcReportEmail;
             this.aliasOf = "aliasOf" in other ? other.aliasOf : this.aliasOf;
+            this.dnsProviderUid = "dnsProviderUid" in other ? other.dnsProviderUid : this.dnsProviderUid;
+            this.dnsPublication = "dnsPublication" in other ? other.dnsPublication : this.dnsPublication;
         }
     }
 }

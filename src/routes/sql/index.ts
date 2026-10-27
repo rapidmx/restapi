@@ -10,6 +10,7 @@ export * from "./DataExportRequestRouteSQL.js";
 export * from "./DataSubjectErasureRequestRouteSQL.js";
 export * from "./DirectoryRouteSQL.js";
 export * from "./DistributionListRouteSQL.js";
+export * from "./DnsProviderRouteSQL.js";
 export * from "./DomainRouteSQL.js";
 export * from "./EncryptionPolicyRouteSQL.js";
 export * from "./EscrowAccessRequestRouteSQL.js";

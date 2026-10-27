@@ -13,6 +13,7 @@ export * from "./BaseDataExportRoute.js";
 export * from "./BaseDataSubjectErasureRequestRoute.js";
 export * from "./BaseDirectoryRoute.js";
 export * from "./BaseDistributionListRoute.js";
+export * from "./BaseDnsProviderRoute.js";
 export * from "./BaseDomainRoute.js";
 export * from "./BaseEncryptionPolicyRoute.js";
 export * from "./BaseFocusedInboxOverrideRoute.js";

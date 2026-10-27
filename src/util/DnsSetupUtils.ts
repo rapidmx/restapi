@@ -3,13 +3,11 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { DnsMxRecord, DnsResolver, DnsSrvRecord } from "../dns/DnsResolver.js";
-import type { Domain } from "../models/types.js";
+import type { DnsRecordType, Domain } from "../models/types.js";
 import { buildVerificationTxtValue, checkDomainVerification } from "./DomainVerificationUtils.js";
 
-/** One of the mail-related DNS record types a domain's setup is checked against. The two `autodiscover_*`
- * types are only ever included in `checkDnsSetup()`'s result while `@rapidmx/autodiscover-plugin` is
- * active for this deployment - see that function's own doc comment. */
-export type DnsRecordType = "ownership" | "mx" | "spf" | "dkim" | "dmarc" | "openpgpkey_cname" | "autodiscover_cname" | "autodiscover_srv";
+// Defined next to `Domain.dnsPublication`, which records publication per record type; re-exported here, where it always lived.
+export type { DnsRecordType };
 
 /** The live-checked status of one DNS record this server recommends for a `Domain` - see
  * `checkDnsSetup()`. Always computed fresh, never persisted (unlike `Domain.verified`). */

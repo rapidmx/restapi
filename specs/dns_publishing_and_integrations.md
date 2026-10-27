@@ -116,14 +116,19 @@ export interface DnsProvider extends BaseEntity {
     uid: string;
     /** Display name, unique (case-insensitive). */
     name: string;
+    /** `name` in lowercase, under a unique index on both backends, so two writes racing past the name check can't both save the same
+     * name (the loser gets the same 409). Server-set, never returned. */
+    nameKey: string;
     type: DnsProviderType;
     /** The zones (apex names) this config may publish into: external-dns's --domain-filter. At least one. A Domain may be
      * assigned to this config only when its name is one of these or under one of them. */
     zones: string[];
-    /** Non-secret, type-specific options, validated per type (4.2). */
-    options: Record<string, string | number | boolean>;
-    /** Where the credentials are: a reference, never the value (5). Unset until credentials are saved. */
-    secretRef?: SecretRef;
+    /** Non-secret, type-specific options, validated per type (4.2), with every default filled in. A value is text, a number, a switch or a
+     * list of text (Cloudflare's `zoneIds`, rfc2136's `hosts`). */
+    options: Record<string, string | number | boolean | string[]>;
+    /** Where the credentials are: a reference, never the value (5). Unset until credentials are saved (and for a config that needs none:
+     * Route 53 through IRSA, unsigned rfc2136); `null` once every credential was cleared. */
+    secretRef?: SecretRef | null;
     /** Set by the installer for the config it created, so the console can say where it came from. */
     origin?: "installer" | "console";
     /** Admin on/off. A disabled config's external-dns instance is scaled to zero; its records stay as they are. */
@@ -131,7 +136,21 @@ export interface DnsProvider extends BaseEntity {
     /** Allow the takeover of records this deployment does not own yet in these zones (9). Default false. */
     allowTakeover: boolean;
     /** Written only from the controller's status reports (7.7). Never client-settable. */
-    status?: DnsProviderStatus;
+    status?: DnsProviderStatus | null;
+}
+
+/** What the controller last reported (7.7); every field optional, since a config the controller hasn't reported on has none. */
+export interface DnsProviderStatus {
+    reportedAt?: Date;
+    readyReplicas?: number;
+    image?: string;
+    lastRolloutAt?: Date;
+    lastSyncAt?: Date;
+    registryErrors?: number;
+    sourceErrors?: number;
+    providerErrors?: number;
+    ownerMismatchRecords?: number;
+    lastError?: string;
 }
 
 export interface SecretRef {
@@ -159,6 +178,8 @@ Each type declares its options and its secret fields. Option values are validate
 
 Providers that are not live-tested carry `tested: false` in `GET /types`, and the console marks them "not yet live-tested".
 
+The registry is `src/dns/DnsProviderTypes.ts` (restapi). Beyond the table, as implemented: Cloudflare's `zoneIds` are 32-character hex ids, one per zone **in the order of `zones`**, never repeated; rfc2136's `zone` must be one of `zones`, `tsigKeyName` is required unless `insecure`, and `tsigAlgorithm` is one of `hmac-sha1`/`-sha224`/`-sha256` (default)/`-sha384`/`-sha512`; Route 53's `region` and `assumeRoleArn`, Google's `project` and Azure's GUIDs and resource group are checked for shape. Credential values are checked for shape too (an AWS access key id, a base64 TSIG secret, a JSON object for Google's key file, a GUID client id), with errors that name the field and never repeat the value. A config that needs no credentials (Route 53 through IRSA, unsigned rfc2136) needs no secret store either.
+
 Facts checked against external-dns v0.23.0's source and docs (2026-10-26):
 
 - **DigitalOcean is not offered**: its in-tree provider was removed in v0.21.0 and is only reachable through a third-party webhook provider. DigitalOcean and webhook providers come later.
@@ -171,14 +192,14 @@ Facts checked against external-dns v0.23.0's source and docs (2026-10-26):
 
 | Field | Meaning |
 | --- | --- |
-| `dnsProviderUid?: string` | The provider config publishing this domain's records; unset means manual. Set only through `PUT /:id/dns-provider` (10.4). Must name an existing `DnsProvider` whose `zones` cover the domain. |
+| `dnsProviderUid?: string \| null` | The provider config publishing this domain's records; unset or `null` means manual. Set only through `PUT /:id/dns-provider` (10.4). Must name an existing `DnsProvider` whose `zones` cover the domain. |
 | `origin?: "seed" \| "console"` | `"seed"` for a domain the server created from `mail:domains` (13). Unset on existing rows, which count as console-created. Server-managed. |
 | `dnsPublication?: DnsPublicationStatus` | Written from the controller's status reports and the live check, see 4.4. Server-managed. |
 | `dkimRotation?: DkimRotationState` | Rotation state, see 6.2. Server-managed. |
 | `dkimManaged?: boolean` | `true` when the current key came from the `DkimKeyProvider` (rotation possible), `false` when an admin imported `dkimSelector`/`dkimPublicKey` by hand (never rotated automatically). Server-managed. |
 | `apexTxt?: { managed: boolean; keep: string[] }` | **PROPOSED (§9.4).** Whether RapidMX owns the domain's apex TXT set to publish SPF, and the foreign values it keeps in that set. Set only through `PUT /:id/apex-txt` (trusted role and elevation, audited). Unset means not managed. |
 
-All of them join `SERVER_MANAGED_DOMAIN_FIELDS` (refused by plain `PUT` and `PUT /:id/:property`).
+All of them join `SERVER_MANAGED_DOMAIN_FIELDS`, each with the restapi step that adds it (`dnsProviderUid` and `dnsPublication` in step 2). As the code already treats `verified` and the other server-managed fields: a plain `PUT` **drops** them (so a console round-tripping a domain still works), `PUT /:id/:property` **refuses** them (403), and a create never takes them.
 
 ### 4.4 Publication status
 
@@ -228,7 +249,7 @@ A singleton row `DeploymentIdentity { installationId }`: a random 16-character v
 
 ### 4.7 Audit actions
 
-`DNS_PROVIDER_CREATE`, `DNS_PROVIDER_UPDATE` (details: changed option keys, `credentialsChanged: boolean`, never values), `DNS_PROVIDER_DELETE`, `DOMAIN_DNS_PROVIDER_ASSIGN` (details: from, to), `DNS_TAKEOVER` (details: provider, record names, the old values), `DKIM_ROTATION_STARTED` (details: new selector, `reason: "scheduled" | "manual" | "compromised"`), `DKIM_ROTATION_SWITCHED`, `DKIM_ROTATION_RETIRED`, `DKIM_ROTATION_CANCELLED`, `INTEGRATION_UPDATE` (details: section, changed keys, `secretChanged`), `INTEGRATION_RESET` (details: section, keys), `PLUGIN_SECRET_MIGRATED`.
+`DNS_PROVIDER_CREATE` (details: name, type, zones, option keys, `credentialsChanged`), `DNS_PROVIDER_UPDATE` (details: name, the changed fields, changed option keys, `credentialsChanged: boolean`, never values; `secretLeftBehind: true` when credentials in a backend the deployment no longer uses were left there; `rowWriteFailed: true` with `rowMatchesStore` when the store changed but the row's write then failed, see 10.1), `DNS_PROVIDER_DELETE` (details: name, type, `secretLeftBehind` when the credentials could not be removed from the store), `DOMAIN_DNS_PROVIDER_ASSIGN` (details: domain name, from, to; `null` for manual), `DNS_TAKEOVER` (details: provider, record names, the old values), `DKIM_ROTATION_STARTED` (details: new selector, `reason: "scheduled" | "manual" | "compromised"`), `DKIM_ROTATION_SWITCHED`, `DKIM_ROTATION_RETIRED`, `DKIM_ROTATION_CANCELLED`, `INTEGRATION_UPDATE` (details: section, changed keys, `secretChanged`), `INTEGRATION_RESET` (details: section, keys), `PLUGIN_SECRET_MIGRATED`.
 
 ## 5. Secret Storage
 
@@ -545,7 +566,7 @@ restapi raises these through an injected `DnsPublisher` (DI token, `NullDnsPubli
 - Writes use server-side apply (`fieldManager=rapidmx-dns-controller`), so every write is idempotent. The controller's own Kubernetes client (in its repository, 7.2) has `GET`, `POST`, `PUT`, apply `PATCH` and `DELETE`; the server's `KubeClient` stays GET-only.
 - `status.observedGeneration` is written by external-dns when it **reads** the resource, not when the provider has applied it. "Published" therefore means observed **and** seen by the server's live check. Observed but not live is "pending"; still not live after several intervals is shown with the instance's last error.
 
-Deletion: a deleted domain's endpoint is deleted; external-dns removes what it owns on its next sync, and a managed apex TXT set is restored afterwards (9.5). A provider config can be deleted only when no domain is assigned to it (409 otherwise); the controller then deletes its hosts endpoint, waits one interval, and deletes the Deployment and its credentials.
+Deletion: a deleted domain's endpoint is deleted; external-dns removes what it owns on its next sync, and a managed apex TXT set is restored afterwards (9.5). A provider config can be deleted only when no domain is assigned to it (409 otherwise). The server removes the row and then its credentials from the secret store (the running instance keeps the copy it started with; a store failure, or a reference from a backend the deployment no longer has, leaves them behind, logged and audited as `secretLeftBehind`); the controller then deletes its hosts endpoint, waits one interval, and deletes the Deployment and its Kubernetes Secret.
 
 ### 7.6 RBAC
 
@@ -668,12 +689,12 @@ All routes: `@RequiresTrustedRole()` plus `assertAdminScope()` (elevation) for e
 
 | Route | Behaviour |
 | --- | --- |
-| `GET /` | List, secrets masked, with `status`. |
+| `GET /` | List (by name), with `status` and `domainCount` (the domains assigned). Credentials appear only as `credentials: { <key>: { "secret": true } }` per key saved (`maskSecretRef()`); the `SecretRef` itself is never returned. `GET /:id` returns one the same way. |
 | `GET /types` | The provider types, their option schemas, secret fields and `tested` flag (drives the console form). |
-| `POST /` | Create. Body: `name`, `type`, `zones`, `options`, `credentials` (write-only), `allowTakeover`. Validates the type schema; zones must be valid host names; credentials written to the `SecretStore` before the row; 400 when no secret store. |
-| `PUT /:id` | Update; `credentials` keys omitted or given as the mask are unchanged, `null` clears. `type` cannot change. Narrowing `zones` is refused while an assigned domain falls outside them. |
-| `POST /:id/test` | Queues a test operation: the controller runs a short `--dry-run --once` Job and reports whether it authenticated and found the zones. |
-| `POST /:id/takeover` | Body: `domainUid`, optional record list; queues 9.3. Never includes the apex TXT set, which only `PUT mail/domains/:id/apex-txt` (9.4) manages. |
+| `POST /` | Create. Body: `name`, `type`, `zones`, `options`, `credentials` (write-only), `enabled`, `allowTakeover`. Validates the type schema; zones must be valid host names of at least two labels (a top-level domain alone is refused); the uid is generated from the name (a slug of at most 31 characters, `dns-` in front when it doesn't start with a letter, then a hyphen and 8 random characters); `origin: "console"`; credentials written to the `SecretStore` at `dns/<uid>` before the row, and removed again if the row can't be saved; 400 when credentials are sent and there is no secret store. |
+| `PUT /:id` | Update; `credentials` keys omitted or given as the mask are unchanged, `null` clears (clearing every key deletes the secret and sets `secretRef: null`). `type` cannot change. Narrowing `zones` is refused (409) while an assigned domain falls outside them. A `version` other than the row's is a 409 (`INVALID_OBJECT_VERSION`, the same code as the optimistic lock's own failure) before anything is written, and the version is checked again right before the store write. The store change can't be undone (DNS credentials are never read back), so when another write lands during the store call and the row's write then fails, the row as it now is gets the new `secretRef` (unless a later credentials write already replaced it, or the row is gone, in which case the new secret is removed), the change is audited with `rowWriteFailed`, and the request still answers the 409. A `secretRef` from a backend the deployment doesn't use is never sent to the current store: clearing every key leaves it there and replacing every key writes a new secret, both audited as `secretLeftBehind`; keeping some of its keys is a 409. Names are unique through `nameKey`'s index (409 `IDENTIFIER_EXISTS`). Assigned domains are counted and checked across every page, not only the first. A request that changes nothing writes and audits nothing. |
+| `POST /:id/test` | Queues a test operation: the controller runs a short `--dry-run --once` Job and reports whether it authenticated and found the zones. Arrives with the operations queue in restapi step 3. |
+| `POST /:id/takeover` | Body: `domainUid`, optional record list; queues 9.3. Never includes the apex TXT set, which only `PUT mail/domains/:id/apex-txt` (9.4) manages. Arrives with the operations queue in restapi step 3. |
 | `DELETE /:id` | 409 while any domain is assigned; then 7.5 deletion. |
 
 ### 10.2 `system/integrations`
@@ -698,7 +719,7 @@ Every URL field is parsed, must be `https:` (except STUN URIs), must have a host
 
 ### 10.4 Assigning a domain
 
-`PUT mail/domains/:id/dns-provider` with `{ dnsProviderUid: string | null }`: trusted role and elevation, checks the provider's zones cover the domain, audits `DOMAIN_DNS_PROVIDER_ASSIGN`, bumps the desired-state version.
+`PUT mail/domains/:id/dns-provider` with `{ dnsProviderUid: string | null }`: trusted role and elevation, checks the provider exists and its zones cover the domain (400 otherwise), audits `DOMAIN_DNS_PROVIDER_ASSIGN`, bumps the desired-state version (from restapi step 3, when `DnsPublisher` exists). Assigning the provider the domain already has changes nothing. A provider deleted, or its zones narrowed, at the same moment as an assignment can leave a domain assigned to a provider that no longer covers it; that is harmless (external-dns publishes only inside its `--domain-filter`), and the desired state (step 3) treats such an assignment as manual (`no_provider` or `outside_zones`).
 
 ## 11. Live Application
 
@@ -838,6 +859,7 @@ With a provider, the ownership TXT is published with the other records, so `Doma
 | Bad credentials / provider API down | external-dns retries; the provider shows Error with the last error; records keep their last state. |
 | Record conflict | `conflict` with the existing value; nothing overwritten unless takeover. |
 | Provider cannot hold a kind | That record is manual with its reason; the others publish. |
+| A provider config's row write fails after its credentials changed in the store | The row is pointed at the new `secretRef` (so the masks and the pod-template generation follow the store), the change is audited with `rowWriteFailed`, and the request answers 409 for the rest; if even that write fails, the mismatch is logged and audited with `rowMatchesStore: false`. |
 | OpenBao sealed or unreachable | Credential writes fail with 503; running external-dns pods keep their Secret; server-side secrets keep their cached value and warn. |
 | New DKIM record never goes live | Rotation stays `pending`, signing unchanged; the console reminds the admin. |
 | postfix-bridge does not acknowledge a switch | Both selectors stay published; no overlap clock; `lastError` shown. |
@@ -870,8 +892,8 @@ Process per the 2026-10-27 rules: reproduce or test first, an independent review
 
 **restapi**
 1. `SecretStore` interface + `NullSecretStore`; `SecretRef`; masks shared with plugin settings; `HostConfig`.
-2. `DnsProvider` model, types registry, `BaseDnsProviderRoute`; `Domain` fields and `PUT /:id/dns-provider`; `DeploymentIdentity`; audit actions.
-3. `buildDesiredDnsRecords()` and the `checkDnsSetup()` refactor (with `dkim_next`/`dkim_previous`, manual reasons); `_rapidmx-verify` verification with the legacy apex transition (6.5); `DnsPublisher` + `NullDnsPublisher`; `BaseDnsDesiredStateRoute` (handshake, `/v1` desired state, status, operations) with the `v1` API types and the contract fixtures shared with dns-controller; `Domain.apexTxt` and `PUT /:id/apex-txt` if 9.4 is accepted.
+2. `DnsProvider` model, types registry, `BaseDnsProviderRoute`; `Domain` fields and `PUT /:id/dns-provider`; `DeploymentIdentity`; audit actions. (The queued `test`/`takeover` routes move to step 3, which brings the operations queue.)
+3. `POST system/dns-providers/:id/test` and `/:id/takeover`; `buildDesiredDnsRecords()` and the `checkDnsSetup()` refactor (with `dkim_next`/`dkim_previous`, manual reasons); `_rapidmx-verify` verification with the legacy apex transition (6.5); `DnsPublisher` + `NullDnsPublisher`; `BaseDnsDesiredStateRoute` (handshake, `/v1` desired state, status, operations) with the `v1` API types and the contract fixtures shared with dns-controller; `Domain.apexTxt` and `PUT /:id/apex-txt` if 9.4 is accepted.
 4. DKIM rotation: `DkimKeyProvider` additions, `Domain.dkimRotation`/`dkimManaged`, `DkimRotationJob`, rotate/cancel/pause routes.
 5. `IntegrationSettings` model and `BaseIntegrationsRoute`; `integrations` in `CORE_CONFIG_NAMESPACES`.
 6. `DomainSeeder` over `mail:domains`, `SetupState.seededDomains`, `Domain.origin`, `toStatus()` change; stale `mail:domains` comments corrected.
@@ -940,4 +962,4 @@ From JP, 2026-10-27:
 
 ## Status
 
-Design, revised 2026-10-27 (dedicated dns-controller project, versioned API, spike results, `_rapidmx-verify`). The dns-controller C1 skeleton exists in its own repository. restapi step 1 (`SecretStore`, `NullSecretStore`, `SecretRef`, the shared masks, `HostConfig`) is implemented; no server code yet.
+Design, revised 2026-10-27 (dedicated dns-controller project, versioned API, spike results, `_rapidmx-verify`). The dns-controller C1 skeleton exists in its own repository. restapi step 1 (`SecretStore`, `NullSecretStore`, `SecretRef`, the shared masks, `HostConfig`) and step 2 (`DnsProvider` with `BaseDnsProviderRoute` and the types registry, `Domain.dnsProviderUid`/`dnsPublication` with `PUT /:id/dns-provider`, `DeploymentIdentity`, the audit actions) are implemented; no server code yet. **Prerequisite of the server's bump to this restapi release, in the same change:** list `DnsProvider` and `DeploymentIdentity` in its Mongo and SQL model lists, register a `SecretStore` (`NullSecretStore` until its backends exist: the route injects one) and mount `system/dns-providers`. Without the model lists the domain route still boots (it logs a warning and answers an assignment to a provider with 503), but the DNS provider route can't be mounted.

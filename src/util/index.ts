@@ -27,6 +27,7 @@ export * from "./DeliveryFailureNoticeUtils.js";
 export * from "./DistributionListUtils.js";
 export * from "./DraftBodyRetentionUtils.js";
 export * from "./DnsSetupUtils.js";
+export * from "./DeploymentIdentityUtils.js";
 export * from "./DomainUtils.js";
 export * from "./DsnParser.js";
 export * from "./TimeZoneUtils.js";

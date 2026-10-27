@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { AuditLogEntryMongo, DomainMongo } from "../../mongo.js";
+import { AuditLogEntryMongo, DnsProviderMongo, DomainMongo } from "../../mongo.js";
 import { BaseDomainRoute } from "../BaseDomainRoute.js";
 const { Model } = RouteDecorators;
 
@@ -11,4 +11,5 @@ const { Model } = RouteDecorators;
 export class DomainRouteMongo extends BaseDomainRoute<DomainMongo> {
     protected readonly repoUtilsClass: any = RepoUtils;
     protected auditLogClass: any = AuditLogEntryMongo;
+    protected dnsProviderClass: any = DnsProviderMongo;
 }

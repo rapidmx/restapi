@@ -2230,6 +2230,130 @@ export enum AuditAction {
     MAILBOX_ACCESS_ADMIN_LIST = "mailbox_access.admin-list",
     /** Somebody other than the requester or the mailbox owner downloaded a data export (`GET /data-export/:id/download`). */
     DATA_EXPORT_DOWNLOADED = "data_export.downloaded",
+    /** `POST /system/dns-providers` - an elevated administrator added a DNS provider config. `details` carries its `name`, `type`, `zones`, the
+     * `optionKeys` set and `credentialsChanged`; never a credential. */
+    DNS_PROVIDER_CREATE = "dns_provider.create",
+    /** `PUT /system/dns-providers/:id` - `details` carries the `fields` that changed, the changed `optionKeys` and `credentialsChanged` (whether any
+     * credential was set or cleared); never a value of a credential. */
+    DNS_PROVIDER_UPDATE = "dns_provider.update",
+    /** `DELETE /system/dns-providers/:id` - `details` carries its `name`, `type` and `secretLeftBehind` when its credentials could not be removed from the
+     * secret store (no store, another backend, or the store failed). */
+    DNS_PROVIDER_DELETE = "dns_provider.delete",
+    /** `PUT /mail/domains/:id/dns-provider` - a domain was assigned to a DNS provider config or set back to manual. `details` carries `from` and `to` (provider
+     * uids, `null` for manual). */
+    DOMAIN_DNS_PROVIDER_ASSIGN = "domain.dns_provider_assign",
+    /** Records this deployment did not own were taken over at a DNS provider. `details` carries the provider, the record names and their old values. */
+    DNS_TAKEOVER = "dns.takeover",
+    /** A DKIM key rotation began. `details` carries the new selector and `reason` (`scheduled`, `manual` or `compromised`). */
+    DKIM_ROTATION_STARTED = "dkim_rotation.started",
+    /** Signing switched to a rotation's new selector. */
+    DKIM_ROTATION_SWITCHED = "dkim_rotation.switched",
+    /** A rotation's old selector was retired and its private key deleted. */
+    DKIM_ROTATION_RETIRED = "dkim_rotation.retired",
+    /** A rotation that had not switched yet was abandoned. */
+    DKIM_ROTATION_CANCELLED = "dkim_rotation.cancelled",
+    /** An Integrations section was changed. `details` carries the `section`, the changed keys and `secretChanged`; never a secret. */
+    INTEGRATION_UPDATE = "integration.update",
+    /** An Integrations section's admin values were reset to the deployment's. `details` carries the `section` and `keys`. */
+    INTEGRATION_RESET = "integration.reset",
+    /** A plugin's plaintext secret setting was moved into the secret store. `details` carries the plugin and the setting's key; never its value. */
+    PLUGIN_SECRET_MIGRATED = "plugin.secret_migrated",
+}
+
+/** The DNS hosting services a `DnsProvider` config can publish through (each an external-dns provider, see `dns/DnsProviderTypes.ts`). */
+export type DnsProviderType = "cloudflare" | "route53" | "rfc2136" | "google" | "azure";
+
+/** A non-secret option of a `DnsProvider`: text, a number, a switch, or a list of text (Cloudflare's zone ids, the rfc2136 server list). */
+export type DnsProviderOptionValue = string | number | boolean | string[];
+
+/**
+ * What the DNS controller last reported about one provider config's external-dns instance. Written only from the controller's status reports; never
+ * client-settable. Every field is optional: a provider the controller has not reported on yet has no status at all.
+ */
+export interface DnsProviderStatus {
+    /** When the controller sent the report this status came from. */
+    reportedAt?: Date;
+    /** The instance's Deployment: ready replicas (0 or 1), the image it runs, and when it last rolled out. */
+    readyReplicas?: number;
+    image?: string;
+    lastRolloutAt?: Date;
+    /** From the instance's metrics: when it last synced successfully, its error counters, and the records it skipped because another owner holds them. */
+    lastSyncAt?: Date;
+    registryErrors?: number;
+    sourceErrors?: number;
+    providerErrors?: number;
+    ownerMismatchRecords?: number;
+    /** The instance's last error, as the controller reported it (never a credential). */
+    lastError?: string;
+}
+
+/**
+ * A named, admin-managed configuration of one DNS hosting account, which publishes the records of the domains assigned to it (`Domain.dnsProviderUid`)
+ * through its own external-dns instance. Its credentials live in the deployment's `SecretStore`; the row holds only `secretRef`.
+ *
+ * Deny-all class ACL like every admin entity; `BaseDnsProviderRoute` (trusted role, elevation for every write) is the only way in.
+ */
+export interface DnsProvider extends BaseEntity {
+    /** Server-generated, stable and DNS-label-safe (lowercase letters, digits and hyphens, at most 40 characters). It names the external-dns
+     * Deployment, its Secret and its label value, so it never changes. */
+    uid: string;
+    /** Display name, unique (case-insensitive). */
+    name: string;
+    /** `name` in lowercase, under a unique index on both backends: what keeps names unique when two writes race. Server-set, never returned. */
+    nameKey: string;
+    type: DnsProviderType;
+    /** The zones (apex names) this config may publish into: external-dns's `--domain-filter`. At least one. A `Domain` may be assigned to this config only
+     * when its name is one of these or under one of them. */
+    zones: string[];
+    /** Non-secret, type-specific options, validated per type (`dns/DnsProviderTypes.ts`), with every default filled in. */
+    options: Record<string, DnsProviderOptionValue>;
+    /** Where the credentials are: a reference, never the value. Unset until credentials are saved (and for a type that can run without, such as Route 53
+     * with IRSA). `null` once cleared. */
+    secretRef?: SecretRef | null;
+    /** `"installer"` for the config the installer created, so the console can say where it came from; `"console"` for one added there. */
+    origin?: "installer" | "console";
+    /** Admin on/off. A disabled config's external-dns instance is scaled to zero; its records stay as they are. */
+    enabled: boolean;
+    /** Allow the takeover of records this deployment does not own yet in these zones. Default false. */
+    allowTakeover: boolean;
+    /** Written only from the DNS controller's status reports. */
+    status?: DnsProviderStatus | null;
+}
+
+/**
+ * One of the mail-related DNS record types a domain's setup is checked against (`checkDnsSetup()`). The two `autodiscover_*` types are only ever included
+ * while `@rapidmx/autodiscover-plugin` is active for this deployment.
+ */
+export type DnsRecordType = "ownership" | "mx" | "spf" | "dkim" | "dmarc" | "openpgpkey_cname" | "autodiscover_cname" | "autodiscover_srv";
+
+/** Whether one record a domain needs is published automatically, and if not, why. Same identity as a `DnsRecordCheck`: `type` and `recordName`. */
+export interface DnsRecordPublication {
+    type: DnsRecordType | "host_a" | "host_aaaa" | "host_cname";
+    recordName: string;
+    recordKind: "A" | "AAAA" | "CNAME" | "MX" | "TXT" | "SRV";
+    /** `"published"`: external-dns observed it and the live lookup sees it; `"pending"`: applied, not yet live; `"conflict"`: a record at this name exists
+     * that this deployment does not own; `"manual"`: the admin publishes it, see `manualReason`. */
+    state: "published" | "pending" | "conflict" | "manual";
+    manualReason?: "no_provider" | "kind_unsupported" | "outside_zones" | "apex_txt_unmanaged";
+}
+
+/** What the DNS controller and the live check last said about a domain's published records. Server-managed. */
+export interface DnsPublicationStatus {
+    /** The `DNSEndpoint` resources the controller last applied for this domain, and the generation external-dns has observed. */
+    endpoints: { name: string; generation: number; observedGeneration?: number }[];
+    records: DnsRecordPublication[];
+    lastReconciledAt?: Date;
+    lastError?: string;
+}
+
+/**
+ * This deployment's own identity, created once and never changed for the life of the database - a singleton row at `DEPLOYMENT_IDENTITY_UID`
+ * (`util/DeploymentIdentityUtils.ts`). `installationId` is the stable part of the external-dns owner id (`rapidmx-<installationId>`), so two deployments
+ * sharing a zone never claim each other's records.
+ */
+export interface DeploymentIdentity extends BaseEntity {
+    /** 16 random lowercase letters and digits. */
+    installationId: string;
 }
 
 /**
@@ -2307,6 +2431,13 @@ export interface Domain extends BaseEntity {
      * excluded from it.
      */
     aliasOf?: string;
+
+    /** The `DnsProvider` config publishing this domain's records; unset (or `null`) means manual - the admin publishes them by hand. Server-managed: set
+     * only through `PUT /:id/dns-provider` (trusted role and elevation, audited), which checks the provider's `zones` cover `name`. */
+    dnsProviderUid?: string | null;
+
+    /** What the DNS controller and the live check last said about this domain's published records. Server-managed. */
+    dnsPublication?: DnsPublicationStatus;
 }
 
 /**
