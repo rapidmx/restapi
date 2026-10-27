@@ -4,7 +4,15 @@
 ///////////////////////////////////////////////////////////////////////////////
 import crypto from "crypto";
 import semver from "semver";
-import { Plugin, PluginConfiguredSetting, PluginManifest, PluginSettingDefinition, PluginUi } from "../models/types.js";
+import {
+    Plugin,
+    PluginConfiguredSetting,
+    PluginManifest,
+    PluginSecretSettingRef,
+    PluginSettingDefinition,
+    PluginSettingValue,
+    PluginUi,
+} from "../models/types.js";
 import { parsePluginUi } from "./PluginUiUtils.js";
 
 /** The plugin contract version this library implements. A plugin whose manifest declares any other
@@ -514,6 +522,39 @@ export function isSecretSettingKey(key: string): boolean {
     return words.some((word, i) => SECRET_WORD.test(word) || (SECRET_PAIRS[word]?.has(words[i + 1]) ?? false));
 }
 
+/** Whether a setting is a secret, whose saved value is never sent to the browser and is kept in the `SecretStore` while the deployment has one: its key
+ * names one (`isSecretSettingKey()`), or the plugin's manifest says so (`secret: true`, or a `password` type) - the manifest is the plugin's own word for
+ * it, which a key like `private_key` or `dsn` can't give. */
+export function isSecretSetting(key: string, manifest?: Pick<PluginManifest, "settings">): boolean {
+    if (isSecretSettingKey(key)) {
+        return true;
+    }
+    const definition: PluginSettingDefinition | undefined = manifest?.settings?.find((setting) => setting.key === key);
+    return definition?.secret === true || (definition?.type as string | undefined) === "password";
+}
+
+/** The one key of what a plugin row holds in place of a secret setting's value (`PluginSecretSettingRef`, spec 5.4). */
+export const PLUGIN_SECRET_REF_KEY = "$secretRef";
+
+/** Whether `value` is exactly a secret setting's reference: an object whose only key is `$secretRef`, holding a whole `SecretRef`. Nothing a client sends
+ * is ever taken as one (`validatePluginSettings()` refuses an object), so no setting can be pointed at another secret. */
+export function isPluginSecretRef(value: unknown): value is PluginSecretSettingRef {
+    if (typeof value !== "object" || value === null || Array.isArray(value) || Object.keys(value).length !== 1) {
+        return false;
+    }
+    const ref: any = (value as any)[PLUGIN_SECRET_REF_KEY];
+    return (
+        typeof ref === "object" &&
+        ref !== null &&
+        (ref.backend === "openbao" || ref.backend === "kubernetes") &&
+        typeof ref.path === "string" &&
+        ref.path !== "" &&
+        Array.isArray(ref.keys) &&
+        ref.keys.every((key: unknown) => typeof key === "string") &&
+        typeof ref.generation === "number"
+    );
+}
+
 /** What a config store holds for `key`: nothing for an unset value, an empty one (which nothing treats as set) or one that
  * isn't text, a number or a flag. */
 function storedValue(store: { get?: (key: string) => unknown } | undefined, key: string): string | number | boolean | undefined {
@@ -556,13 +597,23 @@ export function configuredPluginSettings(config: any, manifest: PluginManifest):
  * Checks `values` against `manifest`'s setting definitions and returns only the declared keys. Throws an
  * `Error` whose message names the first invalid setting. A `null` value removes a saved value so the
  * plugin's own default applies.
+ *
+ * `kept` are the secret references the row already holds for settings the caller keeps (sent back as the mask, or carried to a new version): they are
+ * kept as they are and count as values. Only the caller can name them - a reference sent in `values` is an object, which no setting takes.
  */
 export function validatePluginSettings(
     manifest: PluginManifest,
     values: Record<string, unknown>,
-): Record<string, string | number | boolean> {
+    kept: Record<string, PluginSecretSettingRef> = {},
+): Record<string, PluginSettingValue> {
     const definitions: Map<string, PluginSettingDefinition> = new Map((manifest.settings ?? []).map((s) => [s.key, s]));
-    const result: Record<string, string | number | boolean> = {};
+    const result: Record<string, PluginSettingValue> = {};
+    for (const [key, ref] of Object.entries(kept)) {
+        if (!definitions.has(key)) {
+            throw new Error(`'${key}' is not a setting of this plugin.`);
+        }
+        result[key] = ref;
+    }
     for (const [key, value] of Object.entries(values)) {
         const definition: PluginSettingDefinition | undefined = definitions.get(key);
         if (!definition) {
@@ -622,11 +673,15 @@ function checkSettingValue(definition: PluginSettingDefinition, value: unknown):
  * plugins with the same settings, so a change message whose hash matches a copy's own is a no-op for it. An unset
  * integrity (`undefined`, or `null` as SQL reads it back) hashes the same. An uploaded plugin (`source: "upload"`, whose
  * integrity is the hash of the pack) also counts that it was uploaded; a registry plugin's entry is exactly what it was before
- * uploads existed, so the hash of a deployment without them doesn't change.
+ * uploads existed, so the hash of a deployment without them doesn't change. A secret setting held in the `SecretStore` counts by its reference (backend,
+ * path and generation, spec 5.4), never its value: a new value is written to a new path, so the plugins reload with it, and a kept one changes nothing.
  */
 export function computePluginStateHash(
     plugins: (Pick<Plugin, "name" | "packageVersion" | "enabled" | "settings"> & { integrity?: string | null; source?: string | null })[],
 ): string {
+    // Listed rather than hashed as stored, so the order a database gives the reference's fields in can't change the hash.
+    const settingForHash = (value: unknown): unknown =>
+        isPluginSecretRef(value) ? [PLUGIN_SECRET_REF_KEY, value.$secretRef.backend, value.$secretRef.path, value.$secretRef.generation] : value;
     const normalized = plugins
         .filter((plugin) => plugin.enabled)
         .map((plugin) => [
@@ -635,7 +690,7 @@ export function computePluginStateHash(
             plugin.integrity ?? null,
             Object.keys(plugin.settings ?? {})
                 .sort()
-                .map((key) => [key, plugin.settings[key]]),
+                .map((key) => [key, settingForHash(plugin.settings[key])]),
             ...(plugin.source === "upload" ? ["upload"] : []),
         ])
         .sort((a, b) => String(a[0]).localeCompare(String(b[0])));

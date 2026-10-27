@@ -12,7 +12,7 @@ import { Logger } from "@rapidrest/core";
 import { Repository } from "typeorm";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { PluginSQL } from "../../../src/models/sql/PluginSQL.js";
-import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
+import { InMemoryBlobStore, InMemorySecretStore, registerTestDoubles } from "../../testDoubles.js";
 import { pluginRouteSuite } from "../../plugins/pluginRouteSuite.js";
 import { pluginUploadSuite, UPLOAD_TEST_MAX_BYTES } from "../../plugins/pluginUploadSuite.js";
 
@@ -58,6 +58,7 @@ describe("Route:PluginSQL Tests", () => {
         updatePlugin: async (uid, fields) => {
             await pluginRepo.update({ uid }, fields);
         },
+        store: () => objectFactory.getInstance<InMemorySecretStore>("SecretStore")!,
     };
 
     pluginRouteSuite(context);

@@ -214,3 +214,23 @@ describe("BasePluginRoute uploads", () => {
         expect(blobStore.delete).not.toHaveBeenCalled();
     });
 });
+
+describe("BasePluginRoute secret settings without a secret store", () => {
+    const MANIFEST: any = { apiVersion: 1, displayName: "Vault", settings: [{ key: "mail:v:api_key", label: "API key", type: "string" }] };
+
+    it("keeps a secret setting on the row on a server that registers no store, as it did before the store existed", async () => {
+        const route = await newRoute({});
+        const undo: any[] = [];
+        expect(await route.storeSecretSettings("@rapidmx/vault", MANIFEST, { "mail:v:api_key": "s3cr3t" }, undo)).toEqual({ "mail:v:api_key": "s3cr3t" });
+        // Its undo step has nothing to remove, so it reads nothing either (this route has no repository to read).
+        expect(undo).toHaveLength(1);
+        await expect(undo[0]()).resolves.toBeUndefined();
+    });
+
+    it("never sends the missing store a reference to remove, only logs that it was left where it is", async () => {
+        const logger = { warn: vi.fn() };
+        const route = await newRoute({ logger });
+        await route.releaseSecrets([{ backend: "openbao", path: "plugins/rapidmx/vault/mail_v_api_key-0123456789abcdef", keys: ["value"], generation: 1 }]);
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("openbao"));
+    });
+});

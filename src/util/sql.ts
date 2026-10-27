@@ -3,3 +3,4 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 export * from "./sql/DomainSeederSQL.js";
+export * from "./sql/PluginSecretMigratorSQL.js";

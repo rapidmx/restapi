@@ -3,3 +3,4 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 export * from "./mongo/DomainSeederMongo.js";
+export * from "./mongo/PluginSecretMigratorMongo.js";

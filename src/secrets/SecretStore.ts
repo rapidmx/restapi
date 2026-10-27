@@ -10,10 +10,14 @@ import { SecretBackend, SecretRef } from "../models/types.js";
  *
  * This library defines the abstraction and the server registers the implementation under the DI token `"SecretStore"` (OpenBao KV when the deployment has
  * OpenBao, else Kubernetes Secrets written through the DNS controller), the same split as `BlobStore` and `DkimKeyProvider`. `NullSecretStore` is the default
- * and refuses to save (400), so a deployment without a store refuses credentials rather than keeping them anywhere else.
+ * and refuses to save (400), so a deployment without a store refuses credentials rather than keeping them anywhere else - with one exception: plugin
+ * secret settings, which a deployment without a store keeps on the plugin's row as it always has (the plugin route never writes them to `NullSecretStore`)
+ * until a store is registered and `PluginSecretMigrator` moves them (spec 5.4).
  *
  * Paths are namespaced by consumer: `dns/<provider uid>` (consumed only by external-dns, so the server can write them but never read them back),
- * `server/<name>` (the Giphy key, the registry token) and `plugins/<package>/<key>`.
+ * `server/<name>-<random>` (the Giphy key, the registry token: `integrationSecretPath()`) and `plugins/<package>/<key>-<random>` (plugin secret
+ * settings: `pluginSecretPath()`, at most 253 characters). Those two get a new path for every write, never one fixed path per setting, so a policy or a
+ * mapping for them covers the prefix.
  *
  * An implementation never puts a value in a log line or an error message.
  *

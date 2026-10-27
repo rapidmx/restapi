@@ -12,7 +12,7 @@ import { Logger } from "@rapidrest/core";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { PluginMongo } from "../../../src/models/mongo/PluginMongo.js";
-import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
+import { InMemoryBlobStore, InMemorySecretStore, registerTestDoubles } from "../../testDoubles.js";
 import { pluginRouteSuite } from "../../plugins/pluginRouteSuite.js";
 import { pluginUploadSuite, UPLOAD_TEST_MAX_BYTES } from "../../plugins/pluginUploadSuite.js";
 
@@ -64,6 +64,7 @@ describe("Route:PluginMongo Tests", () => {
         updatePlugin: async (uid, fields) => {
             await pluginRepo.updateOne({ uid }, { $set: fields });
         },
+        store: () => objectFactory.getInstance<InMemorySecretStore>("SecretStore")!,
     };
 
     pluginRouteSuite(context);

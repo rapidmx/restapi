@@ -3522,8 +3522,9 @@ export interface Plugin extends BaseEntity {
     /** The uid of the administrator who uploaded the pack. */
     uploadedByUserUid?: string;
 
-    /** Saved setting values, keyed by `PluginSettingDefinition.key`. */
-    settings: Record<string, string | number | boolean>;
+    /** Saved setting values, keyed by `PluginSettingDefinition.key`. A secret setting's value is in the `SecretStore` while the deployment has one, and the
+     * row holds only its reference (`PluginSecretSettingRef`, spec 5.4), which the server's plugin host resolves before loading the settings. */
+    settings: Record<string, PluginSettingValue>;
 
     /** A snapshot of the package's `rapidmx.plugin` block for `version`. */
     manifest: PluginManifest;
@@ -3628,6 +3629,17 @@ export interface SecretRef {
      * picked up without the value ever being compared. */
     generation: number;
 }
+
+/**
+ * What a plugin row holds in place of a secret setting's value once it is in the `SecretStore` (spec 5.4): the reference, never the value. The store keeps the
+ * value under `value` (as text), with `type` (`"number"` or `"boolean"`) when the setting isn't text.
+ */
+export interface PluginSecretSettingRef {
+    $secretRef: SecretRef;
+}
+
+/** A saved plugin setting: a value the plugin reads as it is, or the reference to a secret setting's value in the `SecretStore`. */
+export type PluginSettingValue = string | number | boolean | PluginSecretSettingRef;
 
 /** The sections of the admin console's Integrations (`BaseIntegrationsRoute`, `system/integrations`), each overriding some of the deployment's config keys. */
 export type IntegrationSectionName = "giphy" | "stun" | "signingCa" | "dnsResolver" | "pluginRegistry";

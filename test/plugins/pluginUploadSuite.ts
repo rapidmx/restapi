@@ -86,6 +86,7 @@ export function pluginUploadSuite(ctx: PluginUploadSuiteContext): void {
 
         beforeEach(async () => {
             await ctx.clear();
+            ctx.store().reset();
             resetPluginTestDoubles();
             publishFakePackage("@rapidmx/activesync", "1.0.0", { plugin: EAS_MANIFEST });
             user = { uid: uuid.v4(), roles: [], elevated: Date.now() };
@@ -199,6 +200,8 @@ export function pluginUploadSuite(ctx: PluginUploadSuiteContext): void {
                     enabled: false,
                 });
                 expect(saved.status).toBe(200);
+                const savedSecret = (await ctx.rows())[0].settings["mail:crm:api_key"];
+                expect(savedSecret.$secretRef.path).toMatch(/^plugins\/acme\/crm-plugin\/mail_crm_api_key-[0-9a-f]{16}$/);
                 publishedHashes.length = 0;
 
                 const v2 = pack("1.1.0", {
@@ -221,8 +224,10 @@ export function pluginUploadSuite(ctx: PluginUploadSuiteContext): void {
                 });
                 expect(JSON.stringify(replaced.body)).not.toContain("hunter2");
 
+                // The secret's reference is carried over as it is (spec 5.4): the value stays in the store, at the same path.
                 const [row] = await ctx.rows();
-                expect(row.settings["mail:crm:api_key"]).toBe("hunter2");
+                expect(row.settings["mail:crm:api_key"]).toEqual(savedSecret);
+                expect(ctx.store().secrets.get(savedSecret.$secretRef.path)).toEqual({ value: "hunter2" });
                 expect(row.uploadBlobKey).toBe(pluginUploadBlobKey(v2));
                 expect(await ctx.blobStore().exists(pluginUploadBlobKey(v1))).toBe(false);
                 expect(await ctx.blobStore().exists(pluginUploadBlobKey(v2))).toBe(true);
@@ -231,6 +236,32 @@ export function pluginUploadSuite(ctx: PluginUploadSuiteContext): void {
                 const audit = (await ctx.auditEntries()).filter((entry) => entry.action === AuditAction.PLUGIN_UPLOAD);
                 expect(audit.map((entry) => entry.details.replaced)).toEqual([false, true]);
                 expect(audit[1].details).toMatchObject({ packageVersion: "1.1.0", previousVersion: "1.0.0" });
+            });
+
+            it("checks a carried secret against the replacement's manifest, keeping it over a host-named default and refusing a value it no longer takes", async () => {
+                const created = await upload(pack("1.0.0"));
+                expect((await asAdmin(request(ctx.app()).put(`${ctx.baseUrl}/${created.body.uid}`)).send({ settings: { "mail:crm:api_key": "hunter2" } })).status).toBe(200);
+                const savedSecret = (await ctx.rows())[0].settings["mail:crm:api_key"];
+                const withKey = (over: Record<string, unknown>) => ({
+                    ...CRM_MANIFEST,
+                    settings: CRM_MANIFEST.settings.map((setting) => (setting.key === "mail:crm:api_key" ? { ...setting, ...over } : setting)),
+                });
+
+                // A default naming the host doesn't replace a saved secret, and a definition taking the same values keeps it unread.
+                const hosted = await upload(pack("1.1.0", { manifest: withKey({ default: "https://<host>/key" }) }), { query: "?replace=true" });
+                expect(hosted.status).toBe(200);
+                expect((await ctx.rows())[0].settings["mail:crm:api_key"]).toEqual(savedSecret);
+
+                const retyped = pack("1.2.0", { manifest: withKey({ type: "select", options: [{ value: "a", label: "A" }, { value: "b", label: "B" }] }) });
+                const refused = await upload(retyped, { query: "?replace=true" });
+                expect(refused.status).toBe(400);
+                expect(refused.body.message).toBe("'API key' must be one of: a, b.");
+                expect(JSON.stringify(refused.body)).not.toContain("hunter2");
+                const [row] = await ctx.rows();
+                expect(row.packageVersion).toBe("1.1.0");
+                expect(row.settings["mail:crm:api_key"]).toEqual(savedSecret);
+                expect(ctx.store().secrets.get(savedSecret.$secretRef.path)).toEqual({ value: "hunter2" });
+                expect(await ctx.blobStore().exists(pluginUploadBlobKey(retyped))).toBe(false);
             });
 
             it("fills in a host-named default a replacement declares, and refuses one that needs a setting nobody gave", async () => {

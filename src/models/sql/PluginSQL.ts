@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BaseEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
-import { Plugin, PluginManifest, PluginSource } from "../types.js";
+import { Plugin, PluginManifest, PluginSettingValue, PluginSource } from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Column, Entity, Index } = PersistenceDecorators;
@@ -79,8 +79,8 @@ export class PluginSQL extends BaseEntity implements Plugin {
     public uploadedByUserUid?: string;
 
     @Column({ type: "simple-json" })
-    @Description("Saved setting values, keyed by config key.")
-    public settings: Record<string, string | number | boolean> = {};
+    @Description("Saved setting values, keyed by config key; a secret setting as its secret store reference ({ \"$secretRef\": ... }) while the deployment has a store.")
+    public settings: Record<string, PluginSettingValue> = {};
 
     @Column({ type: "simple-json" })
     @Description("A snapshot of the package's plugin manifest for this version.")
