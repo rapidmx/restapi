@@ -14,14 +14,14 @@ import {
     type UpdateObject,
 } from "@rapidrest/service-core";
 import type { DkimKeyProvider } from "../dkim/DkimKeyProvider.js";
-import { DEFAULT_PUBLISH_TTL, domainEndpointSetId, publishTtl } from "../dns/DnsDesiredState.js";
+import { DEFAULT_PUBLISH_TTL, domainEndpointSetId, moreSpecificProvider, publishTtl } from "../dns/DnsDesiredState.js";
 import { notifyDnsPublisher, resolveDnsPublisher, type DnsPublisher } from "../dns/DnsPublisher.js";
 import { isDnsNoRecordsError, type DnsResolver } from "../dns/DnsResolver.js";
 import { isNameInZones } from "../dns/DnsProviderTypes.js";
 import { normalizeAddress } from "../util/AddressUtils.js";
 import { chooseApexSpf, normalizeApexTxtKeep, suggestApexTxtKeep } from "../util/ApexTxtUtils.js";
 import { AuditLogUtils } from "../util/AuditLogUtils.js";
-import { autodiscoverHostnameFor, findDnsOwnerId, isDomainEndpointObserved, queueDnsOperation } from "../util/DnsPublishingUtils.js";
+import { autodiscoverHostnameFor, findAllRows, findDnsOwnerId, isDomainEndpointObserved, queueDnsOperation } from "../util/DnsPublishingUtils.js";
 import {
     configNumber,
     DEFAULT_DKIM_ROTATION_INTERVAL_DAYS,
@@ -37,7 +37,7 @@ import {
     type DkimRotationCaller,
     type DkimRotationContext,
 } from "../util/DkimRotationUtils.js";
-import { checkDnsSetup, type DnsRecordCheck } from "../util/DnsSetupUtils.js";
+import { checkDnsSetup, DEFAULT_SPF_VALUE, providerKeepsTxt, type DnsRecordCheck } from "../util/DnsSetupUtils.js";
 import { DEFAULT_ACCEPT_LEGACY_APEX, findDomainVerification, type DomainVerificationResult } from "../util/DomainVerificationUtils.js";
 import { prepareNewDomain, validateDmarcPolicy, validateDomainAliasOf } from "../util/DomainUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
@@ -495,7 +495,9 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
      * Assigns the domain to a DNS provider config (`{ dnsProviderUid: "<uid>" }`), whose external-dns instance then publishes its records, or sets it
      * back to manual (`{ dnsProviderUid: null }`): the admin publishes them by hand. A trusted role AND an elevated token (`assertAdminScope()`) - this
      * decides who can change the domain's public DNS records - and audited (`DOMAIN_DNS_PROVIDER_ASSIGN`, from and to). The provider must exist and its
-     * `zones` must cover the domain's name (400 otherwise). Assigning the provider it already has changes nothing.
+     * `zones` must cover the domain's name, and no other config's zones may cover it more specifically (400 otherwise): an external-dns instance leaves
+     * out the zones other configs nest under its own, so a domain assigned to the parent would never be published. Assigning the provider it already has
+     * changes nothing.
      *
      * A provider deleted, or its zones narrowed, at the same moment can leave an assignment the provider no longer covers; that is harmless, since
      * external-dns publishes only inside its zones, and the desired state treats such an assignment as manual.
@@ -530,6 +532,16 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
             }
             if (!isNameInZones(domain.name, provider.zones)) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${domain.name}' is not in the zones of DNS provider '${provider.name}' (${provider.zones.join(", ")}).`);
+            }
+            // Only the config whose zone covers the name most specifically: an instance leaves out the zones other configs nest under its own (spec 7.4), so a
+            // domain assigned to the parent of a nested zone would never be published. Disabled configs count too, as their zones are left out all the same.
+            const covering: DnsProvider | undefined = moreSpecificProvider(domain.name, provider, await findAllRows<DnsProvider>(this.dnsProviderRepo, {}));
+            if (covering) {
+                throw new ApiError(
+                    ApiErrors.INVALID_REQUEST,
+                    400,
+                    `'${domain.name}' is covered more specifically by the zones of DNS provider '${covering.name}' (${covering.zones.join(", ")}) - assign it there instead.`,
+                );
             }
         }
         // What the old provider's controller reported no longer says anything about the records of the new assignment.
@@ -653,7 +665,8 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
      * answered: opting in on an apex wrongly taken for empty would delete what is there). The SPF value published is the existing SPF record verbatim
      * when it already authorizes the MX hosts (`mx`), else `v=spf1 mx ~all`; with it, every value of `keep` (SPF refused, ownership tokens dropped). A
      * takeover of the set is queued for the controller (the set isn't owned yet), and the opt-in is audited as `DNS_TAKEOVER` with the values that were
-     * there.
+     * there. A 400 when the provider can't keep the set (`providerKeepsTxt()`), here and when editing: Azure keeps one value per name, so it takes
+     * no `keep`, and rfc2136 can't keep an SPF value at all. Opting out is never refused.
      * - **Editing** `keep` while managed bumps the desired state; audited as `DOMAIN_APEX_TXT_UPDATE`.
      * - **Opting out** releases the set and queues the restore of the SPF value and the kept values as unowned records, so the domain keeps its SPF
      * record; audited as `DOMAIN_APEX_TXT_UPDATE`. The kept values stay on the row so the console can show what was restored.
@@ -702,6 +715,16 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         const provider: DnsProvider | undefined = await this.findAssignedProvider(domain);
         if (!provider || !isNameInZones(domain.name, provider.zones)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Assign this domain to a DNS provider covering it before RapidMX manages its apex TXT records.");
+        }
+        // The set is [SPF, ...keep]; any SPF value has a space, which is all rfc2136's rule looks at, so the default stands in for the one chosen below.
+        if (!providerKeepsTxt(provider.type, [(wasManaged && domain.apexTxt!.spf) || DEFAULT_SPF_VALUE, ...keep])) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                400,
+                provider.type === "azure"
+                    ? "An Azure DNS provider keeps only one value per TXT name, so RapidMX can't manage the root TXT records with values to keep. Manage this domain's root TXT records by hand, or opt in with no values to keep."
+                    : `A ${provider.type} DNS provider can't keep the SPF value (or a kept value) among the root TXT records, so RapidMX can't manage them. Manage this domain's root TXT records by hand.`,
+            );
         }
         if (wasManaged) {
             const updated: T = await this.saveApexTxt(domain, { ...domain.apexTxt!, keep }, user);

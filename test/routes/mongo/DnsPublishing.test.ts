@@ -13,7 +13,8 @@ import { DnsOperationMongo } from "../../../src/models/mongo/DnsOperationMongo.j
 import { DnsProviderMongo } from "../../../src/models/mongo/DnsProviderMongo.js";
 import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
 import { DomainRouteMongo } from "../../../src/routes/mongo/DomainRouteMongo.js";
-import { InMemoryDnsPublisher, InMemorySecretStore, registerTestDoubles, StaticDnsResolver } from "../../testDoubles.js";
+import { InMemoryDnsPublisher, registerTestDoubles, StaticDnsResolver } from "../../testDoubles.js";
+import type { ConfigCipher } from "../../../src/secrets/ConfigCipher.js";
 import { dnsPublishingSuite } from "../dnsPublishingSuite.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({ instance: { port: 9999, dbName: "rrst-test" } });
@@ -47,7 +48,7 @@ describe("Route:DnsPublishingMongo Tests", () => {
         config,
         app: () => server.getApplication(),
         prefix: "/mongo",
-        store: () => objectFactory.getInstance<InMemorySecretStore>("SecretStore")!,
+        cipher: () => objectFactory.getInstance<ConfigCipher>("ConfigCipher")!,
         publisher: () => objectFactory.getInstance<InMemoryDnsPublisher>("DnsPublisher")!,
         resolver: () => objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!,
         clear: async () => {
@@ -61,6 +62,9 @@ describe("Route:DnsPublishingMongo Tests", () => {
         },
         domainRow: async (uid) => await repos.DomainMongo.findOne({ uid } as any),
         providerRow: async (uid) => await repos.DnsProviderMongo.findOne({ uid } as any),
+        updateProviderRow: async (uid, fields) => {
+            await repos.DnsProviderMongo.updateOne({ uid } as any, { $set: fields });
+        },
         operationRows: async () => (await repos.DnsOperationMongo.find({}).toArray()).sort((a: any, b: any) => +new Date(a.dateCreated) - +new Date(b.dateCreated)),
         auditEntries: async () => await repos.AuditLogEntryMongo.find({}).toArray(),
         newDomainRoute: async (name) => await objectFactory.newInstance(DomainRouteMongo, { name }),

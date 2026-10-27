@@ -7,6 +7,7 @@
 // tested over HTTP on both backends in test/routes/dnsPublishingSuite.ts.
 import { RepoUtils } from "@rapidrest/service-core";
 import { NullDnsPublisher } from "../../src/dns/NullDnsPublisher.js";
+import { ConfigSecretUnavailableError } from "../../src/secrets/ConfigCipher.js";
 import { BaseDnsDesiredStateRoute } from "../../src/routes/BaseDnsDesiredStateRoute.js";
 import { BaseDnsProviderRoute } from "../../src/routes/BaseDnsProviderRoute.js";
 import { BaseDomainRoute } from "../../src/routes/BaseDomainRoute.js";
@@ -317,5 +318,99 @@ describe("DnsPublishingUtils", () => {
         const queued: any = await queueDnsOperation(repo as any, Operation, { type: "test", providerUid: "p", domainUid: undefined, requestedBy: undefined });
         expect(queued).toEqual({ uid: expect.any(String), state: "queued", type: "test", providerUid: "p" });
         expect("domainUid" in queued).toBe(false);
+    });
+});
+
+describe("BaseDnsDesiredStateRoute providerCredentials()", () => {
+    const envelope = (ct: string) => ({ $enc: 1 as const, kid: "k1", iv: "aXY=", ct, tag: "dGFn" });
+    const subject = "system:serviceaccount:mail:mail-dns-controller";
+    const req: any = { headers: { authorization: "Bearer controller-token" } };
+
+    /** A route that accepts the controller's token, over a provider repo answering `provider`, with a cipher that opens `ct` as `plain-<ct>` except for "bad". */
+    function routeFor(provider: any): { route: any; res: any; logger: any } {
+        const route: any = new TestDesiredStateRoute();
+        const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+        Object.defineProperty(route, "logger", { value: logger, configurable: true, writable: true });
+        route.controllerSubject = subject;
+        route.tokenVerifier = { verify: vi.fn(async () => ({ subject })) };
+        route.providerRepo = { findOne: vi.fn(async () => provider) };
+        route.cipher = {
+            decryptString: vi.fn((e: any) => {
+                if (e.ct === "bad") {
+                    throw new ConfigSecretUnavailableError("DnsProvider", "aws-x", "credentials.x", "failed", "the value was changed");
+                }
+                return `plain-${e.ct}`;
+            }),
+        };
+        return { route, res: { setHeader: vi.fn() }, logger };
+    }
+    const aws = (credentials: any, credentialsGeneration: number = 2) => ({ uid: "aws-x", credentials, credentialsGeneration });
+
+    it("reads the row afresh, answers the decrypted values uncached, and logs only the provider and generation", async () => {
+        const { route, res, logger } = routeFor(aws({ accessKeyId: envelope("a"), secretAccessKey: envelope("b") }));
+        const answer = await route.providerCredentials("aws-x", req, res);
+        expect(answer).toEqual({
+            apiVersion: "dns.rapidmx.io/v1",
+            kind: "DnsProviderCredentials",
+            providerUid: "aws-x",
+            generation: 2,
+            values: { accessKeyId: "plain-a", secretAccessKey: "plain-b" },
+        });
+        expect(route.providerRepo.findOne).toHaveBeenCalledWith("aws-x", { ignoreACL: true, skipCache: true });
+        expect(res.setHeader).toHaveBeenCalledWith("cache-control", "no-store");
+        expect(logger.info).toHaveBeenCalledTimes(1);
+        expect(logger.info).toHaveBeenCalledWith(expect.stringContaining("'aws-x' at generation 2"));
+        expect(JSON.stringify([logger.info.mock.calls, logger.warn.mock.calls, logger.error.mock.calls])).not.toContain("plain-");
+    });
+
+    it("refuses a caller that isn't the controller, before reading anything", async () => {
+        const { route, res } = routeFor(aws({}));
+        route.tokenVerifier = { verify: vi.fn(async () => Promise.reject(new Error("bad signature"))) };
+        await expect(route.providerCredentials("aws-x", req, res)).rejects.toMatchObject({ status: 403 });
+        expect(route.providerRepo.findOne).not.toHaveBeenCalled();
+        expect(res.setHeader).not.toHaveBeenCalled();
+    });
+
+    it("answers 404 for a config that is gone", async () => {
+        const { route, res } = routeFor(undefined);
+        await expect(route.providerCredentials("gone", req, res)).rejects.toMatchObject({ status: 404 });
+    });
+
+    it("answers empty values at generation 0 for a row that never had credentials, without needing a cipher", async () => {
+        const { route, res } = routeFor({ uid: "irsa" });
+        route.cipher = undefined;
+        expect(await route.providerCredentials("irsa", req, res)).toEqual({ apiVersion: "dns.rapidmx.io/v1", kind: "DnsProviderCredentials", providerUid: "irsa", generation: 0, values: {} });
+        const cleared = routeFor(aws(null, 3));
+        cleared.route.cipher = undefined;
+        expect((await cleared.route.providerCredentials("aws-x", req, cleared.res)).generation).toBe(3);
+    });
+
+    it("answers 503 for credentials it has no cipher to read", async () => {
+        const { route, res } = routeFor(aws({ accessKeyId: envelope("a") }));
+        route.cipher = undefined;
+        await expect(route.providerCredentials("aws-x", req, res)).rejects.toMatchObject({ status: 503 });
+        expect(res.setHeader).not.toHaveBeenCalled();
+    });
+
+    it("names a credential it can't read, warning once per field however often it is asked, and never says what was in it", async () => {
+        const { route, res, logger } = routeFor(aws({ accessKeyId: envelope("a"), secretAccessKey: envelope("bad") }));
+        const first = await route.providerCredentials("aws-x", req, res);
+        expect(first.values).toEqual({ accessKeyId: "plain-a" });
+        expect(first.unreadable).toEqual(["secretAccessKey"]);
+        await route.providerCredentials("aws-x", req, res);
+        expect(logger.warn).toHaveBeenCalledTimes(1);
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("'secretAccessKey' of DNS provider 'aws-x'"));
+        // Another field of it is another warning.
+        const other = routeFor(aws({ accessKeyId: envelope("bad"), secretAccessKey: envelope("bad") }));
+        await other.route.providerCredentials("aws-x", req, other.res);
+        expect(other.logger.warn).toHaveBeenCalledTimes(2);
+    });
+
+    it("doesn't hide a failure that isn't an unreadable credential", async () => {
+        const { route, res } = routeFor(aws({ accessKeyId: envelope("a") }));
+        route.cipher.decryptString = vi.fn(() => {
+            throw new TypeError("cipher is broken");
+        });
+        await expect(route.providerCredentials("aws-x", req, res)).rejects.toThrow("cipher is broken");
     });
 });

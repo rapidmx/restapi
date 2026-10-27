@@ -44,7 +44,7 @@ export interface DnsProviderOptionSpec {
     check?: (value: string) => boolean;
 }
 
-/** One credential field of a provider type: written to the secret store, never stored or returned. */
+/** One credential field of a provider type: saved encrypted on the provider's row, never returned. */
 export interface DnsProviderSecretFieldSpec {
     key: string;
     label: string;
@@ -525,6 +525,6 @@ export function assertDnsProviderSecretValues(spec: DnsProviderTypeSpec, patch: 
 export function assertDnsProviderCredentials(spec: DnsProviderTypeSpec, options: Record<string, DnsProviderOptionValue>, keys: readonly string[]): void {
     const problem: string | undefined = spec.checkCredentials(options, keys);
     if (problem) {
-        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `${problem} Credentials are saved in the secret store and never shown again.`);
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `${problem} Credentials are saved encrypted and never shown again.`);
     }
 }

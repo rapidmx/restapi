@@ -14,13 +14,17 @@ import {
     normalizePublishHosts,
     providerForName,
     publishTtl,
+    toDnsProviderV1,
     type DesiredStateInput,
 } from "../../src/dns/DnsDesiredState.js";
-import type { DnsOperation, DnsProvider, Domain } from "../../src/models/types.js";
+import type { ConfigEnvelope, DnsOperation, DnsProvider, Domain } from "../../src/models/types.js";
 
 function fixture(name: string): any {
     return JSON.parse(readFileSync(new URL(`../fixtures/dns-api/v1/${name}.json`, import.meta.url), "utf8"));
 }
+
+/** What the desired state needs of an envelope is that the field has one: its name, never anything inside it. */
+const ENVELOPE: ConfigEnvelope = { $enc: 1, kid: "k1", iv: "iv", ct: "ct", tag: "tag" };
 
 function provider(fields: Partial<DnsProvider> = {}): DnsProvider {
     return {
@@ -30,7 +34,8 @@ function provider(fields: Partial<DnsProvider> = {}): DnsProvider {
         type: "cloudflare",
         zones: ["example.com"],
         options: { zoneIds: ["0123456789abcdef0123456789abcdef"] },
-        secretRef: { backend: "openbao", path: "dns/cloudflare-main", keys: ["apiToken"], generation: 1 },
+        credentials: { apiToken: ENVELOPE },
+        credentialsGeneration: 1,
         enabled: true,
         allowTakeover: false,
         ...fields,
@@ -159,9 +164,9 @@ describe("DNS desired state", () => {
         it("leaves out MX and SRV on rfc2136, records not configured yet, and SPF unless the apex TXT set is managed", () => {
             const rfc = provider({ type: "rfc2136", options: { hosts: ["ns1.example.com"], zone: "example.com" } });
             const types = (records: { recordType: string; dnsName: string }[]) => records.map((r) => `${r.recordType} ${r.dnsName}`);
+            // The DMARC value isn't one plain character-string, which rfc2136 could never update or delete (4.2), so it is manual too.
             expect(types(domainDnsRecordsV1(domain(), rfc, { ...ctx, autodiscoverHostname: "mail.example.com" }))).toEqual([
                 "TXT _rapidmx-verify.example.com",
-                "TXT _dmarc.example.com",
                 "CNAME openpgpkey.example.com",
                 "CNAME autodiscover.example.com",
             ]);
@@ -170,11 +175,57 @@ describe("DNS desired state", () => {
             expect(domainDnsRecordsV1(managed, provider(), { mxHostname: "", ttl: 300 }).map((r) => r.recordType)).not.toContain("MX");
         });
 
+        it("leaves out the TXT records Azure can't keep (a name with several values) and rfc2136 can't (a value that isn't one plain character-string)", () => {
+            const targets = (records: { recordType: string; dnsName: string }[]) => records.map((r) => `${r.recordType} ${r.dnsName}`);
+            const keeping = domain({ dkimSelector: "mail", dkimPublicKey: "KEY", apexTxt: { managed: true, keep: ["ms=1"], spf: "v=spf1 mx ~all" } });
+            const azure = provider({ type: "azure", options: { tenantId: "t", subscriptionId: "s", resourceGroup: "rg" } });
+            // The managed apex set holds two values, which Azure writes and reads only the first of: the whole record is manual, the rest publishes.
+            expect(targets(domainDnsRecordsV1(keeping, azure, ctx))).toEqual([
+                "TXT _rapidmx-verify.example.com",
+                "MX example.com",
+                "TXT mail._domainkey.example.com",
+                "TXT _dmarc.example.com",
+                "CNAME openpgpkey.example.com",
+            ]);
+            // Without kept values the set is one value, which Azure keeps.
+            const alone = domain({ apexTxt: { managed: true, keep: [], spf: "v=spf1 mx ~all" } });
+            expect(domainDnsRecordsV1(alone, azure, ctx)).toContainEqual({ dnsName: "example.com", recordType: "TXT", targets: ["v=spf1 mx ~all"], ttl: 300 });
+
+            // rfc2136 keeps the ownership value, one plain character-string, and no SPF, DKIM or DMARC record, nor a value over 255 bytes.
+            const rfc = provider({ type: "rfc2136", options: { hosts: ["ns1.example.com"], zone: "example.com" } });
+            expect(targets(domainDnsRecordsV1(keeping, rfc, ctx))).toEqual(["TXT _rapidmx-verify.example.com", "CNAME openpgpkey.example.com"]);
+            const plain = domain({ apexTxt: { managed: true, keep: ["ms=1"], spf: "plain-spf" } });
+            expect(domainDnsRecordsV1(plain, rfc, ctx)).toContainEqual({ dnsName: "example.com", recordType: "TXT", targets: ["plain-spf", "ms=1"], ttl: 300 });
+            const long = domain({ apexTxt: { managed: true, keep: ["x".repeat(256)], spf: "plain-spf" } });
+            expect(domainDnsRecordsV1(long, rfc, ctx).map((r) => r.dnsName)).not.toContain("example.com");
+        });
+
         it("raises the TTL to Cloudflare's minimum", () => {
             expect(publishTtl("cloudflare", 60)).toBe(120);
             expect(publishTtl("cloudflare", 300)).toBe(300);
             expect(publishTtl("route53", 60)).toBe(60);
             expect(domainDnsRecordsV1(domain(), provider(), { mxHostname: "", ttl: 30 })[0].ttl).toBe(120);
+        });
+    });
+
+    describe("a provider config's credentials", () => {
+        it("names the saved fields and their generation, never a value, and none for a config without credentials", () => {
+            expect(toDnsProviderV1(provider())).toEqual({
+                uid: "cloudflare-main",
+                type: "cloudflare",
+                zones: ["example.com"],
+                options: { zoneIds: ["0123456789abcdef0123456789abcdef"] },
+                credentials: { keys: ["apiToken"], generation: 1 },
+                enabled: true,
+            });
+            const aws = provider({ type: "route53", credentials: { secretAccessKey: ENVELOPE, accessKeyId: ENVELOPE }, credentialsGeneration: 4 });
+            expect(toDnsProviderV1(aws).credentials).toEqual({ keys: ["accessKeyId", "secretAccessKey"], generation: 4 });
+            expect(JSON.stringify(toDnsProviderV1(aws))).not.toContain("iv");
+            for (const none of [{ credentials: null, credentialsGeneration: 2 }, { credentials: {} }, { credentials: undefined }]) {
+                expect(toDnsProviderV1(provider(none)), JSON.stringify(none)).not.toHaveProperty("credentials");
+            }
+            // A config that never had credentials is at generation 0.
+            expect(toDnsProviderV1(provider({ credentials: { apiToken: ENVELOPE }, credentialsGeneration: undefined })).credentials?.generation).toBe(0);
         });
     });
 
@@ -213,7 +264,7 @@ describe("DNS desired state", () => {
         it("publishes a domain only through an existing provider covering it, disabled domains and providers included", () => {
             const state = buildDesiredState(
                 input({
-                    providers: [provider(), provider({ uid: "off", zones: ["off.com"], enabled: false, secretRef: null })],
+                    providers: [provider(), provider({ uid: "off", zones: ["off.com"], enabled: false, credentials: null, credentialsGeneration: 2 })],
                     domains: [
                         domain(),
                         domain({ uid: "manual.com", name: "manual.com", dnsProviderUid: null }),

@@ -6,8 +6,9 @@
 // method here is defined relative to that.
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, HttpRequest, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { DEFAULT_PUBLISH_TTL, domainDnsRecordsV1, domainEndpointSetId, domainProvider } from "../dns/DnsDesiredState.js";
+import { DEFAULT_PUBLISH_TTL, domainDnsRecordsV1, domainEndpointSetId, domainProvider, zoneCoverage } from "../dns/DnsDesiredState.js";
 import type { DnsRecordV1 } from "../dns/DnsDesiredStateApiV1.js";
+import { noConfigCipher, savedCredentialKeys, sealDnsCredentials } from "../dns/DnsProviderCredentials.js";
 import { notifyDnsPublisher, resolveDnsPublisher, type DnsPublisher } from "../dns/DnsPublisher.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import {
@@ -23,8 +24,8 @@ import {
     type DnsProviderTypeInfo,
     type DnsProviderTypeSpec,
 } from "../dns/DnsProviderTypes.js";
+import type { ConfigCipher } from "../secrets/ConfigCipher.js";
 import { maskCredentials, toSecretPatch, type SecretMask } from "../secrets/SecretMask.js";
-import type { SecretStore } from "../secrets/SecretStore.js";
 import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import {
     autodiscoverHostnameFor,
@@ -40,6 +41,7 @@ import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/Mai
 import { assertNoPathKeys, isDuplicateKeyError } from "../util/RequestBodyUtils.js";
 import {
     AuditAction,
+    ConfigEnvelope,
     DnsControllerState,
     DnsOperation,
     DnsProvider,
@@ -48,7 +50,6 @@ import {
     DnsProviderType,
     DnsRecordType,
     Domain,
-    SecretRef,
 } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Delete, Get, Param, Post, Put, Request, RequiresTrustedRole, User: AuthUser } = RouteDecorators;
@@ -82,7 +83,7 @@ function mapNameTaken(err: any): any {
 // eslint-disable-next-line no-control-regex -- matching control characters is the point.
 const CONTROL_CHARACTER: RegExp = /[\u0000-\u001f\u007f-\u009f]/;
 
-/** The wire shape of a `DnsProvider`: its credentials only as masks (one per key saved), never its `SecretRef`, plus how many domains it publishes. */
+/** The wire shape of a `DnsProvider`: its credentials only as masks (one per key saved), never an envelope, plus how many domains it publishes. */
 export interface PublicDnsProvider {
     uid: string;
     name: string;
@@ -156,17 +157,6 @@ function keysAfterPatch(saved: readonly string[], patch: Record<string, string |
     return [...keys].sort();
 }
 
-/** Whether `a` and `b` are the same reference (both unset counts as the same). */
-function sameSecretRef(a: SecretRef | null | undefined, b: SecretRef | null | undefined): boolean {
-    return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
-}
-
-/** What `saveCredentials()` did: the reference to save on the row, and whether credentials it replaced were left in a backend this deployment doesn't use. */
-interface SavedCredentials {
-    secretRef: SecretRef | null;
-    secretLeftBehind: boolean;
-}
-
 /** The option keys whose value differs between `before` and `after`. */
 function changedOptionKeys(before: Record<string, DnsProviderOptionValue>, after: Record<string, DnsProviderOptionValue>): string[] {
     const keys: Set<string> = new Set([...Object.keys(before), ...Object.keys(after)]);
@@ -178,11 +168,12 @@ function changedOptionKeys(before: Record<string, DnsProviderOptionValue>, after
  *
  * - `GET /types` the provider types, their options, credential fields and whether they are live-tested: what the console's form is built from.
  * - `GET /` and `GET /:id` the configs, credentials shown only as masks (one per key saved), with the number of domains assigned to each.
- * - `POST /` creates one. Credentials are written to the `SecretStore` before the row, at `dns/<uid>`, so the row only ever holds the reference; with no
- * store (`NullSecretStore`) saving credentials is a 400.
- * - `PUT /:id` changes one. Credentials are write-only: a field sent as the mask, or not sent, is kept; `null` clears it. `type` never changes, and the
- * zones can't be narrowed while a domain assigned to the config would fall outside them (409).
- * - `DELETE /:id` removes one: 409 while any domain is assigned to it; its credentials are removed from the store after the row.
+ * - `POST /` creates one. Credentials are encrypted (`ConfigCipher`, bound to the row and the field) and saved in the row's own write, with
+ * `credentialsGeneration` 1; without a keyring, saving credentials is a 503. A zone another config has is a 409.
+ * - `PUT /:id` changes one, in one versioned write of the row: a write that loses a race is a 409 and changes nothing. Credentials are write-only: a field
+ * sent as the mask, or not sent, is kept; `null` clears it (`credentials` is `null` once none is left); any change bumps `credentialsGeneration`. `type`
+ * never changes, the zones can't be narrowed while a domain assigned to the config would fall outside them, and can't take one another config has or cover a domain assigned to another config more specifically (409).
+ * - `DELETE /:id` removes one: 409 while any domain is assigned to it; its credentials go with the row.
  *
  * **Access:** reads need a trusted role, every write a trusted role AND an elevated token (`assertAdminScope()`): credentials that can edit a zone can
  * redirect its mail. Every write is audited with the keys that changed, never a credential's value.
@@ -220,9 +211,9 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
     @Config("mail:security:elevation_max_age_seconds", DEFAULT_ELEVATION_MAX_AGE_SECONDS)
     protected elevationMaxAgeSeconds: number = DEFAULT_ELEVATION_MAX_AGE_SECONDS;
 
-    /** Where credentials go. The server registers OpenBao or Kubernetes Secrets; `NullSecretStore` refuses to save any. */
-    @Inject("SecretStore")
-    private secretStore?: SecretStore;
+    /** Encrypts the credentials the row holds. Unset on a server that registers none: saving a credential is then a 503. */
+    @Inject("ConfigCipher")
+    protected cipher?: ConfigCipher;
 
     @Logger
     private logger: any;
@@ -318,6 +309,62 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
         }
     }
 
+    /**
+     * A 409 when another config (not `exceptUid`) already has one of `zones`. The DNS controller refuses a desired state in which two configs list one zone
+     * (two external-dns instances could not be told apart there), which would stall every config's publishing, so the admin learns it here. Zones that
+     * nest (`mail.example.com` under `example.com`) are different zones and fine.
+     */
+    private async assertZonesFree(zones: readonly string[], exceptUid?: string): Promise<void> {
+        const all: T[] = await findAllRows<T>(this.repo!, {});
+        for (const other of all) {
+            const shared: string | undefined = other.uid === exceptUid ? undefined : zones.find((zone) => other.zones.includes(zone));
+            if (shared) {
+                throw new ApiError(
+                    ApiErrors.IDENTIFIER_EXISTS,
+                    409,
+                    `The zone '${shared}' is already used by the DNS provider '${other.name}' - a zone belongs to one DNS provider only.`,
+                );
+            }
+        }
+    }
+
+    /**
+     * A 409 when `zones` (the zones a create or update adds) would cover a domain assigned to another config more specifically than that config's own zones:
+     * the new config's instance would take the zone over, and the other's leaves it out (7.4), so the domain's records would be deleted and nothing would
+     * publish them again until it is assigned to this config, which the assignment route accepts only once the config has the zone. Assigned domains whose
+     * config no longer covers them are manual already and left alone.
+     */
+    private async assertNoAssignedDomainTaken(zones: readonly string[], uid?: string): Promise<void> {
+        if (zones.length === 0) {
+            return;
+        }
+        for (const other of await findAllRows<T>(this.repo!, {})) {
+            if (other.uid === uid) {
+                continue;
+            }
+            const assigned: Domain[] = await findAllRows<Domain>(this.domainRepo!, { dnsProviderUid: other.uid });
+            const taken: Domain | undefined = assigned.find((domain) => {
+                const current: number = zoneCoverage(domain.name, other.zones);
+                return current >= 0 && zoneCoverage(domain.name, zones) > current;
+            });
+            if (taken) {
+                throw new ApiError(
+                    ApiErrors.IDENTIFIER_EXISTS,
+                    409,
+                    `'${taken.name}' is assigned to the DNS provider '${other.name}' but the zones to add cover it more specifically - set it to manual first, then assign it to this DNS provider.`,
+                );
+            }
+        }
+    }
+
+    /** The cipher, or a 503 on a server that has none. */
+    private requireCipher(): ConfigCipher {
+        if (!this.cipher) {
+            throw noConfigCipher();
+        }
+        return this.cipher;
+    }
+
     private toPublic(provider: T, domainCount: number): PublicDnsProvider {
         return {
             uid: provider.uid,
@@ -325,8 +372,7 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
             type: provider.type,
             zones: [...provider.zones],
             options: { ...provider.options },
-            // The reference lists the fields that are set; R2 replaces it with the row's own `credentials` envelopes.
-            credentials: maskCredentials(Object.fromEntries((provider.secretRef?.keys ?? []).map((key) => [key, true]))),
+            credentials: maskCredentials(provider.credentials),
             ...(provider.origin ? { origin: provider.origin } : {}),
             enabled: provider.enabled,
             allowTakeover: provider.allowTakeover,
@@ -399,20 +445,31 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
         }
         assertDnsProviderCredentials(spec, options, Object.keys(values));
         await this.assertNameFree(name);
+        await this.assertZonesFree(zones);
+        await this.assertNoAssignedDomainTaken(zones);
 
         const uid: string = newDnsProviderUid(name);
-        // The store first: a row never points at credentials that weren't saved. Route 53 with IRSA and unsigned rfc2136 need none, and no store.
-        const secretRef: SecretRef | undefined = Object.keys(values).length > 0 ? await this.secretStore!.write(`dns/${uid}`, values) : undefined;
+        // Encrypted before anything is written, so a server without a keyring (503) changes nothing. The credentials go into the row's own write.
+        const hasCredentials: boolean = Object.keys(values).length > 0;
+        const credentials: Record<string, ConfigEnvelope> | undefined = hasCredentials ? sealDnsCredentials(this.requireCipher(), uid, values) : undefined;
         let created: T;
         try {
             created = await this.repo!.create(
-                new this.dnsProviderClass({ uid, name, nameKey: name.toLowerCase(), type: spec.type, zones, options, secretRef, origin: "console", enabled, allowTakeover }),
+                new this.dnsProviderClass({
+                    uid,
+                    name,
+                    nameKey: name.toLowerCase(),
+                    type: spec.type,
+                    zones,
+                    options,
+                    ...(credentials ? { credentials, credentialsGeneration: 1 } : {}),
+                    origin: "console",
+                    enabled,
+                    allowTakeover,
+                }),
                 { user, ignoreACL: true },
             );
         } catch (err) {
-            if (secretRef) {
-                await this.deleteSecret(secretRef);
-            }
             throw mapNameTaken(err);
         }
 
@@ -421,7 +478,7 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
             type: spec.type,
             zones,
             optionKeys: Object.keys(options).sort(),
-            credentialsChanged: secretRef !== undefined,
+            credentialsChanged: hasCredentials,
         });
         await this.announce(created.uid);
         return this.toPublic(created, 0);
@@ -438,7 +495,7 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
         assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const body: DnsProviderRequest = asRequest(obj);
         const existing: T = await this.findProvider(id, true);
-        // Checked before the store is written, so a change made against an older version saves nothing.
+        // Checked before anything is encrypted or written, so a change made against an older version saves nothing.
         if (body.version !== undefined && Number(body.version) !== existing.version) {
             throw staleVersion();
         }
@@ -467,6 +524,10 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
             if (outside) {
                 throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, `'${outside.name}' is assigned to this DNS provider and would fall outside its zones - assign it elsewhere first.`);
             }
+            // Only the zones this change adds: a config that already shares one (a row from before this check) can still be edited otherwise.
+            const added: string[] = zones.filter((zone) => !existing.zones.includes(zone));
+            await this.assertZonesFree(added, existing.uid);
+            await this.assertNoAssignedDomainTaken(added, existing.uid);
             patch.zones = zones;
             fields.push("zones");
         }
@@ -484,7 +545,7 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
         }
 
         // Only what really changes: a field cleared that was never saved is no change.
-        const savedKeys: string[] = existing.secretRef?.keys ?? [];
+        const savedKeys: string[] = savedCredentialKeys(existing.credentials);
         const secretPatch: Record<string, string | null> = {};
         for (const [key, value] of Object.entries(this.secretPatch(spec, body.credentials))) {
             if (value !== null || savedKeys.includes(key)) {
@@ -498,19 +559,13 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
             return this.toPublic(existing, await this.domainCount(existing.uid));
         }
 
-        let saved: SavedCredentials | undefined;
         if (credentialsChanged) {
-            // The store change can't be undone (DNS credentials are never read back), so the version is checked again right before it: a write since
-            // the read above is a 409 with the store untouched. A write racing in during the store call itself is handled by `reconcileSecretRef()`.
-            if ((await this.findProvider(existing.uid, true)).version !== existing.version) {
-                throw staleVersion();
-            }
-            saved = await this.saveCredentials(existing, secretPatch, keys);
-            patch.secretRef = saved.secretRef;
+            patch.credentials = keys.length === 0 ? null : this.patchCredentials(existing, secretPatch);
+            patch.credentialsGeneration = (existing.credentialsGeneration ?? 0) + 1;
             fields.push("credentials");
         }
-        const leftBehind: Record<string, boolean> = saved?.secretLeftBehind ? { secretLeftBehind: true } : {};
 
+        // One versioned write of the row, credentials and generation with the rest of the change: a write that loses a race is a 409 and changes nothing.
         let updated: T;
         try {
             updated = await this.repo!.update({ uid: existing.uid, version: existing.version, ...patch } as any, asEntity(this.repo!, existing), {
@@ -519,116 +574,28 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
                 ignoreACL: true,
             });
         } catch (err) {
-            if (saved) {
-                // The store already holds the new credentials: point the row at them, record that they changed, and still refuse the rest of the change.
-                const rowMatchesStore: boolean = await this.reconcileSecretRef(existing, saved.secretRef, user);
-                await this.audit(req, user, AuditAction.DNS_PROVIDER_UPDATE, existing, {
-                    name: existing.name,
-                    fields: ["credentials"],
-                    optionKeys: [],
-                    credentialsChanged: true,
-                    ...leftBehind,
-                    rowWriteFailed: true,
-                    rowMatchesStore,
-                });
-                // The credentials did change: the controller rolls the instance onto them.
-                await this.announce(existing.uid);
-            }
             throw mapNameTaken(err);
         }
-        await this.audit(req, user, AuditAction.DNS_PROVIDER_UPDATE, updated, { name: updated.name, fields, optionKeys, credentialsChanged, ...leftBehind });
+        await this.audit(req, user, AuditAction.DNS_PROVIDER_UPDATE, updated, { name: updated.name, fields, optionKeys, credentialsChanged });
         await this.announce(updated.uid);
         return this.toPublic(updated, await this.domainCount(updated.uid));
     }
 
-    /**
-     * Applies a non-empty credentials patch to the store and returns the reference to save: patched, newly written, or `null` when none is left.
-     *
-     * A reference into a backend this deployment doesn't use (a database restored into another deployment) is never sent to the current store: clearing
-     * every field leaves the old secret where it is, and replacing every field writes a fresh secret here; both report `secretLeftBehind`. Keeping some of
-     * its fields is a 409, since their values can't be read back from there.
-     */
-    private async saveCredentials(existing: T, secretPatch: Record<string, string | null>, keys: string[]): Promise<SavedCredentials> {
-        let ref: SecretRef | undefined = existing.secretRef ?? undefined;
-        let secretLeftBehind: boolean = false;
-        if (ref && ref.backend !== this.secretStore!.backend) {
-            if (keys.some((key) => typeof secretPatch[key] !== "string")) {
-                throw new ApiError(
-                    ApiErrors.IDENTIFIER_EXISTS,
-                    409,
-                    `This DNS provider's credentials are in the ${ref.backend} secret store, which this deployment doesn't use - enter every credential again.`,
-                );
-            }
-            this.logger?.warn(`DNS provider credentials at '${ref.path}' are in the ${ref.backend} backend, which this deployment doesn't use; they were left there.`);
-            ref = undefined;
-            secretLeftBehind = true;
-        }
-        if (keys.length === 0) {
-            // Every saved field cleared (Route 53 back to IRSA, rfc2136 to unsigned updates): nothing left to keep. A failed removal fails the request.
-            if (ref) {
-                await this.secretStore!.delete(ref);
-            }
-            return { secretRef: null, secretLeftBehind };
-        }
-        if (ref) {
-            return { secretRef: await this.secretStore!.patch(ref, secretPatch), secretLeftBehind };
+    /** The credentials of `existing` with `secretPatch` applied: a new value encrypted for this row and field, `null` removed, the others kept as saved. */
+    private patchCredentials(existing: T, secretPatch: Record<string, string | null>): Record<string, ConfigEnvelope> {
+        const credentials: Record<string, ConfigEnvelope> = {};
+        for (const key of savedCredentialKeys(existing.credentials)) {
+            credentials[key] = existing.credentials![key];
         }
         const values: Record<string, string> = {};
-        for (const key of keys) {
-            values[key] = secretPatch[key]!;
-        }
-        return { secretRef: await this.secretStore!.write(`dns/${existing.uid}`, values), secretLeftBehind };
-    }
-
-    /**
-     * After the store was changed but the row's write failed (most often a lost race: another write bumped the version during the store call), points the
-     * row as it is now at what the store holds, so the console's masks and the pod-template generation follow the credentials really there. Skipped when
-     * the row's reference was changed by a later credentials write, which then holds the newer state; when the row is gone, the secret just written is
-     * removed. Returns whether the row and the store agree; never throws, so the original failure is what the caller sees.
-     */
-    private async reconcileSecretRef(existing: T, secretRef: SecretRef | null, user: JWTUser | undefined): Promise<boolean> {
-        try {
-            const current: T | undefined = await this.repo!.findOne(existing.uid, { ignoreACL: true, skipCache: true });
-            if (!current) {
-                return secretRef ? await this.deleteSecret(secretRef) : true;
+        for (const [key, value] of Object.entries(secretPatch)) {
+            if (value === null) {
+                delete credentials[key];
+            } else {
+                values[key] = value;
             }
-            if (sameSecretRef(current.secretRef, secretRef)) {
-                return true;
-            }
-            const before: SecretRef | null | undefined = current.secretRef;
-            const ours: boolean =
-                sameSecretRef(before, existing.secretRef) ||
-                (!!secretRef && !!before && before.backend === secretRef.backend && before.path === secretRef.path && before.generation < secretRef.generation);
-            if (!ours) {
-                this.logger?.warn(`DNS provider '${existing.uid}': its credentials were changed again during a failed update; the newer reference was kept.`);
-                return false;
-            }
-            await this.repo!.update({ uid: current.uid, version: current.version, secretRef } as any, asEntity(this.repo!, current), {
-                user,
-                version: current.version,
-                ignoreACL: true,
-            });
-            return true;
-        } catch (err: any) {
-            this.logger?.error(`DNS provider '${existing.uid}': its credentials changed in the secret store but the row could not be updated to match: ${err?.message}`);
-            return false;
         }
-    }
-
-    /** Removes `ref` from the store, returning whether it is gone. A reference from another backend (a database restored into a deployment without that
-     * store) is left alone, and a failure is logged without anything of the secret. */
-    private async deleteSecret(ref: SecretRef): Promise<boolean> {
-        if (ref.backend !== this.secretStore!.backend) {
-            this.logger?.warn(`DNS provider credentials at '${ref.path}' are in the ${ref.backend} backend, which this deployment doesn't use; they were left there.`);
-            return false;
-        }
-        try {
-            await this.secretStore!.delete(ref);
-            return true;
-        } catch (err: any) {
-            this.logger?.warn(`Could not remove DNS provider credentials at '${ref.path}' from the secret store: ${err?.message}`);
-            return false;
-        }
+        return { ...credentials, ...(Object.keys(values).length > 0 ? sealDnsCredentials(this.requireCipher(), existing.uid, values) : {}) };
     }
 
     @RequiresTrustedRole()
@@ -661,9 +628,7 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
         for (const operation of pending) {
             await this.cancelOperation(operation, "the DNS provider config was deleted");
         }
-        // After the row: a failure here leaves credentials nothing refers to, never a row whose credentials are gone.
-        const secretLeftBehind: boolean = existing.secretRef ? !(await this.deleteSecret(existing.secretRef)) : false;
-        await this.audit(req, user, AuditAction.DNS_PROVIDER_DELETE, existing, { name: existing.name, type: existing.type, secretLeftBehind });
+        await this.audit(req, user, AuditAction.DNS_PROVIDER_DELETE, existing, { name: existing.name, type: existing.type });
         await this.announce(existing.uid);
     }
 

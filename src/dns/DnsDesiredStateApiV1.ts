@@ -13,6 +13,8 @@
 //   they are.
 //
 // `DnsProviderV1.options` values may be lists (Cloudflare's `zoneIds`, rfc2136's `hosts`), in both copies and in the shared desired-state fixture.
+// `DnsProviderV1.credentials` (the saved fields and their generation) replaced the first build's `secretRef`, in place in both copies and the fixtures:
+// neither side had released v1. The credentials themselves are served by `GET /v1/providers/:uid/credentials` (`DnsProviderCredentialsV1`).
 // `PUT /v1/status` answers a `StatusReportResult`, in both copies (the controller's since its phase C2, which refuses any other answer).
 
 /** The API version this server speaks. */
@@ -55,10 +57,9 @@ export interface V1Envelope<K extends string> {
 export type DnsProviderTypeV1 = "cloudflare" | "route53" | "rfc2136" | "google" | "azure";
 export type DnsRecordKindV1 = "A" | "AAAA" | "CNAME" | "MX" | "TXT" | "SRV";
 
-/** Where a provider's credentials are: a reference, never the value. */
-export interface SecretRefV1 {
-    backend: "openbao" | "kubernetes";
-    path: string;
+/** Which credentials a provider has saved, never their values: the names of the fields and the generation they are at, which the controller compares with
+ * the one its external-dns Secret was written for. The values come from `GET <base>/v1/providers/:uid/credentials`. */
+export interface DnsProviderCredentialsInfoV1 {
     keys: string[];
     generation: number;
 }
@@ -68,8 +69,21 @@ export interface DnsProviderV1 {
     type: DnsProviderTypeV1;
     zones: string[];
     options: Record<string, string | number | boolean | string[]>;
-    secretRef?: SecretRefV1;
+    /** Left out for a config without credentials (Route 53 through IRSA, unsigned rfc2136, or every credential cleared). */
+    credentials?: DnsProviderCredentialsInfoV1 | null;
     enabled: boolean;
+}
+
+/**
+ * `GET <base>/v1/providers/:uid/credentials`: a provider's credentials in plaintext, decrypted by the server, for the controller to write the one Secret
+ * external-dns reads. `values` is empty for a config without credentials; a field that couldn't be decrypted is left out of it and named in `unreadable`
+ * (only present then), and the controller keeps the Secret it has. Sent with `Cache-Control: no-store`.
+ */
+export interface DnsProviderCredentialsV1 extends V1Envelope<"DnsProviderCredentials"> {
+    providerUid: string;
+    generation: number;
+    values: Record<string, string>;
+    unreadable?: string[];
 }
 
 export interface DnsRecordV1 {

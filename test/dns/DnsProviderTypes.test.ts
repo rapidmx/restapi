@@ -209,7 +209,7 @@ describe("DnsProviderTypes", () => {
         it("requires what each type needs, given its options", () => {
             const pass = (type: string, options: Record<string, any>, keys: string[]) => assertDnsProviderCredentials(getDnsProviderType(type), options, keys);
             pass("cloudflare", {}, ["apiToken"]);
-            expect(refusal(() => pass("cloudflare", {}, []))).toBe("'apiToken' is required. Credentials are saved in the secret store and never shown again.");
+            expect(refusal(() => pass("cloudflare", {}, []))).toBe("'apiToken' is required. Credentials are saved encrypted and never shown again.");
             pass("route53", {}, []);
             pass("route53", {}, ["accessKeyId", "secretAccessKey"]);
             refusal(() => pass("route53", {}, ["secretAccessKey"]));

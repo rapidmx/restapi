@@ -18,29 +18,33 @@ describe.each([
     ["Mongo", DnsProviderMongo, DeploymentIdentityMongo, DomainMongo],
     ["SQL", DnsProviderSQL, DeploymentIdentitySQL, DomainSQL],
 ])("DNS publishing models (%s)", (_backend, Provider: any, Identity: any, Domain: any) => {
-    it("constructs a provider config with safe defaults: enabled, no takeover, no credentials", () => {
+    it("constructs a provider config with safe defaults: enabled, no takeover, no credentials, generation 0", () => {
         const provider = new Provider();
-        expect(provider).toEqual(expect.objectContaining({ name: "", type: "cloudflare", zones: [], options: {}, enabled: true, allowTakeover: false }));
+        expect(provider).toEqual(expect.objectContaining({ name: "", type: "cloudflare", zones: [], options: {}, enabled: true, allowTakeover: false, credentialsGeneration: 0 }));
+        expect(provider.credentials).toBeUndefined();
         expect(provider.secretRef).toBeUndefined();
         expect(provider.origin).toBeUndefined();
         expect(provider.status).toBeUndefined();
         expect(new Provider({}).enabled).toBe(true);
+        expect(new Provider({}).credentialsGeneration).toBe(0);
     });
 
-    it("copies every field of a provider config, including a cleared reference", () => {
+    it("copies every field of a provider config, including cleared credentials", () => {
+        const envelope = { $enc: 1, kid: "k1", iv: "aXY=", ct: "Y3Q=", tag: "dGFn" };
         const fields = {
             name: "AWS",
             type: "route53",
             zones: ["example.com"],
             options: { region: "us-east-1" },
-            secretRef: { backend: "openbao", path: "dns/aws-x", keys: ["accessKeyId"], generation: 3 },
+            credentials: { accessKeyId: envelope },
+            credentialsGeneration: 3,
             origin: "installer",
             enabled: false,
             allowTakeover: true,
             status: { readyReplicas: 1 },
         };
         expect(new Provider(fields)).toEqual(expect.objectContaining(fields));
-        expect(new Provider({ secretRef: null, status: null })).toEqual(expect.objectContaining({ secretRef: null, status: null }));
+        expect(new Provider({ credentials: null, credentialsGeneration: 4, status: null })).toEqual(expect.objectContaining({ credentials: null, credentialsGeneration: 4, status: null }));
     });
 
     it("keys a provider config's name in lowercase for its unique index, unless given the key", () => {

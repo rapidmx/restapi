@@ -8,6 +8,7 @@ import * as crypto from "crypto";
 import * as net from "net";
 import type { DnsOperation, DnsOperationRecord, DnsProvider, DnsProviderType, Domain } from "../models/types.js";
 import { buildDesiredDnsRecords, dnsManualReason, type DesiredDnsRecord, type DesiredDnsRecordContext } from "../util/DnsSetupUtils.js";
+import { savedCredentialKeys } from "./DnsProviderCredentials.js";
 import { isNameInZones } from "./DnsProviderTypes.js";
 import {
     API_VERSION_V1,
@@ -187,16 +188,27 @@ export function normalizePublishHosts(value: unknown): { hosts: PublishHost[]; i
     return { hosts, invalid };
 }
 
+/** How specifically `zones` cover `name`: the length of the longest zone that does, -1 when none does. */
+export function zoneCoverage(name: string, zones: readonly string[]): number {
+    return Math.max(-1, ...zones.filter((zone) => isNameInZones(name, [zone])).map((zone) => zone.length));
+}
+
+/** The config in `providers` other than `provider` whose zones cover `name` more specifically than `provider`'s do, if any: a domain may be assigned only to
+ * the config that covers it most specifically, since an instance leaves out the zones other configs nest under its own (7.4). Disabled configs count. */
+export function moreSpecificProvider<T extends Pick<DnsProvider, "uid" | "zones">>(name: string, provider: Pick<DnsProvider, "uid" | "zones">, providers: readonly T[]): T | undefined {
+    const own: number = zoneCoverage(name, provider.zones);
+    return providers.find((other) => other.uid !== provider.uid && zoneCoverage(name, other.zones) > own);
+}
+
 /** The provider config whose zones cover `name` most specifically (the longest matching zone; the first such config in `providers` on a tie). */
 export function providerForName<T extends Pick<DnsProvider, "zones">>(name: string, providers: readonly T[]): T | undefined {
     let best: T | undefined;
     let bestLength = -1;
     for (const provider of providers) {
-        for (const zone of provider.zones) {
-            if (isNameInZones(name, [zone]) && zone.length > bestLength) {
-                best = provider;
-                bestLength = zone.length;
-            }
+        const length: number = zoneCoverage(name, provider.zones);
+        if (length > bestLength) {
+            best = provider;
+            bestLength = length;
         }
     }
     return best;
@@ -294,7 +306,7 @@ export function buildHostEndpointSets(
     return { endpointSets, manual };
 }
 
-/** A provider config as the controller sees it: its credentials only as a reference, never a value. */
+/** A provider config as the controller sees it: which credentials it has saved and their generation, never a value. */
 export function toDnsProviderV1(provider: DnsProvider): DnsProviderV1 {
     const v1: DnsProviderV1 = {
         uid: provider.uid,
@@ -303,9 +315,9 @@ export function toDnsProviderV1(provider: DnsProvider): DnsProviderV1 {
         options: { ...provider.options },
         enabled: provider.enabled,
     };
-    if (provider.secretRef) {
-        const { backend, path, keys, generation } = provider.secretRef;
-        v1.secretRef = { backend, path, keys: [...keys], generation };
+    const keys: string[] = savedCredentialKeys(provider.credentials);
+    if (keys.length > 0) {
+        v1.credentials = { keys, generation: provider.credentialsGeneration ?? 0 };
     }
     return v1;
 }

@@ -11,7 +11,8 @@ import { DeploymentIdentityMongo } from "../../../src/models/mongo/DeploymentIde
 import { DnsProviderMongo } from "../../../src/models/mongo/DnsProviderMongo.js";
 import { DomainMongo } from "../../../src/models/mongo/DomainMongo.js";
 import { DEPLOYMENT_IDENTITY_UID } from "../../../src/util/DeploymentIdentityUtils.js";
-import { InMemorySecretStore, registerTestDoubles } from "../../testDoubles.js";
+import { registerTestDoubles } from "../../testDoubles.js";
+import type { ConfigCipher } from "../../../src/secrets/ConfigCipher.js";
 import { dnsProviderSuite } from "../dnsProviderSuite.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({ instance: { port: 9999, dbName: "rrst-test" } });
@@ -47,7 +48,7 @@ describe("Route:DnsProviderMongo Tests", () => {
         config,
         app: () => server.getApplication(),
         prefix: "/mongo",
-        store: () => objectFactory.getInstance<InMemorySecretStore>("SecretStore")!,
+        cipher: () => objectFactory.getInstance<ConfigCipher>("ConfigCipher")!,
         clear: async () => {
             for (const repo of Object.values(repos)) {
                 await repo.clear().catch(() => undefined);

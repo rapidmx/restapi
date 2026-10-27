@@ -154,13 +154,35 @@ export function buildDesiredDnsRecords(domain: Domain, ctx: DesiredDnsRecordCont
     return records;
 }
 
+/** A value rfc2136 reads back exactly as written when it is passed unquoted: one character-string (255 bytes at most, all printable ASCII) with nothing that
+ * zone-file text treats specially. The same rule as the DNS controller's, which leaves out what fails it (4.2). */
+const RFC2136_PLAIN_TXT: RegExp = /^(?:(?!["\\;()$@])[\x21-\x7e]){1,255}$/;
+
+/**
+ * Whether `provider`'s external-dns v0.23.0 provider can keep a TXT record of `values` (4.2). Azure writes and reads only the first target of a name, so a name
+ * with several values can't be kept. rfc2136 reads back bare character-strings and removes an old value by parsing it as zone-file text, so a value that
+ * isn't one plain character-string (a space, `;`, a quote, a backslash, a bracket, `$`, `@`, non-ASCII, or over 255 bytes: SPF, DKIM and DMARC) could never
+ * be updated or deleted, and one such value makes the whole record manual. The others keep any TXT value.
+ */
+export function providerKeepsTxt(type: string, values: readonly string[]): boolean {
+    switch (type) {
+        case "azure":
+            return values.length <= 1;
+        case "rfc2136":
+            return values.every((value) => RFC2136_PLAIN_TXT.test(value));
+        default:
+            return true;
+    }
+}
+
 /**
  * Why `record` is not published automatically for `domain` through `provider` (the provider config the domain is assigned to, `null`/`undefined` when it
  * has none or it no longer exists), or `undefined` when it is published. In order: no provider; the name outside the provider's zones (an assignment the
- * provider no longer covers); a kind the provider can't manage (rfc2136: MX, SRV); SPF while the apex TXT set isn't managed.
+ * provider no longer covers); a kind the provider can't manage (rfc2136: MX, SRV) or a TXT value it can't keep (`providerKeepsTxt()`); SPF while the apex TXT
+ * set isn't managed.
  */
 export function dnsManualReason(
-    record: Pick<DesiredDnsRecord, "type" | "recordKind" | "recordName">,
+    record: Pick<DesiredDnsRecord, "type" | "recordKind" | "recordName" | "values">,
     domain: Pick<Domain, "apexTxt">,
     provider: Pick<DnsProvider, "type" | "zones"> | null | undefined,
 ): DnsManualReason | undefined {
@@ -171,7 +193,7 @@ export function dnsManualReason(
         return "outside_zones";
     }
     const unsupported: readonly string[] = isDnsProviderType(provider.type) ? getDnsProviderType(provider.type).unsupportedRecordKinds : [];
-    if (unsupported.includes(record.recordKind)) {
+    if (unsupported.includes(record.recordKind) || (record.recordKind === "TXT" && !providerKeepsTxt(provider.type, record.values))) {
         return "kind_unsupported";
     }
     if (record.type === "spf" && !domain.apexTxt?.managed) {

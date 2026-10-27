@@ -180,6 +180,26 @@ export function domainSeedSuite(ctx: DomainSeedSuiteContext): void {
             expect(audits.find((entry) => entry.targetUid === "example.net").details).toEqual({ name: "example.net", origin: "seed" });
         });
 
+        it("seeds a domain as manual when another config's zones cover it more specifically, as the console's assignment refuses it", async () => {
+            await ctx.saveProvider({ uid: "cf-boot", name: "Installer", zones: ["example.com"], origin: "installer" });
+            await ctx.saveProvider({ uid: "cf-eu", name: "Europe", zones: ["eu.example.com"], origin: "console", enabled: false });
+            const warn = vi.spyOn(seeder.logger, "warn");
+            seeder.domains = [
+                { name: "eu.example.com", dnsProvider: "bootstrap" },
+                { name: "www.example.com", dnsProvider: "bootstrap" },
+                { name: "mail.eu.example.com", dnsProvider: "cf-eu" },
+            ];
+
+            expect((await seeder.run()).created).toEqual(["eu.example.com", "www.example.com", "mail.eu.example.com"]);
+
+            expect((await ctx.domainRow("eu.example.com")).dnsProviderUid ?? undefined).toBeUndefined();
+            expect((await ctx.domainRow("www.example.com")).dnsProviderUid).toBe("cf-boot");
+            expect((await ctx.domainRow("mail.eu.example.com")).dnsProviderUid).toBe("cf-eu");
+            expect(warn).toHaveBeenCalledTimes(1);
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("more specifically"));
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("cf-eu"));
+        });
+
         it("seeds a 'bootstrap' domain as manual when there is no installer provider, or more than one", async () => {
             const warn = vi.spyOn(seeder.logger, "warn");
             seeder.domains = [{ name: "example.com", dnsProvider: "bootstrap" }];

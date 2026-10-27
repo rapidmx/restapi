@@ -16,6 +16,7 @@ import config from "../../config.sql.js";
 import { ConfigKeyRotationJobSQL } from "../../../src/jobs/sql/ConfigKeyRotationJobSQL.js";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { ConfigKeyStateSQL } from "../../../src/models/sql/ConfigKeyStateSQL.js";
+import { DnsProviderSQL } from "../../../src/models/sql/DnsProviderSQL.js";
 import { PluginSQL } from "../../../src/models/sql/PluginSQL.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { LocalConfigKeyChannel } from "../../../src/secrets/ConfigKeyChannel.js";
@@ -48,7 +49,7 @@ describe("ConfigKeyRotationJobSQL Tests (real DB + DI)", () => {
         connectionManager = await objectFactory.newInstance(ConnectionManager, { name: "default" });
         const models = new Map<string, any>();
         models.set("AccessControlListSQL", AccessControlListSQL);
-        for (const cls of [ConfigKeyStateSQL, PluginSQL, AuditLogEntrySQL]) {
+        for (const cls of [ConfigKeyStateSQL, DnsProviderSQL, PluginSQL, AuditLogEntrySQL]) {
             models.set(cls.name, cls);
         }
         await connectionManager.connect(config.get("datastores"), models);
@@ -57,7 +58,7 @@ describe("ConfigKeyRotationJobSQL Tests (real DB + DI)", () => {
         if (!isSqlDataSource(conn)) {
             throw new Error("Could not find sql connection");
         }
-        for (const cls of [ConfigKeyStateSQL, PluginSQL, AuditLogEntrySQL]) {
+        for (const cls of [ConfigKeyStateSQL, DnsProviderSQL, PluginSQL, AuditLogEntrySQL]) {
             repos[cls.name] = conn.getRepository(cls);
         }
         // What the job injects, built once so the suite can reach them.
@@ -79,6 +80,8 @@ describe("ConfigKeyRotationJobSQL Tests (real DB + DI)", () => {
         expect(job.channel).toBeInstanceOf(LocalConfigKeyChannel);
         expect(job.stateRepo).toBeDefined();
         expect(job.auditLogUtils).toBeDefined();
+        // The record types that hold envelopes: a DNS provider's credentials.
+        expect(job.sources.list().map((source: any) => [source.record, source.modelClass])).toEqual([["DnsProvider", DnsProviderSQL]]);
         await job.dispose();
     });
 
@@ -107,6 +110,14 @@ describe("ConfigKeyRotationJobSQL Tests (real DB + DI)", () => {
         },
         clearPlugins: async () => await repos.PluginSQL.clear(),
         pluginModel: () => PluginSQL,
+        insertProvider: async (uid, credentials, credentialsGeneration) => {
+            await repos.DnsProviderSQL.save(
+                new DnsProviderSQL({ uid, name: `provider ${uid}`, type: "route53", zones: ["example.com"], options: { region: "us-east-1" }, credentials, credentialsGeneration } as any),
+            );
+        },
+        provider: async (uid) => (await repos.DnsProviderSQL.findOne({ where: { uid } }))!,
+        clearProviders: async () => await repos.DnsProviderSQL.clear(),
+        providerModel: () => DnsProviderSQL,
         auditEntries: async (action: AuditAction) => await repos.AuditLogEntrySQL.find({ where: { action } }),
         clearAudit: async () => await repos.AuditLogEntrySQL.clear(),
     });

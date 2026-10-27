@@ -152,9 +152,10 @@ export abstract class ConfigKeyRotationJob<S extends ConfigKeyState> extends Bac
         return this.scheduleExpr;
     }
 
-    /** Where the Mongo/SQL subclasses register the record types' envelope sources (`registry.register()`); none until restapi's steps R2 to R4. */
+    /** Where the Mongo/SQL subclasses register the record types' envelope sources (`registry.register()`): the DNS provider configs' since restapi's step R2,
+     * the integration settings' and the plugins' with R3 and R4. */
     protected registerSources(_registry: ConfigEnvelopeSourceRegistry): void {
-        // No record type holds an envelope yet.
+        // A job over no record type that holds an envelope has nothing to count or re-encrypt.
     }
 
     @Init

@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BaseMongoEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
-import { DnsProvider, DnsProviderOptionValue, DnsProviderStatus, DnsProviderType, SecretRef } from "../types.js";
+import { ConfigEnvelope, DnsProvider, DnsProviderOptionValue, DnsProviderStatus, DnsProviderType } from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Column, Entity, Index } = PersistenceDecorators;
@@ -18,7 +18,7 @@ const { Nullable } = ObjectDecorators;
  */
 @DataStore("mongo")
 @Entity()
-@Description("A DNS hosting account this deployment publishes domain records through, with its credentials kept in the secret store.")
+@Description("A DNS hosting account this deployment publishes domain records through, with its credentials encrypted on the row.")
 @Index("dnsprovider_name_key", ["nameKey"], { unique: true })
 @Protect(
     {
@@ -52,9 +52,13 @@ export class DnsProviderMongo extends BaseMongoEntity implements DnsProvider {
     public options: Record<string, DnsProviderOptionValue> = {};
 
     @Column()
-    @Description("Where the credentials are in the secret store: a reference, never the value.")
+    @Description("The credentials, one encrypted envelope per secret field, never the value.")
     @Nullable
-    public secretRef?: SecretRef | null;
+    public credentials?: Record<string, ConfigEnvelope> | null;
+
+    @Column()
+    @Description("Bumped on every change to the credentials, so the DNS controller rewrites the external-dns Secret and rolls its pod.")
+    public credentialsGeneration: number = 0;
 
     @Column()
     @Description("Where this config came from: installer or console.")
@@ -83,7 +87,8 @@ export class DnsProviderMongo extends BaseMongoEntity implements DnsProvider {
             this.type = other.type !== undefined ? other.type : this.type;
             this.zones = other.zones !== undefined ? other.zones : this.zones;
             this.options = other.options !== undefined ? other.options : this.options;
-            this.secretRef = "secretRef" in other ? other.secretRef : this.secretRef;
+            this.credentials = "credentials" in other ? other.credentials : this.credentials;
+            this.credentialsGeneration = other.credentialsGeneration !== undefined ? other.credentialsGeneration : this.credentialsGeneration;
             this.origin = "origin" in other ? other.origin : this.origin;
             this.enabled = other.enabled !== undefined ? other.enabled : this.enabled;
             this.allowTakeover = other.allowTakeover !== undefined ? other.allowTakeover : this.allowTakeover;

@@ -11,7 +11,8 @@ import { DeploymentIdentitySQL } from "../../../src/models/sql/DeploymentIdentit
 import { DnsProviderSQL } from "../../../src/models/sql/DnsProviderSQL.js";
 import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { DEPLOYMENT_IDENTITY_UID } from "../../../src/util/DeploymentIdentityUtils.js";
-import { InMemorySecretStore, registerTestDoubles } from "../../testDoubles.js";
+import { registerTestDoubles } from "../../testDoubles.js";
+import type { ConfigCipher } from "../../../src/secrets/ConfigCipher.js";
 import { dnsProviderSuite } from "../dnsProviderSuite.js";
 
 describe("Route:DnsProviderSQL Tests", () => {
@@ -43,7 +44,7 @@ describe("Route:DnsProviderSQL Tests", () => {
         config,
         app: () => server.getApplication(),
         prefix: "/sql",
-        store: () => objectFactory.getInstance<InMemorySecretStore>("SecretStore")!,
+        cipher: () => objectFactory.getInstance<ConfigCipher>("ConfigCipher")!,
         clear: async () => {
             for (const repo of Object.values(repos)) {
                 await repo.clear();

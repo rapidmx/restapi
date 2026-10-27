@@ -13,7 +13,8 @@ import { DnsOperationSQL } from "../../../src/models/sql/DnsOperationSQL.js";
 import { DnsProviderSQL } from "../../../src/models/sql/DnsProviderSQL.js";
 import { DomainSQL } from "../../../src/models/sql/DomainSQL.js";
 import { DomainRouteSQL } from "../../../src/routes/sql/DomainRouteSQL.js";
-import { InMemoryDnsPublisher, InMemorySecretStore, registerTestDoubles, StaticDnsResolver } from "../../testDoubles.js";
+import { InMemoryDnsPublisher, registerTestDoubles, StaticDnsResolver } from "../../testDoubles.js";
+import type { ConfigCipher } from "../../../src/secrets/ConfigCipher.js";
 import { dnsPublishingSuite } from "../dnsPublishingSuite.js";
 
 describe("Route:DnsPublishingSQL Tests", () => {
@@ -43,7 +44,7 @@ describe("Route:DnsPublishingSQL Tests", () => {
         config,
         app: () => server.getApplication(),
         prefix: "/sql",
-        store: () => objectFactory.getInstance<InMemorySecretStore>("SecretStore")!,
+        cipher: () => objectFactory.getInstance<ConfigCipher>("ConfigCipher")!,
         publisher: () => objectFactory.getInstance<InMemoryDnsPublisher>("DnsPublisher")!,
         resolver: () => objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!,
         clear: async () => {
@@ -57,6 +58,9 @@ describe("Route:DnsPublishingSQL Tests", () => {
         },
         domainRow: async (uid) => await repos.DomainSQL.findOneBy({ uid }),
         providerRow: async (uid) => await repos.DnsProviderSQL.findOneBy({ uid }),
+        updateProviderRow: async (uid, fields) => {
+            await repos.DnsProviderSQL.update({ uid }, fields);
+        },
         operationRows: async () => await repos.DnsOperationSQL.find({ order: { dateCreated: "ASC" } }),
         auditEntries: async () => await repos.AuditLogEntrySQL.find(),
         newDomainRoute: async (name) => await objectFactory.newInstance(DomainRouteSQL, { name }),

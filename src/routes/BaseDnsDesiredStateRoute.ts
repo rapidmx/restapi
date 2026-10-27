@@ -23,19 +23,22 @@ import {
     parseStatusReport,
     SUPPORTED_API_VERSIONS,
     type DesiredStateV1,
+    type DnsProviderCredentialsV1,
     type HandshakeResult,
     type StatusReportResultV1,
     type StatusReportV1,
 } from "../dns/DnsDesiredStateApiV1.js";
 import type { DnsControllerTokenVerifier } from "../dns/DnsControllerTokenVerifier.js";
+import { noConfigCipher, openDnsCredentials, savedCredentialKeys, type OpenedDnsCredentials } from "../dns/DnsProviderCredentials.js";
 import { resolveDnsPublisher, type DnsPublisher } from "../dns/DnsPublisher.js";
+import type { ConfigCipher } from "../secrets/ConfigCipher.js";
 import { findOrCreateDeploymentIdentity } from "../util/DeploymentIdentityUtils.js";
 import { autodiscoverHostnameFor, DEFAULT_LONG_POLL_SECONDS, DNS_CONTROLLER_STATE_UID, dnsOwnerId, findAllRows } from "../util/DnsPublishingUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { findOrCreateSingleton } from "../util/MailboxPolicyUtils.js";
 import { DeploymentIdentity, DnsControllerState, DnsOperation, DnsProvider, DnsProviderStatus, DnsPublicationStatus, Domain } from "../models/types.js";
-const { Config, Init, Logger } = ObjectDecorators;
-const { Get, Post, Put, Query, Request, Response } = RouteDecorators;
+const { Config, Init, Inject, Logger } = ObjectDecorators;
+const { Get, Param, Post, Put, Query, Request, Response } = RouteDecorators;
 
 /** A provider config's status is rewritten when only its report time moved, but no more often than this: what keeps a status report every minute from
  * bumping the row's version (and failing an admin's edit made meanwhile) every minute. */
@@ -59,9 +62,11 @@ function withoutReportedAt(status: DnsProviderStatus | null | undefined): string
  *
  * - `POST /handshake` (unversioned, frozen): the controller lists the API versions it speaks; the answer selects the best one both speak, or says they
  * share none. What the controller said is recorded (`DnsControllerState`) so the console can show a mismatch.
- * - `GET /v1/desired-state?since=<version>`: the provider configs (credentials only as references), every domain's and the deployment hosts' records,
+ * - `GET /v1/desired-state?since=<version>`: the provider configs (credentials only as the names of their fields and a generation), every domain's and the deployment hosts' records,
  * the external-dns owner id and image, and the queued operations. With `since`, a long poll answering as soon as the version moves away from it
  * (`DnsPublisher`), or after `mail:dns:desired_state:long_poll_seconds`.
+ * - `GET /v1/providers/:uid/credentials`: one provider config's credentials, decrypted (spec 5.4), for the controller to write the Secret its external-dns
+ * instance reads. Answered to the controller's token only, with `Cache-Control: no-store`; logged with the provider and generation only, never audited per call.
  * - `PUT /v1/status`: the controller's report - per provider config (`DnsProvider.status`), per endpoint set (`Domain.dnsPublication`), per operation,
  * and its Lease. Only the Lease holder's report changes rows; another pod's is kept apart (`lastStandbyReport`).
  *
@@ -125,6 +130,13 @@ export abstract class BaseDnsDesiredStateRoute {
     protected operationRepo?: RepoUtils<DnsOperation>;
     protected identityRepo?: RepoUtils<DeploymentIdentity>;
     protected controllerStateRepo?: RepoUtils<DnsControllerState>;
+
+    /** Decrypts the credentials the controller asks for; unset on a server that registers none (a config with credentials is then answered 503). */
+    @Inject("ConfigCipher")
+    protected cipher?: ConfigCipher;
+
+    /** The credential fields already logged as unreadable (`<provider uid>/<field>`), so the controller asking again every pass doesn't fill the log. */
+    private readonly warnedUnreadable: Set<string> = new Set();
 
     /** Verifies the controller's token; unset (every call refused) on a server that registers none. */
     protected tokenVerifier?: DnsControllerTokenVerifier;
@@ -287,6 +299,46 @@ export abstract class BaseDnsDesiredStateRoute {
             ...this.publishConfig(),
             context: { mxHostname: this.mxHostname, autodiscoverHostname: autodiscoverHostnameFor(this.autodiscoverPublicUrl), ttl: this.publishTtlSeconds },
         });
+    }
+
+    /**
+     * One provider config's credentials, decrypted, for the controller to write the one Secret its external-dns instance reads (spec 5.4: not kept, decrypted
+     * only to answer this, which the controller asks only when the config's generation moves or its Secret is missing). The controller's token only; 404
+     * for a config that is gone; empty `values` for one without credentials. A credential that can't be decrypted is left out and named in `unreadable`,
+     * so the controller keeps the Secret it has rather than writing half of one. Never cached, and logged with the provider and generation alone: a
+     * value appears in no log line, audit entry or error, and a call is no audit event.
+     */
+    @Get("/v1/providers/:uid/credentials")
+    public async providerCredentials(@Param("uid") uid: string, @Request req: HttpRequest, @Response res: HttpResponse): Promise<DnsProviderCredentialsV1> {
+        await this.authorize(req);
+        const provider: DnsProvider | undefined = await this.providerRepo!.findOne(uid, { ignoreACL: true, skipCache: true });
+        if (!provider) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        let opened: OpenedDnsCredentials = { values: {}, unreadable: [] };
+        if (savedCredentialKeys(provider.credentials).length > 0) {
+            if (!this.cipher) {
+                throw noConfigCipher();
+            }
+            opened = openDnsCredentials(this.cipher, provider);
+        }
+        const generation: number = provider.credentialsGeneration ?? 0;
+        for (const field of opened.unreadable) {
+            if (!this.warnedUnreadable.has(`${provider.uid}/${field}`)) {
+                this.warnedUnreadable.add(`${provider.uid}/${field}`);
+                this.logger?.warn(`The credential '${field}' of DNS provider '${provider.uid}' can't be read (its key isn't in the keyring, or it was changed): enter it again.`);
+            }
+        }
+        this.logger?.info(`Served the credentials of DNS provider '${provider.uid}' at generation ${generation} to the DNS controller.`);
+        res.setHeader("cache-control", "no-store");
+        return {
+            apiVersion: API_VERSION_V1,
+            kind: "DnsProviderCredentials",
+            providerUid: provider.uid,
+            generation,
+            values: opened.values,
+            ...(opened.unreadable.length > 0 ? { unreadable: opened.unreadable } : {}),
+        };
     }
 
     /**

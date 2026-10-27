@@ -5,11 +5,13 @@
 import { ObjectDecorators } from "@rapidrest/core";
 import { ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import type { DkimKeyProvider } from "../dkim/DkimKeyProvider.js";
+import { moreSpecificProvider } from "../dns/DnsDesiredState.js";
 import { isNameInZones } from "../dns/DnsProviderTypes.js";
 import { notifyDnsPublisher, resolveDnsPublisher, type DnsPublisher } from "../dns/DnsPublisher.js";
 import { AuditAction, DnsProvider, Domain, SetupState } from "../models/types.js";
 import { normalizeAddress } from "./AddressUtils.js";
 import { AuditLogUtils } from "./AuditLogUtils.js";
+import { findAllRows } from "./DnsPublishingUtils.js";
 import { prepareNewDomain } from "./DomainUtils.js";
 import { asEntity } from "./EntityUtils.js";
 import { SETUP_STATE_UID, updateSetupState } from "./SetupStateUtils.js";
@@ -389,6 +391,14 @@ export abstract class DomainSeeder<D extends Domain, S extends SetupState> {
         }
         if (!isNameInZones(name, provider.zones)) {
             this.logger?.warn(`DomainSeeder: '${name}' is not in the zones of DNS provider '${provider.uid}' (${provider.zones.join(", ")}); ${manual}.`);
+            return undefined;
+        }
+        // The same rule as the console's assignment: only the config covering the name most specifically publishes it (7.4).
+        const covering: DnsProvider | undefined = moreSpecificProvider(name, provider, await findAllRows<DnsProvider>(this.dnsProviderRepo, {}));
+        if (covering) {
+            this.logger?.warn(
+                `DomainSeeder: '${name}' is covered more specifically by the zones of DNS provider '${covering.uid}' (${covering.zones.join(", ")}), not those of '${provider.uid}'; ${manual}.`,
+            );
             return undefined;
         }
         return provider.uid;

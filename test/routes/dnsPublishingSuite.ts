@@ -5,23 +5,19 @@
 // HTTP behaviour of DNS publishing, identical on both backends: ownership verification at `_rapidmx-verify` with the legacy apex transition, the DNS
 // checklist's publication states, the apex TXT opt-in (`PUT mail/domains/:id/apex-txt`), the queued test and takeover operations, and the DNS
 // controller's internal API (`/internal/dns`: handshake, desired state with its long poll, status reports).
+import { readFileSync } from "node:fs";
 import { request } from "@rapidrest/service-core/test";
 import { JWTUtils } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { AuditAction } from "../../src/models/types.js";
-import {
-    TEST_DNS_CONTROLLER_TOKEN,
-    TEST_OTHER_SERVICE_ACCOUNT_TOKEN,
-    type InMemoryDnsPublisher,
-    type InMemorySecretStore,
-    type StaticDnsResolver,
-} from "../testDoubles.js";
+import type { ConfigCipher } from "../../src/secrets/ConfigCipher.js";
+import { TEST_DNS_CONTROLLER_TOKEN, TEST_OTHER_SERVICE_ACCOUNT_TOKEN, type InMemoryDnsPublisher, type StaticDnsResolver } from "../testDoubles.js";
 
 export interface DnsPublishingSuiteContext {
     config: any;
     app: () => any;
     prefix: string;
-    store: () => InMemorySecretStore;
+    cipher: () => ConfigCipher;
     publisher: () => InMemoryDnsPublisher;
     resolver: () => StaticDnsResolver;
     clear: () => Promise<void>;
@@ -29,6 +25,8 @@ export interface DnsPublishingSuiteContext {
     saveDomain: (fields: Record<string, unknown>) => Promise<void>;
     domainRow: (uid: string) => Promise<any>;
     providerRow: (uid: string) => Promise<any>;
+    /** Changes fields of the stored provider row directly, as a restore or a manual edit of the database would. */
+    updateProviderRow: (uid: string, fields: Record<string, unknown>) => Promise<void>;
     operationRows: () => Promise<any[]>;
     auditEntries: () => Promise<{ action: string; targetUid: string; details?: any }[]>;
     /** A new instance of the backend's domain route, configured from `config` as it is now (the server's own instance was configured at start-up). */
@@ -53,7 +51,6 @@ export function dnsPublishingSuite(ctx: DnsPublishingSuiteContext): void {
 
     beforeEach(async () => {
         await ctx.clear();
-        ctx.store().reset();
         ctx.publisher().reset();
         const resolver = ctx.resolver();
         resolver.records.clear();
@@ -84,6 +81,14 @@ export function dnsPublishingSuite(ctx: DnsPublishingSuiteContext): void {
     };
     const createRfc2136 = () =>
         createProvider({ name: "Bind", type: "rfc2136", options: { hosts: ["ns1.example.com"], zone: "example.com", insecure: true }, credentials: undefined });
+    const GUID = "11111111-2222-3333-4444-555555555555";
+    const createAzure = () =>
+        createProvider({
+            name: "Azure",
+            type: "azure",
+            options: { tenantId: GUID, subscriptionId: GUID, resourceGroup: "dns-rg" },
+            credentials: { clientId: GUID, clientSecret: "azure-secret-VALUE" },
+        });
     const assign = async (domainUid: string, dnsProviderUid: string | null) => {
         const result = await as(adminToken, request(ctx.app()).put(domains(`/${domainUid}/dns-provider`))).send({ dnsProviderUid });
         expect(result.status, JSON.stringify(result.body)).toBe(200);
@@ -111,6 +116,7 @@ export function dnsPublishingSuite(ctx: DnsPublishingSuiteContext): void {
             operations: [],
             ...body,
         });
+    const keysOf = (o: any) => Object.keys(o).sort();
     const audit = async (action: string) => (await ctx.auditEntries()).filter((entry) => entry.action === action);
 
     describe("ownership verification", () => {
@@ -207,7 +213,27 @@ export function dnsPublishingSuite(ctx: DnsPublishingSuiteContext): void {
             const checks = await dnsSetup("example.com");
 
             expect(checks.mx).toMatchObject({ publication: "manual", manualReason: "kind_unsupported" });
-            expect(checks.dmarc).toMatchObject({ publication: "pending" });
+            // A DMARC value is not one plain character-string either, which rfc2136 could never update or delete; the ownership value is.
+            expect(checks.dmarc).toMatchObject({ publication: "manual", manualReason: "kind_unsupported" });
+            expect(checks.ownership).toMatchObject({ publication: "pending" });
+            expect(checks.openpgpkey_cname).toMatchObject({ publication: "pending" });
+        });
+
+        it("shows a managed apex TXT set with kept values as manual on Azure, which keeps only the first value of a name, and without them as pending", async () => {
+            const provider = await createAzure();
+            const managed = (name: string, keep: string[]) =>
+                ctx.saveDomain({ name, dkimSelector: "mail", dkimPublicKey: "KEY", dnsProviderUid: provider.uid, apexTxt: { managed: true, keep, spf: "v=spf1 mx ~all" } });
+            await ctx.saveDomain({ name: "example.com" });
+            await managed("several.example.com", ["ms=1"]);
+            await managed("single.example.com", []);
+
+            const several = await dnsSetup("several.example.com");
+            expect(several.spf).toMatchObject({ publication: "manual", manualReason: "kind_unsupported" });
+            // Its other records are single values, which Azure keeps.
+            expect(several.dkim).toMatchObject({ publication: "pending" });
+            expect(several.dmarc).toMatchObject({ publication: "pending" });
+
+            expect((await dnsSetup("single.example.com")).spf).toMatchObject({ publication: "pending" });
         });
 
         it("lists the next and previous DKIM selectors during a rotation", async () => {
@@ -283,6 +309,52 @@ export function dnsPublishingSuite(ctx: DnsPublishingSuiteContext): void {
             expect((await putApexTxt("example.com", { managed: true, keep: "ms=1" })).status).toBe(400);
             expect((await ctx.domainRow("example.com")).apexTxt ?? undefined).toBeUndefined();
             expect(await ctx.operationRows()).toEqual([]);
+        });
+
+        it("refuses kept values on an Azure provider, which keeps only the first value of a name, and opts in without them", async () => {
+            const provider = await createAzure();
+            await ctx.saveDomain({ name: "example.com", verificationToken: "tok" });
+            await assign("example.com", provider.uid);
+            ctx.resolver().records.set("example.com", apex);
+
+            const refused = await putApexTxt("example.com", { managed: true, keep: ["google-site-verification=g"] });
+            expect(refused.status).toBe(400);
+            expect(refused.body.message).toContain("Azure");
+            expect((await ctx.domainRow("example.com")).apexTxt ?? undefined).toBeUndefined();
+            expect(await ctx.operationRows()).toEqual([]);
+            expect(await audit(AuditAction.DNS_TAKEOVER)).toEqual([]);
+
+            // Without kept values the set is one value, SPF alone.
+            const optedIn = await putApexTxt("example.com", { managed: true, keep: [] });
+            expect(optedIn.status, JSON.stringify(optedIn.body)).toBe(200);
+            expect(optedIn.body.apexTxt).toEqual({ managed: true, keep: [], spf: "v=spf1 mx ~all" });
+
+            // Adding values to keep later is refused as well, and opting out never is.
+            const edited = await putApexTxt("example.com", { managed: true, keep: ["ms=1"] });
+            expect(edited.status).toBe(400);
+            expect((await ctx.domainRow("example.com")).apexTxt.keep).toEqual([]);
+            expect((await putApexTxt("example.com", { managed: false })).status).toBe(200);
+        });
+
+        it("refuses the opt-in on an rfc2136 provider, which can't keep an SPF value (400), changing nothing, and opting out is never refused", async () => {
+            const provider = await createRfc2136();
+            await ctx.saveDomain({ name: "example.com", verificationToken: "tok" });
+            await assign("example.com", provider.uid);
+            ctx.resolver().records.set("example.com", apex);
+
+            for (const keep of [[], ["ms=1"]]) {
+                const refused = await putApexTxt("example.com", { managed: true, keep });
+                expect(refused.status, JSON.stringify(keep)).toBe(400);
+                expect(refused.body.message).toContain("rfc2136");
+            }
+            expect((await ctx.domainRow("example.com")).apexTxt ?? undefined).toBeUndefined();
+            expect(await ctx.operationRows()).toEqual([]);
+            expect(await audit(AuditAction.DNS_TAKEOVER)).toEqual([]);
+
+            // A row opted in before this rule (spf set) can't be edited either, but can be released.
+            await ctx.saveDomain({ name: "legacy.example.com", dnsProviderUid: provider.uid, apexTxt: { managed: true, keep: [], spf: "v=spf1 mx ~all" } });
+            expect((await putApexTxt("legacy.example.com", { managed: true, keep: ["ms=1"] })).status).toBe(400);
+            expect((await putApexTxt("legacy.example.com", { managed: false })).status).toBe(200);
         });
 
         it("opts in: owns the set with SPF and the kept values, queues the takeover and audits the old values", async () => {
@@ -505,17 +577,20 @@ export function dnsPublishingSuite(ctx: DnsPublishingSuiteContext): void {
         await assign("example.com", provider.uid);
         const takeover = (records: string[]) => as(adminToken, request(ctx.app()).post(providers(`/${provider.uid}/takeover`))).send({ domainUid: "example.com", records });
         expect((await takeover(["mx"])).status).toBe(400);
-        const mixed = await takeover(["mx", "dmarc"]);
+        const mixed = await takeover(["mx", "ownership"]);
         expect(mixed.status).toBe(400);
         expect(mixed.body.message).toContain("mx");
-        expect(mixed.body.message).not.toContain("dmarc");
-        // DKIM without a key yet is listed but not published either.
-        expect((await takeover(["dkim", "dmarc"])).status).toBe(400);
+        expect(mixed.body.message).not.toContain("ownership");
+        // DMARC is a value rfc2136 can't keep (not one plain character-string), and DKIM has no key yet: listed but not published either.
+        expect((await takeover(["dkim", "ownership"])).status).toBe(400);
+        const dmarc = await takeover(["dmarc", "ownership"]);
+        expect(dmarc.status).toBe(400);
+        expect(dmarc.body.message).toContain("dmarc");
         expect(await ctx.operationRows()).toEqual([]);
 
-        const dmarc = await takeover(["dmarc"]);
-        expect(dmarc.status).toBe(200);
-        expect(dmarc.body.records.map((r: any) => `${r.recordType} ${r.dnsName}`)).toEqual(["TXT _dmarc.example.com"]);
+        const ownership = await takeover(["ownership"]);
+        expect(ownership.status).toBe(200);
+        expect(ownership.body.records.map((r: any) => `${r.recordType} ${r.dnsName}`)).toEqual(["TXT _rapidmx-verify.example.com"]);
     });
 
     it("keeps a provider config with a restore still to run, and cancels its other operations when it is deleted", async () => {
@@ -556,9 +631,11 @@ export function dnsPublishingSuite(ctx: DnsPublishingSuiteContext): void {
                 expect((await auth(request(ctx.app()).post(internal("/handshake"))).send({ kind: "Handshake", controllerVersion: "0.1.0", apiVersions: [V1] })).status).toBe(403);
                 expect((await auth(request(ctx.app()).get(internal("/v1/desired-state")))).status).toBe(403);
                 expect((await auth(request(ctx.app()).put(internal("/v1/status"))).send({ apiVersion: V1, kind: "StatusReport" })).status).toBe(403);
+                expect((await auth(request(ctx.app()).get(internal("/v1/providers/anything/credentials")))).status).toBe(403);
             }
             // A user's own token is no controller token either.
             expect((await as(adminToken, request(ctx.app()).get(internal("/v1/desired-state")))).status).toBe(403);
+            expect((await as(adminToken, request(ctx.app()).get(internal("/v1/providers/anything/credentials")))).status).toBe(403);
         });
 
         it("answers the handshake and records what the controller said, for the console", async () => {
@@ -579,7 +656,7 @@ export function dnsPublishingSuite(ctx: DnsPublishingSuiteContext): void {
             expect((await asController(request(ctx.app()).post(internal("/handshake"))).send({ kind: "Hello" })).status).toBe(400);
         });
 
-        it("serves the desired state: providers with references only, the owner id, the domains' and hosts' records", async () => {
+        it("serves the desired state: providers with the names of their credentials only, the owner id, the domains' and hosts' records", async () => {
             const provider = await createProvider({ zones: ["example.com"] });
             await ctx.saveDomain({ name: "example.com", verificationToken: "tok", dkimSelector: "mail", dkimPublicKey: "KEY" });
             await ctx.saveDomain({ name: "manual.com" });
@@ -603,7 +680,7 @@ export function dnsPublishingSuite(ctx: DnsPublishingSuiteContext): void {
                     type: "cloudflare",
                     zones: ["example.com"],
                     options: { zoneIds: [CF_ZONE_ID] },
-                    secretRef: { backend: "openbao", path: `dns/${provider.uid}`, keys: ["apiToken"], generation: 1 },
+                    credentials: { keys: ["apiToken"], generation: 1 },
                     enabled: true,
                 },
             ]);
@@ -632,6 +709,101 @@ export function dnsPublishingSuite(ctx: DnsPublishingSuiteContext): void {
             ]);
             // The owner id is stable.
             expect((await desiredState()).ownerId).toBe(state.ownerId);
+        });
+
+        describe("a provider config's credentials", () => {
+            const route53 = () =>
+                createProvider({
+                    name: "AWS",
+                    type: "route53",
+                    options: { region: "us-east-1" },
+                    credentials: { accessKeyId: "AKIAABCDEFGHIJKLMNOP", secretAccessKey: "aws-secret-VALUE" },
+                });
+            const credentialsOf = (uid: string, token: string = TEST_DNS_CONTROLLER_TOKEN) => asController(request(ctx.app()).get(internal(`/v1/providers/${uid}/credentials`)), token);
+            const fixture = (name: string) => JSON.parse(readFileSync(new URL(`../fixtures/dns-api/v1/${name}.json`, import.meta.url), "utf8"));
+
+            it("answers the controller only, whatever the config", async () => {
+                const provider = await createProvider();
+                for (const token of ["forged", TEST_OTHER_SERVICE_ACCOUNT_TOKEN]) {
+                    const refused = await credentialsOf(provider.uid, token);
+                    expect(refused.status).toBe(403);
+                    expect(JSON.stringify(refused.body)).not.toContain(TOKEN);
+                }
+                expect((await request(ctx.app()).get(internal(`/v1/providers/${provider.uid}/credentials`))).status).toBe(403);
+                // An unknown config is no different to a caller that may not ask.
+                expect((await credentialsOf("nope", "forged")).status).toBe(403);
+            });
+
+            it("hands over the decrypted credentials with their generation, never to be cached, and audits nothing", async () => {
+                const provider = await route53();
+                const auditBefore = (await ctx.auditEntries()).length;
+
+                const result = await credentialsOf(provider.uid);
+
+                expect(result.status, JSON.stringify(result.body)).toBe(200);
+                expect(result.headers["cache-control"]).toBe("no-store");
+                expect(result.body).toEqual({
+                    apiVersion: V1,
+                    kind: "DnsProviderCredentials",
+                    providerUid: provider.uid,
+                    generation: 1,
+                    values: { accessKeyId: "AKIAABCDEFGHIJKLMNOP", secretAccessKey: "aws-secret-VALUE" },
+                });
+                // The shared fixture has the same shape (and a field of a later version, which readers ignore).
+                expect(keysOf(fixture("provider-credentials"))).toEqual([...keysOf(result.body), "futureField"].sort());
+                // Asking again is no event: no audit entry.
+                await credentialsOf(provider.uid);
+                expect((await ctx.auditEntries()).length).toBe(auditBefore);
+
+                // A new credential is a new generation with the new value.
+                const changed = await as(adminToken, request(ctx.app()).put(providers(`/${provider.uid}`))).send({ credentials: { secretAccessKey: "aws-secret-NEW" } });
+                expect(changed.status).toBe(200);
+                expect((await credentialsOf(provider.uid)).body).toEqual(
+                    expect.objectContaining({ generation: 2, values: { accessKeyId: "AKIAABCDEFGHIJKLMNOP", secretAccessKey: "aws-secret-NEW" } }),
+                );
+            });
+
+            it("answers empty values for a config without credentials, and for one whose credentials were all cleared, at the generation it is at", async () => {
+                const bare = await createProvider({ name: "AWS IRSA", type: "route53", zones: ["example.net"], options: { region: "us-east-1" }, credentials: undefined });
+                expect((await credentialsOf(bare.uid)).body).toEqual({ apiVersion: V1, kind: "DnsProviderCredentials", providerUid: bare.uid, generation: 0, values: {} });
+
+                const aws = await route53();
+                await as(adminToken, request(ctx.app()).put(providers(`/${aws.uid}`))).send({ credentials: { accessKeyId: null, secretAccessKey: null } });
+                expect((await credentialsOf(aws.uid)).body).toEqual({ apiVersion: V1, kind: "DnsProviderCredentials", providerUid: aws.uid, generation: 2, values: {} });
+            });
+
+            it("is a 404 for a config that is gone", async () => {
+                const provider = await createProvider();
+                await as(adminToken, request(ctx.app()).delete(providers(`/${provider.uid}`)));
+                expect((await credentialsOf(provider.uid)).status).toBe(404);
+                expect((await credentialsOf("nope")).status).toBe(404);
+            });
+
+            it("leaves out a credential that can't be read and names it, without saying why or what was in it", async () => {
+                const provider = await route53();
+                const row = await ctx.providerRow(provider.uid);
+                // Copied from another config, so it fails authentication here; and one that isn't an envelope at all.
+                const foreign = ctx.cipher().encrypt("foreign-VALUE", { record: "DnsProvider", uid: "another-config", field: "credentials.secretAccessKey" });
+                await ctx.updateProviderRow(provider.uid, { credentials: { ...row.credentials, secretAccessKey: foreign } });
+                let result = await credentialsOf(provider.uid);
+                expect(result.status).toBe(200);
+                expect(result.body).toEqual({
+                    apiVersion: V1,
+                    kind: "DnsProviderCredentials",
+                    providerUid: provider.uid,
+                    generation: 1,
+                    values: { accessKeyId: "AKIAABCDEFGHIJKLMNOP" },
+                    unreadable: ["secretAccessKey"],
+                });
+                expect(JSON.stringify(result.body)).not.toContain("foreign-VALUE");
+                expect(keysOf(fixture("provider-credentials-unreadable"))).toEqual(keysOf(result.body));
+
+                await ctx.updateProviderRow(provider.uid, { credentials: { ...row.credentials, accessKeyId: "plaintext-in-the-row" } });
+                result = await credentialsOf(provider.uid);
+                expect(result.body.values).toEqual({ secretAccessKey: "aws-secret-VALUE" });
+                expect(result.body.unreadable).toEqual(["accessKeyId"]);
+                expect(JSON.stringify(result.body)).not.toContain("plaintext-in-the-row");
+            });
         });
 
         it("long-polls: answers as soon as the desired state changes, or with the same version after the wait", async () => {

@@ -81,7 +81,7 @@ export const ROUTE_TABLE: Record<string, RouteRow> = {
     TransportRuleRoute: { kind: "admin", base: "BaseTransportRuleRoute", gate: "trusted manages org transport rules; audited" },
     // --- public / machine ------------------------------------------------------------------------------------------
     KeyDiscoveryRoute: { kind: "public", base: "BaseKeyDiscoveryRoute", gate: "anonymous, rate limited: the published public keys of a mailbox, by hash" },
-    DnsDesiredStateRoute: { kind: "public", base: "BaseDnsDesiredStateRoute", gate: "the DNS controller's projected ServiceAccount token, verified and its exact subject checked; serves DNS desired state with secret references only, never a user's data" },
+    DnsDesiredStateRoute: { kind: "public", base: "BaseDnsDesiredStateRoute", gate: "the DNS controller's projected ServiceAccount token, verified and its exact subject checked; serves DNS desired state with the names of each provider's credential fields only, and each provider's decrypted credentials to that token alone (no-store, never audited per call), never a user's data" },
     MailIngestRoute: { kind: "public", base: "BaseMailIngestRoute", gate: "the MTA's shared bearer secret; not a user endpoint" },
     WkdRoute: { kind: "public", base: "BaseWkdRoute", gate: "anonymous, rate limited: a mailbox's published OpenPGP certificate, by WKD hash and local part" },
     ServerInfoRoute: { kind: "public", base: "BaseServerInfoRoute", gate: "anonymous, rate limited: this deployment's auth-server URL (mail:auth_server_url), the second hop of multi-server discovery" },

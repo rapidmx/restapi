@@ -2321,7 +2321,7 @@ export interface DnsProviderStatus {
 
 /**
  * A named, admin-managed configuration of one DNS hosting account, which publishes the records of the domains assigned to it (`Domain.dnsProviderUid`)
- * through its own external-dns instance. Its credentials live in the deployment's `SecretStore`; the row holds only `secretRef`.
+ * through its own external-dns instance. Its credentials are saved on the row itself, one encrypted envelope per secret field (`credentials`).
  *
  * Deny-all class ACL like every admin entity; `BaseDnsProviderRoute` (trusted role, elevation for every write) is the only way in.
  */
@@ -2334,14 +2334,18 @@ export interface DnsProvider extends BaseEntity {
     /** `name` in lowercase, under a unique index on both backends: what keeps names unique when two writes race. Server-set, never returned. */
     nameKey: string;
     type: DnsProviderType;
-    /** The zones (apex names) this config may publish into: external-dns's `--domain-filter`. At least one. A `Domain` may be assigned to this config only
-     * when its name is one of these or under one of them. */
+    /** The zones (apex names) this config may publish into: external-dns's `--domain-filter`. At least one, and none that another config has. A `Domain`
+     * may be assigned to this config only when its name is one of these or under one of them, and no other config covers it more specifically. */
     zones: string[];
     /** Non-secret, type-specific options, validated per type (`dns/DnsProviderTypes.ts`), with every default filled in. */
     options: Record<string, DnsProviderOptionValue>;
-    /** Where the credentials are: a reference, never the value. Unset until credentials are saved (and for a type that can run without, such as Route 53
-     * with IRSA). `null` once cleared. */
-    secretRef?: SecretRef | null;
+    /** The credentials, one encrypted envelope per secret field of the type, keyed by the field name (associated data `DnsProvider`, the row's `uid` and
+     * `credentials.<field>`). Unset until credentials are saved (and for a config that needs none: Route 53 through IRSA, unsigned rfc2136); `null` once
+     * every credential was cleared. Never returned: responses show the mask for each field set. */
+    credentials?: Record<string, ConfigEnvelope> | null;
+    /** Bumped on every change to `credentials`, in the same write: the DNS controller rewrites the external-dns Secret when it differs from the one the
+     * Secret is at, and the Deployment's pod template carries it, so new credentials roll the pod. 0 before any. */
+    credentialsGeneration?: number;
     /** `"installer"` for the config the installer created, so the console can say where it came from; `"console"` for one added there. */
     origin?: "installer" | "console";
     /** Admin on/off. A disabled config's external-dns instance is scaled to zero; its records stay as they are. */

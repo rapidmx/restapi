@@ -119,8 +119,52 @@ describe("dnsManualReason()", () => {
     it("is kind_unsupported for MX and SRV on rfc2136, which can't update or delete them", () => {
         expect(dnsManualReason(record("mx"), makeDomain(), rfc2136)).toBe("kind_unsupported");
         expect(dnsManualReason(record("autodiscover_srv"), makeDomain(), rfc2136)).toBe("kind_unsupported");
-        expect(dnsManualReason(record("dmarc"), makeDomain(), rfc2136)).toBeUndefined();
+        expect(dnsManualReason(record("openpgpkey_cname"), makeDomain(), rfc2136)).toBeUndefined();
         expect(dnsManualReason(record("mx"), makeDomain(), cloudflare)).toBeUndefined();
+    });
+
+    it("is kind_unsupported for a TXT value rfc2136 can't update or delete: anything but one plain character-string", () => {
+        const txt = (...values: string[]) => ({ type: "dmarc" as const, recordKind: "TXT" as const, recordName: "_dmarc.example.com", values });
+        // Plain values read back as written: the ownership value and an unquoted word.
+        expect(dnsManualReason(record("ownership"), makeDomain(), rfc2136)).toBeUndefined();
+        expect(dnsManualReason(txt("ms=1", "google-site-verification=abc_DEF-1.2"), makeDomain(), rfc2136)).toBeUndefined();
+        // A space, `;`, a quote, a backslash, parentheses, `$`, `@`, a control or non-ASCII character, a value over 255 bytes, or an empty one.
+        for (const value of ["v=DMARC1; p=none;", "a b", "a;b", 'a"b', "a\\b", "a(b", "a)b", "a$b", "a@b", "a\tb", "café","x".repeat(256), ""]) {
+            expect(dnsManualReason(txt(value), makeDomain(), rfc2136), JSON.stringify(value)).toBe("kind_unsupported");
+        }
+        expect(dnsManualReason(txt("x".repeat(255)), makeDomain(), rfc2136)).toBeUndefined();
+        // One value that isn't plain makes the whole record manual.
+        expect(dnsManualReason(txt("ms=1", "v=spf1 mx ~all"), makeDomain(), rfc2136)).toBe("kind_unsupported");
+        // DKIM, SPF and DMARC are never plain.
+        for (const type of ["dkim", "spf", "dmarc"]) {
+            expect(dnsManualReason(record(type), makeDomain({ apexTxt: { managed: true, keep: [] } }), rfc2136), type).toBe("kind_unsupported");
+        }
+        // Other providers keep them, and a value that isn't text (an MX) is no TXT.
+        for (const provider of [cloudflare, { type: "route53" as const, zones: ["example.com"] }, { type: "google" as const, zones: ["example.com"] }]) {
+            expect(dnsManualReason(txt("v=DMARC1; p=none;"), makeDomain(), provider), provider.type).toBeUndefined();
+        }
+    });
+
+    it("is kind_unsupported for an Azure TXT name with several values, which it writes and reads only the first of", () => {
+        const azure: Pick<DnsProvider, "type" | "zones"> = { type: "azure", zones: ["example.com"] };
+        const spf = (...values: string[]) => ({ type: "spf" as const, recordKind: "TXT" as const, recordName: "example.com", values });
+        const managed = makeDomain({ apexTxt: { managed: true, keep: [] } });
+        expect(dnsManualReason(spf("v=spf1 mx ~all", "ms=1"), managed, azure)).toBe("kind_unsupported");
+        expect(dnsManualReason(spf("v=spf1 mx ~all"), managed, azure)).toBeUndefined();
+        // A value with spaces, quotes or a long one is fine for Azure: one value, written as it is.
+        expect(dnsManualReason({ ...spf('v=spf1 "x"'), type: "dmarc" }, makeDomain(), azure)).toBeUndefined();
+        expect(dnsManualReason(spf("x".repeat(300)), managed, azure)).toBeUndefined();
+        // Several values of another kind don't matter to the TXT rule (an MX set).
+        expect(dnsManualReason({ type: "mx", recordKind: "MX", recordName: "example.com", values: ["10 a.example.com", "20 b.example.com"] }, managed, azure)).toBeUndefined();
+        expect(dnsManualReason(spf("v=spf1 mx ~all", "ms=1"), managed, cloudflare)).toBeUndefined();
+    });
+
+    it("reports the reasons in order: no provider, outside the zones, a kind the provider can't keep, then the unmanaged apex", () => {
+        const spf = record("spf");
+        // rfc2136 can't keep SPF whatever the opt-in says, so that reason comes before the apex one.
+        expect(dnsManualReason(spf, makeDomain(), rfc2136)).toBe("kind_unsupported");
+        expect(dnsManualReason(spf, makeDomain(), { type: "rfc2136", zones: ["other.com"] })).toBe("outside_zones");
+        expect(dnsManualReason(spf, makeDomain(), cloudflare)).toBe("apex_txt_unmanaged");
     });
 
     it("is apex_txt_unmanaged for SPF until the domain opts into apex TXT management", () => {

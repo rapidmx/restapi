@@ -9,6 +9,7 @@
 // database.
 import * as fs from "fs";
 import { AuditAction, type ConfigEnvelope } from "../../src/models/types.js";
+import { dnsProviderEnvelopeSource } from "../../src/dns/DnsProviderEnvelopeSource.js";
 import { isConfigEnvelope, type ConfigCipher } from "../../src/secrets/ConfigCipher.js";
 import { ConfigEnvelopeSourceRegistry, type ConfigEnvelopeSource } from "../../src/secrets/ConfigEnvelopeSource.js";
 import type { LocalConfigKeyChannel } from "../../src/secrets/ConfigKeyChannel.js";
@@ -35,6 +36,11 @@ export interface ConfigKeyRotationSuiteContext {
     deletePlugin: (uid: string) => Promise<void>;
     clearPlugins: () => Promise<void>;
     pluginModel: () => any;
+    /** Saves a DNS provider row named `provider <uid>` with these credentials and generation. */
+    insertProvider: (uid: string, credentials: Record<string, ConfigEnvelope> | null, credentialsGeneration: number) => Promise<void>;
+    provider: (uid: string) => Promise<any>;
+    clearProviders: () => Promise<void>;
+    providerModel: () => any;
     auditEntries: (action: AuditAction) => Promise<any[]>;
     clearAudit: () => Promise<void>;
 }
@@ -111,6 +117,7 @@ export function configKeyRotationSuite(ctx: ConfigKeyRotationSuiteContext): void
             writeRing(OLD);
             await ctx.clearState();
             await ctx.clearPlugins();
+            await ctx.clearProviders();
             await ctx.clearAudit();
             ctx.channel().reset();
             await ctx.cipher().reload();
@@ -613,6 +620,35 @@ export function configKeyRotationSuite(ctx: ConfigKeyRotationSuiteContext): void
                 expect(audits[0].details).toEqual({ targetKid: kid, counts: { PluginA: 2, PluginB: 1 } });
                 expect(audits[0].actorUserUid).toBeFalsy();
                 expect(JSON.stringify(audits)).not.toContain("alpha-secret");
+            });
+
+            it("re-encrypts a DNS provider's credentials with their own envelope source, leaving the generation and the rest of the row alone", async () => {
+                const kid = await activate();
+                job.sources.register(dnsProviderEnvelopeSource(ctx.providerModel()));
+                const sealCredential = (uid: string, field: string, value: string) => ctx.cipher().encrypt(value, { record: "DnsProvider", uid, field: `credentials.${field}` });
+                await ctx.insertProvider("aws-1", { accessKeyId: sealCredential("aws-1", "accessKeyId", "AKIAEXAMPLE"), secretAccessKey: sealCredential("aws-1", "secretAccessKey", "aws-secret") }, 3);
+                await ctx.insertProvider("none-1", null, 0);
+                const untouched = (await ctx.provider("none-1")).version;
+                await beat("pod-a:1", [OLD.kid, kid], kid);
+
+                await job.run();
+
+                const row = await ctx.provider("aws-1");
+                expect(row.credentialsGeneration).toBe(3);
+                expect(row.name).toBe("provider aws-1");
+                for (const [field, value] of [
+                    ["accessKeyId", "AKIAEXAMPLE"],
+                    ["secretAccessKey", "aws-secret"],
+                ]) {
+                    expect(row.credentials[field].kid).toBe(kid);
+                    expect(ctx.cipher().decrypt(row.credentials[field], { record: "DnsProvider", uid: "aws-1", field: `credentials.${field}` })).toBe(value);
+                }
+                // A config without credentials has nothing to re-encrypt, and its row is untouched.
+                const bare = await ctx.provider("none-1");
+                expect(bare.credentials ?? null).toBeNull();
+                expect(bare.version).toBe(untouched);
+                expect((await ctx.auditEntries(AuditAction.CONFIG_REENCRYPTED))[0].details).toEqual({ targetKid: kid, counts: { DnsProvider: 2 } });
+                expect((await ctx.state()).kidUsage).toEqual({ [kid]: 2 });
             });
 
             it("records the counts per key and that the pass completed", async () => {

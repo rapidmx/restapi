@@ -16,6 +16,7 @@ import config from "../../config.js";
 import { ConfigKeyRotationJobMongo } from "../../../src/jobs/mongo/ConfigKeyRotationJobMongo.js";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { ConfigKeyStateMongo } from "../../../src/models/mongo/ConfigKeyStateMongo.js";
+import { DnsProviderMongo } from "../../../src/models/mongo/DnsProviderMongo.js";
 import { PluginMongo } from "../../../src/models/mongo/PluginMongo.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { LocalConfigKeyChannel } from "../../../src/secrets/ConfigKeyChannel.js";
@@ -56,7 +57,7 @@ describe("ConfigKeyRotationJobMongo Tests (real DB + DI)", () => {
 
         connectionManager = await objectFactory.newInstance(ConnectionManager, { name: "default" });
         const models = new Map<string, any>();
-        for (const cls of [ConfigKeyStateMongo, PluginMongo, AuditLogEntryMongo]) {
+        for (const cls of [ConfigKeyStateMongo, DnsProviderMongo, PluginMongo, AuditLogEntryMongo]) {
             models.set(cls.name, cls);
         }
         await connectionManager.connect(config.get("datastores"), models);
@@ -86,6 +87,8 @@ describe("ConfigKeyRotationJobMongo Tests (real DB + DI)", () => {
         expect(job.channel).toBeInstanceOf(LocalConfigKeyChannel);
         expect(job.stateRepo).toBeDefined();
         expect(job.auditLogUtils).toBeDefined();
+        // The record types that hold envelopes: a DNS provider's credentials.
+        expect(job.sources.list().map((source: any) => [source.record, source.modelClass])).toEqual([["DnsProvider", DnsProviderMongo]]);
         await job.dispose();
     });
 
@@ -112,6 +115,14 @@ describe("ConfigKeyRotationJobMongo Tests (real DB + DI)", () => {
         },
         clearPlugins: async () => await clear("PluginMongo"),
         pluginModel: () => PluginMongo,
+        insertProvider: async (uid, credentials, credentialsGeneration) => {
+            await repos.DnsProviderMongo.save(
+                new DnsProviderMongo({ uid, name: `provider ${uid}`, type: "route53", zones: ["example.com"], options: { region: "us-east-1" }, credentials, credentialsGeneration } as any),
+            );
+        },
+        provider: async (uid) => (await repos.DnsProviderMongo.findOne({ uid } as any))!,
+        clearProviders: async () => await clear("DnsProviderMongo"),
+        providerModel: () => DnsProviderMongo,
         auditEntries: async (action: AuditAction) => await repos.AuditLogEntryMongo.find({ action }).toArray(),
         clearAudit: async () => await clear("AuditLogEntryMongo"),
     });
