@@ -9,7 +9,8 @@ import { Repository } from "typeorm";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
 import { IntegrationSettingsSQL } from "../../../src/models/sql/IntegrationSettingsSQL.js";
 import { INTEGRATION_SETTINGS_UID } from "../../../src/util/IntegrationSettingsUtils.js";
-import { InMemorySecretStore, registerTestDoubles } from "../../testDoubles.js";
+import type { ConfigCipher } from "../../../src/secrets/ConfigCipher.js";
+import { registerTestDoubles } from "../../testDoubles.js";
 import { integrationsSuite } from "../integrationsSuite.js";
 
 describe("Route:IntegrationsSQL Tests", () => {
@@ -43,7 +44,7 @@ describe("Route:IntegrationsSQL Tests", () => {
         config,
         app: () => server.getApplication(),
         prefix: "/sql",
-        store: () => objectFactory.getInstance<InMemorySecretStore>("SecretStore")!,
+        cipher: () => objectFactory.getInstance<ConfigCipher>("ConfigCipher")!,
         clear: async () => {
             for (const repo of Object.values(repos)) {
                 await repo.clear();

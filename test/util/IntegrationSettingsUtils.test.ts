@@ -10,12 +10,15 @@ import { setDiscoveryAddressLookup } from "../../src/util/KeyDiscoveryClient.js"
 import {
     buildIntegrationsConfigLayer,
     DEFAULT_DOH_ENDPOINT,
+    GIPHY_API_KEY_FIELD,
     integrationDefaults,
-    integrationSecretPath,
+    integrationSecretContext,
     integrationSettingsView,
     INTEGRATION_CONFIG_KEYS,
     INTEGRATION_SECTION_FIELDS,
     INTEGRATION_SECTIONS,
+    INTEGRATION_SETTINGS_RECORD,
+    INTEGRATION_SETTINGS_UID,
     isIntegrationSection,
     MAX_INTEGRATION_PLUGIN_NAMESPACES,
     MAX_STUN_URLS,
@@ -24,14 +27,17 @@ import {
     normalizeIntegrationNamespaces,
     normalizeIntegrationUrl,
     normalizeStunUrls,
-    pluginNamespaceTokenKey,
+    pluginNamespaceTokenField,
+    PLUGIN_REGISTRY_TOKEN_FIELD,
     sameRegistryUrl,
     withoutUrlCredentials,
 } from "../../src/util/IntegrationSettingsUtils.js";
-import type { IntegrationSettings, SecretRef } from "../../src/models/types.js";
+import { ConfigSecretUnavailableError, type ConfigCipherContext } from "../../src/secrets/ConfigCipher.js";
+import type { ConfigEnvelope, IntegrationSettings } from "../../src/models/types.js";
 
 const MASK = { secret: true };
-const ref = (path: string, keys: string[], generation = 1): SecretRef => ({ backend: "openbao", path, keys, generation });
+/** A stand-in envelope; its `ct` says what the fake cipher below reads out of it. */
+const envelope = (ct: string): ConfigEnvelope => ({ $enc: 1, kid: "k1", iv: "aXY=", ct, tag: "dGFn" });
 
 /** Answers each host from `addresses`; a host not listed doesn't resolve. */
 function lookupFrom(addresses: Record<string, string[]>): (hostname: string) => Promise<string[]> {
@@ -208,10 +214,18 @@ describe("IntegrationSettingsUtils", () => {
             expect(err.message).not.toContain("sec");
         });
 
-        it("keys a namespace's token by its scope, in characters every secret backend takes", () => {
-            expect(pluginNamespaceTokenKey("@acme")).toBe("ns-4061636d65");
-            expect(pluginNamespaceTokenKey("@a~b.c_d-e")).toMatch(/^[-._a-zA-Z0-9]+$/);
-            expect(pluginNamespaceTokenKey("@a")).not.toBe(pluginNamespaceTokenKey("@b"));
+        it("binds each secret to the IntegrationSettings row and its field, a namespace's token by its scope", () => {
+            expect(INTEGRATION_SETTINGS_RECORD).toBe("IntegrationSettings");
+            expect(GIPHY_API_KEY_FIELD).toBe("giphy.apiKey");
+            expect(PLUGIN_REGISTRY_TOKEN_FIELD).toBe("pluginRegistry.token");
+            expect(pluginNamespaceTokenField("@acme")).toBe("pluginRegistry.namespaces.@acme.token");
+            expect(pluginNamespaceTokenField("@a")).not.toBe(pluginNamespaceTokenField("@b"));
+            expect(integrationSecretContext(GIPHY_API_KEY_FIELD)).toEqual({ record: "IntegrationSettings", uid: INTEGRATION_SETTINGS_UID, field: "giphy.apiKey" });
+            expect(integrationSecretContext(pluginNamespaceTokenField("@acme"))).toEqual({
+                record: "IntegrationSettings",
+                uid: "integrations",
+                field: "pluginRegistry.namespaces.@acme.token",
+            });
         });
     });
 
@@ -321,14 +335,13 @@ describe("IntegrationSettingsUtils", () => {
             const settings: IntegrationSettings = {
                 uid: "integrations",
                 version: 4,
-                giphy: { enabled: false, apiKeyRef: ref("server/giphy", ["apiKey"]) },
+                giphy: { enabled: false, apiKey: envelope("giphy") },
                 stun: { urls: ["stun:stun.example.com"] },
                 signingCa: null,
                 dnsResolver: { mode: "doh-dnssec" },
                 pluginRegistry: {
-                    tokenRef: ref("server/plugin-registry", ["token"]),
-                    namespaces: [{ name: "@acme", registry: "https://registry.example.com/" }, { name: "@open" }],
-                    namespaceTokensRef: ref("server/plugin-namespaces", [pluginNamespaceTokenKey("@acme")]),
+                    token: envelope("registry"),
+                    namespaces: [{ name: "@acme", registry: "https://registry.example.com/", token: envelope("acme") }, { name: "@open" }],
                 },
             } as any;
             const view = integrationSettingsView(settings, defaults);
@@ -345,7 +358,8 @@ describe("IntegrationSettingsUtils", () => {
                 namespaces: [{ name: "@acme", registry: "https://registry.example.com/", token: MASK }, { name: "@open" }],
             });
             expect(view.pluginRegistry.source).toEqual({ url: "deployment", token: "admin", namespaces: "admin" });
-            expect(JSON.stringify(view)).not.toContain("server/");
+            // The view carries the mask, never an envelope.
+            expect(JSON.stringify(view)).not.toMatch(/$enc|aXY=|"ct"/);
         });
 
         it("shows no token, and the deployment's namespaces without their default-registry tokens, for an administrator's registry elsewhere", () => {
@@ -368,7 +382,7 @@ describe("IntegrationSettingsUtils", () => {
                 {
                     uid: "integrations",
                     version: 3,
-                    pluginRegistry: { url: "https://registry.example.com", tokenRef: ref("server/plugin-registry-1", ["token"]), namespaces: [{ name: "@own" }] },
+                    pluginRegistry: { url: "https://registry.example.com", token: envelope("registry"), namespaces: [{ name: "@own" }] },
                 } as any,
                 deployment,
             );
@@ -378,51 +392,49 @@ describe("IntegrationSettingsUtils", () => {
             expect(same.pluginRegistry.source.token).toBe("deployment");
         });
 
-        it("counts a reference without its key, or a null field, as not set", () => {
-            const view = integrationSettingsView({ uid: "integrations", version: 1, giphy: { enabled: null as any, apiKeyRef: ref("server/giphy", []) } } as any, integrationDefaults({}));
+        it("counts a null or missing secret, or a null field, as not set", () => {
+            const view = integrationSettingsView({ uid: "integrations", version: 1, giphy: { enabled: null as any, apiKey: null } } as any, integrationDefaults({}));
             expect(view.giphy.source).toEqual({ enabled: "deployment", apiKey: "deployment" });
             expect(view.giphy.values).toEqual({ enabled: true, apiKey: null });
         });
     });
 
     describe("buildIntegrationsConfigLayer()", () => {
-        const store = (secrets: Record<string, Record<string, string>>, failing: string[] = []) => ({
-            read: vi.fn(async (secretRef: SecretRef) => {
-                if (failing.includes(secretRef.path)) {
-                    throw new Error("store unavailable");
-                }
-                return { ...(secrets[secretRef.path] ?? {}) };
-            }),
+        /** Reads the plain text out of a stand-in envelope's `ct`, recording the context each was opened for; an envelope whose `ct` starts with `bad` can't be read. */
+        function cipher() {
+            const contexts: ConfigCipherContext[] = [];
+            return {
+                contexts,
+                decryptString: vi.fn((sealed: ConfigEnvelope, context: ConfigCipherContext): string => {
+                    contexts.push(context);
+                    if (sealed.ct.startsWith("bad")) {
+                        throw new ConfigSecretUnavailableError(context.record, context.uid, context.field, "unknown_key", "its key 'k9' isn't in the keyring");
+                    }
+                    return sealed.ct;
+                }),
+            };
+        }
+
+        it("is empty before anything is saved", () => {
+            const read = cipher();
+            expect(buildIntegrationsConfigLayer(undefined, read, {})).toEqual({ values: {}, unreadable: [] });
+            expect(read.decryptString).not.toHaveBeenCalled();
         });
 
-        it("is empty before anything is saved", async () => {
-            const read = store({});
-            expect(await buildIntegrationsConfigLayer(undefined, read, {})).toEqual({ values: {}, unresolved: [] });
-            expect(read.read).not.toHaveBeenCalled();
-        });
-
-        it("sets exactly the config keys the administrator chose, with the secrets read from the store", async () => {
+        it("sets exactly the config keys the administrator chose, with the secrets decrypted for the row and field they are on", () => {
             const settings: any = {
-                giphy: { enabled: true, apiKeyRef: ref("server/giphy", ["apiKey"]) },
+                giphy: { enabled: true, apiKey: envelope("GIPHY") },
                 stun: { urls: ["stun:stun.example.com"] },
                 signingCa: { backend: "rfc8823", directoryUrl: "https://acme.example.com/dir", contactEmail: "pki@example.com" },
                 dnsResolver: { mode: "doh-dnssec", dohEndpoint: "https://dns.example.com/dns-query" },
                 pluginRegistry: {
                     url: "https://registry.example.com",
-                    tokenRef: ref("server/plugin-registry", ["token"]),
-                    namespaces: [{ name: "@acme", registry: "https://npm.acme.example" }, { name: "@open" }],
-                    namespaceTokensRef: ref("server/plugin-namespaces", [pluginNamespaceTokenKey("@acme")]),
+                    token: envelope("REG"),
+                    namespaces: [{ name: "@acme", registry: "https://npm.acme.example", token: envelope("NS") }, { name: "@open" }],
                 },
             };
-            const layer = await buildIntegrationsConfigLayer(
-                settings,
-                store({
-                    "server/giphy": { apiKey: "GIPHY" },
-                    "server/plugin-registry": { token: "REG" },
-                    "server/plugin-namespaces": { [pluginNamespaceTokenKey("@acme")]: "NS" },
-                }),
-                {},
-            );
+            const read = cipher();
+            const layer = buildIntegrationsConfigLayer(settings, read, {});
             expect(layer).toEqual({
                 values: {
                     "giphy:enabled": true,
@@ -437,40 +449,70 @@ describe("IntegrationSettingsUtils", () => {
                     "system:plugins:registry_token": "REG",
                     "system:plugins:namespaces": [{ name: "@acme", registry: "https://npm.acme.example", token: "NS" }, { name: "@open" }],
                 },
-                unresolved: [],
+                unreadable: [],
             });
+            expect(read.contexts).toEqual([
+                { record: "IntegrationSettings", uid: "integrations", field: "giphy.apiKey" },
+                { record: "IntegrationSettings", uid: "integrations", field: "pluginRegistry.token" },
+                { record: "IntegrationSettings", uid: "integrations", field: "pluginRegistry.namespaces.@acme.token" },
+            ]);
+            // The row's envelopes never reach the layer, only what they decrypt to.
+            expect(JSON.stringify(layer)).not.toMatch(/\$enc|aXY=/);
         });
 
-        it("passes namespaces without tokens on as they are, reading nothing", async () => {
-            const read = store({});
-            const layer = await buildIntegrationsConfigLayer({ pluginRegistry: { namespaces: [{ name: "@acme" }], namespaceTokensRef: ref("server/plugin-namespaces", []) } } as any, read, {});
-            expect(layer).toEqual({ values: { "system:plugins:namespaces": [{ name: "@acme" }] }, unresolved: [] });
-            expect((await buildIntegrationsConfigLayer({ pluginRegistry: { namespaces: [] } } as any, read, {})).values).toEqual({ "system:plugins:namespaces": [] });
-            expect(read.read).not.toHaveBeenCalled();
+        it("passes namespaces without tokens on as they are, decrypting nothing", () => {
+            const read = cipher();
+            const layer = buildIntegrationsConfigLayer({ pluginRegistry: { namespaces: [{ name: "@acme" }, { name: "@b", registry: "https://npm.b.example", token: null }] } } as any, read, {});
+            expect(layer).toEqual({ values: { "system:plugins:namespaces": [{ name: "@acme" }, { name: "@b", registry: "https://npm.b.example" }] }, unreadable: [] });
+            expect(buildIntegrationsConfigLayer({ pluginRegistry: { namespaces: [] } } as any, read, {}).values).toEqual({ "system:plugins:namespaces": [] });
+            expect(read.decryptString).not.toHaveBeenCalled();
         });
 
-        it("turns Giphy off by emptying its key too, without reading it", async () => {
-            const read = store({ "server/giphy": { apiKey: "GIPHY" } });
-            const layer = await buildIntegrationsConfigLayer({ giphy: { enabled: false, apiKeyRef: ref("server/giphy", ["apiKey"]) } } as any, read, {});
+        it("turns Giphy off by emptying its key too, without decrypting it", () => {
+            const read = cipher();
+            const layer = buildIntegrationsConfigLayer({ giphy: { enabled: false, apiKey: envelope("GIPHY") } } as any, read, {});
             expect(layer.values).toEqual({ "giphy:enabled": false, "giphy:api_key": "" });
-            expect(read.read).not.toHaveBeenCalled();
+            expect(read.decryptString).not.toHaveBeenCalled();
         });
 
-        it("leaves out, and reports, a secret the store can't give, so the deployment's value applies", async () => {
-            const layer = await buildIntegrationsConfigLayer(
+        it("leaves out, and reports by field, a secret that can't be read, so the deployment's value applies; the namespace it was on is kept without it", () => {
+            const layer = buildIntegrationsConfigLayer(
                 {
-                    giphy: { apiKeyRef: ref("server/giphy", ["apiKey"]) },
+                    giphy: { apiKey: envelope("bad-giphy") },
                     pluginRegistry: {
-                        tokenRef: ref("server/plugin-registry", ["token"]),
-                        namespaces: [{ name: "@acme" }],
-                        namespaceTokensRef: ref("server/plugin-namespaces", [pluginNamespaceTokenKey("@acme")]),
+                        token: envelope("REG"),
+                        namespaces: [{ name: "@acme", token: envelope("bad-acme") }, { name: "@other", token: envelope("OTHER") }],
                     },
                 } as any,
-                store({ "server/plugin-registry": {} }, ["server/giphy", "server/plugin-namespaces"]),
+                cipher(),
                 {},
             );
-            expect(layer.values).toEqual({ "system:plugins:namespaces": [{ name: "@acme" }] });
-            expect(layer.unresolved).toEqual(["giphy:api_key", "system:plugins:registry_token", "system:plugins:namespaces"]);
+            expect(layer.values).toEqual({
+                "system:plugins:registry_token": "REG",
+                "system:plugins:namespaces": [{ name: "@acme" }, { name: "@other", token: "OTHER" }],
+            });
+            expect(layer.unreadable).toEqual(["giphy.apiKey", "pluginRegistry.namespaces.@acme.token"]);
+            // The report names fields, never why or what.
+            expect(JSON.stringify(layer)).not.toMatch(/k9|keyring|bad-/);
+        });
+
+        it("reports a value that isn't an envelope (saved by hand, in plaintext) as unreadable rather than using it", () => {
+            const strict: any = {
+                decryptString: vi.fn((_value: unknown, context: ConfigCipherContext) => {
+                    throw new ConfigSecretUnavailableError(context.record, context.uid, context.field, "invalid", "it isn't an envelope");
+                }),
+            };
+            const layer = buildIntegrationsConfigLayer({ giphy: { apiKey: "plaintext" }, pluginRegistry: { token: "plaintext" } } as any, strict, {});
+            expect(layer).toEqual({ values: {}, unreadable: ["giphy.apiKey", "pluginRegistry.token"] });
+        });
+
+        it("doesn't hide any other failure: that is a bug, not a secret to enter again", () => {
+            const broken: any = {
+                decryptString: vi.fn(() => {
+                    throw new TypeError("cipher is broken");
+                }),
+            };
+            expect(() => buildIntegrationsConfigLayer({ giphy: { apiKey: envelope("GIPHY") } } as any, broken, {})).toThrow("cipher is broken");
         });
 
         describe("an administrator's registry elsewhere than the deployment's", () => {
@@ -480,8 +522,8 @@ describe("IntegrationSettingsUtils", () => {
                 "system:plugins:namespaces": [{ name: "@corp", token: "CORP-TOKEN" }, { name: "@acme", registry: "https://npm.acme.example", token: "ACME-TOKEN" }, "@rapidmx"],
             };
 
-            it("never takes the deployment's token or its default-registry namespaces' tokens with it", async () => {
-                const layer = await buildIntegrationsConfigLayer({ pluginRegistry: { url: "https://registry.npmmirror.com" } } as any, store({}), deployment);
+            it("never takes the deployment's token or its default-registry namespaces' tokens with it", () => {
+                const layer = buildIntegrationsConfigLayer({ pluginRegistry: { url: "https://registry.npmmirror.com" } } as any, cipher(), deployment);
                 expect(layer.values).toEqual({
                     "system:plugins:registry": "https://registry.npmmirror.com",
                     "system:plugins:registry_token": "",
@@ -491,45 +533,38 @@ describe("IntegrationSettingsUtils", () => {
                 expect(JSON.stringify(layer)).not.toMatch(/DEPLOYMENT-TOKEN|CORP-TOKEN/);
             });
 
-            it("sets none when the administrator's own token can't be read either", async () => {
-                const layer = await buildIntegrationsConfigLayer(
-                    { pluginRegistry: { url: "https://registry.example.com", tokenRef: ref("server/plugin-registry", ["token"]) } } as any,
-                    store({}, ["server/plugin-registry"]),
-                    {},
-                );
-                expect(layer).toEqual({ values: { "system:plugins:registry": "https://registry.example.com", "system:plugins:registry_token": "" }, unresolved: ["system:plugins:registry_token"] });
+            it("sets none when the administrator's own token can't be read either", () => {
+                const layer = buildIntegrationsConfigLayer({ pluginRegistry: { url: "https://registry.example.com", token: envelope("bad-token") } } as any, cipher(), {});
+                expect(layer).toEqual({
+                    values: { "system:plugins:registry": "https://registry.example.com", "system:plugins:registry_token": "" },
+                    unreadable: ["pluginRegistry.token"],
+                });
             });
 
-            it("keeps the administrator's own token and namespaces, and leaves namespaces without default-registry tokens to the deployment", async () => {
-                const layer = await buildIntegrationsConfigLayer(
-                    { pluginRegistry: { url: "https://registry.example.com", tokenRef: ref("server/plugin-registry", ["token"]), namespaces: [{ name: "@own" }] } } as any,
-                    store({ "server/plugin-registry": { token: "ADMIN" } }),
+            it("keeps the administrator's own token and namespaces, and leaves namespaces without default-registry tokens to the deployment", () => {
+                const layer = buildIntegrationsConfigLayer(
+                    { pluginRegistry: { url: "https://registry.example.com", token: envelope("ADMIN"), namespaces: [{ name: "@own" }] } } as any,
+                    cipher(),
                     deployment,
                 );
                 expect(layer.values).toEqual({ "system:plugins:registry": "https://registry.example.com", "system:plugins:registry_token": "ADMIN", "system:plugins:namespaces": [{ name: "@own" }] });
-                const plain = await buildIntegrationsConfigLayer({ pluginRegistry: { url: "https://registry.example.com" } } as any, store({}), {});
+                const plain = buildIntegrationsConfigLayer({ pluginRegistry: { url: "https://registry.example.com" } } as any, cipher(), {});
                 expect(plain.values).toEqual({ "system:plugins:registry": "https://registry.example.com", "system:plugins:registry_token": "" });
             });
 
-            it("leaves the deployment's credentials in place for the deployment's own registry, however its URL is written", async () => {
+            it("leaves the deployment's credentials in place for the deployment's own registry, however its URL is written", () => {
                 for (const url of ["https://npm.internal.example.com/", "https://NPM.internal.example.com"]) {
-                    const layer = await buildIntegrationsConfigLayer({ pluginRegistry: { url } } as any, store({}), deployment);
+                    const layer = buildIntegrationsConfigLayer({ pluginRegistry: { url } } as any, cipher(), deployment);
                     expect(layer.values).toEqual({ "system:plugins:registry": url });
                 }
-                expect((await buildIntegrationsConfigLayer({ pluginRegistry: { url: DEFAULT_PLUGIN_REGISTRY } } as any, store({}), {})).values).toEqual({
+                expect(buildIntegrationsConfigLayer({ pluginRegistry: { url: DEFAULT_PLUGIN_REGISTRY } } as any, cipher(), {}).values).toEqual({
                     "system:plugins:registry": DEFAULT_PLUGIN_REGISTRY,
                 });
             });
         });
     });
 
-    describe("secret paths and registry URLs", () => {
-        it("gives every write of a secret a path of its own under its base", () => {
-            const first = integrationSecretPath("server/giphy");
-            expect(first).toMatch(/^server\/giphy-[0-9a-f]{16}$/);
-            expect(integrationSecretPath("server/giphy")).not.toBe(first);
-        });
-
+    describe("registry URLs", () => {
         it("removes a user name and password from a URL, and nothing else", () => {
             expect(withoutUrlCredentials("https://ci:s3cret@npm.internal.example.com/path?q=1")).toBe("https://npm.internal.example.com/path?q=1");
             expect(withoutUrlCredentials("https://user:p@ss@host.example.com")).toBe("https://host.example.com");

@@ -47,6 +47,7 @@ export * from "./FreeBusyLookupUtils.js";
 export * from "./FreeBusyUtils.js";
 export * from "./HostConfig.js";
 export * from "./IcsUtils.js";
+export * from "./IntegrationSettingsEnvelopeSource.js";
 export * from "./IntegrationSettingsUtils.js";
 export * from "./LegalHoldUtils.js";
 export * from "./MailAccessUtils.js";

@@ -17,6 +17,7 @@ import { ConfigKeyRotationJobMongo } from "../../../src/jobs/mongo/ConfigKeyRota
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { ConfigKeyStateMongo } from "../../../src/models/mongo/ConfigKeyStateMongo.js";
 import { DnsProviderMongo } from "../../../src/models/mongo/DnsProviderMongo.js";
+import { IntegrationSettingsMongo } from "../../../src/models/mongo/IntegrationSettingsMongo.js";
 import { PluginMongo } from "../../../src/models/mongo/PluginMongo.js";
 import { AuditAction } from "../../../src/models/types.js";
 import { LocalConfigKeyChannel } from "../../../src/secrets/ConfigKeyChannel.js";
@@ -57,7 +58,7 @@ describe("ConfigKeyRotationJobMongo Tests (real DB + DI)", () => {
 
         connectionManager = await objectFactory.newInstance(ConnectionManager, { name: "default" });
         const models = new Map<string, any>();
-        for (const cls of [ConfigKeyStateMongo, DnsProviderMongo, PluginMongo, AuditLogEntryMongo]) {
+        for (const cls of [ConfigKeyStateMongo, DnsProviderMongo, IntegrationSettingsMongo, PluginMongo, AuditLogEntryMongo]) {
             models.set(cls.name, cls);
         }
         await connectionManager.connect(config.get("datastores"), models);
@@ -87,8 +88,11 @@ describe("ConfigKeyRotationJobMongo Tests (real DB + DI)", () => {
         expect(job.channel).toBeInstanceOf(LocalConfigKeyChannel);
         expect(job.stateRepo).toBeDefined();
         expect(job.auditLogUtils).toBeDefined();
-        // The record types that hold envelopes: a DNS provider's credentials.
-        expect(job.sources.list().map((source: any) => [source.record, source.modelClass])).toEqual([["DnsProvider", DnsProviderMongo]]);
+        // The record types that hold envelopes: a DNS provider's credentials and the Integrations settings' secrets.
+        expect(job.sources.list().map((source: any) => [source.record, source.modelClass])).toEqual([
+            ["DnsProvider", DnsProviderMongo],
+            ["IntegrationSettings", IntegrationSettingsMongo],
+        ]);
         await job.dispose();
     });
 
@@ -123,6 +127,12 @@ describe("ConfigKeyRotationJobMongo Tests (real DB + DI)", () => {
         provider: async (uid) => (await repos.DnsProviderMongo.findOne({ uid } as any))!,
         clearProviders: async () => await clear("DnsProviderMongo"),
         providerModel: () => DnsProviderMongo,
+        insertIntegrations: async (sections) => {
+            await repos.IntegrationSettingsMongo.save(new IntegrationSettingsMongo({ uid: "integrations", ...sections }));
+        },
+        integrations: async () => (await repos.IntegrationSettingsMongo.findOne({ uid: "integrations" } as any))!,
+        clearIntegrations: async () => await clear("IntegrationSettingsMongo"),
+        integrationsModel: () => IntegrationSettingsMongo,
         auditEntries: async (action: AuditAction) => await repos.AuditLogEntryMongo.find({ action }).toArray(),
         clearAudit: async () => await clear("AuditLogEntryMongo"),
     });

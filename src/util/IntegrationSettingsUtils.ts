@@ -5,18 +5,17 @@
 // The admin console's Integrations (spec: specs/dns_publishing_and_integrations.md, 4.5, 10.2, 10.3, 11.1): which config key each field overrides,
 // how each field is validated, what the deployment's own values are, the view `BaseIntegrationsRoute` answers with, and the config layer the server
 // builds from the row. One table (`INTEGRATION_CONFIG_KEYS`) drives all of them, so the route's defaults and the layer can't name different keys.
-import * as crypto from "crypto";
 import * as net from "net";
 import { ApiError } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
 import { DEFAULT_RFC8823_DIRECTORY_URL } from "../pki/Rfc8823AcmeSigningCertificateEnrollment.js";
 import { DEFAULT_PLUGIN_REGISTRY } from "../plugins/NpmRegistryClient.js";
 import { DEFAULT_PLUGIN_NAMESPACES, normalizePluginNamespaces, PluginNamespace } from "../plugins/PluginUtils.js";
+import { ConfigSecretUnavailableError, type ConfigCipher, type ConfigCipherContext } from "../secrets/ConfigCipher.js";
 import { isSecretMask, secretMask, toSecretPatch, type SecretMask } from "../secrets/SecretMask.js";
-import type { SecretStore } from "../secrets/SecretStore.js";
 import { isPublicDiscoveryAddress, resolvesToPublicAddresses } from "./KeyDiscoveryClient.js";
 import { isConfigFlagOn } from "./DkimRotationUtils.js";
-import { DnsResolverMode, IntegrationPluginNamespace, IntegrationSectionName, IntegrationSettings, SecretRef, SigningCaBackend } from "../models/types.js";
+import { ConfigEnvelope, DnsResolverMode, IntegrationPluginNamespace, IntegrationSectionName, IntegrationSettings, SigningCaBackend } from "../models/types.js";
 
 /** The fixed identifier of the one `IntegrationSettings` row - same singleton convention as `MAILBOX_POLICY_UID`. */
 export const INTEGRATION_SETTINGS_UID = "integrations";
@@ -43,24 +42,23 @@ export const INTEGRATION_CONFIG_KEYS: Readonly<Record<IntegrationSectionName, Re
     pluginRegistry: { url: "system:plugins:registry", token: "system:plugins:registry_token", namespaces: "system:plugins:namespaces" },
 };
 
-/** Where the Giphy key is in the secret store (key `apiKey`): each write goes to a path of its own under this one (`integrationSecretPath()`).
- * Server-consumed secrets live under `server/` (spec 5.1). */
-export const GIPHY_SECRET_PATH = "server/giphy";
+/** The record type every envelope of the settings row names in its associated data (spec 5.2). */
+export const INTEGRATION_SETTINGS_RECORD = "IntegrationSettings";
 
-/** Where the plugin registry's token is in the secret store (key `token`), each write at a path of its own under this one. */
-export const PLUGIN_REGISTRY_SECRET_PATH = "server/plugin-registry";
+/** The field path the Giphy key's envelope is bound to. */
+export const GIPHY_API_KEY_FIELD = "giphy.apiKey";
 
-/** Where the plugin namespaces' own tokens are in the secret store, one key per namespace (`pluginNamespaceTokenKey()`), each write at a path of its
- * own under this one. */
-export const PLUGIN_NAMESPACES_SECRET_PATH = "server/plugin-namespaces";
+/** The field path the plugin registry token's envelope is bound to. */
+export const PLUGIN_REGISTRY_TOKEN_FIELD = "pluginRegistry.token";
 
-/**
- * A new path for one write of the secret at `base`: `<base>-<16 random hex digits>`. Every write goes to a path of its own, never over the secret the
- * row names, so a row that can't be saved afterwards leaves the secret in use untouched, and two writes racing each other never share a store entry
- * (a clear can't remove the other's new value). The secret the row named before is removed once the row is saved.
- */
-export function integrationSecretPath(base: string): string {
-    return `${base}-${crypto.randomBytes(8).toString("hex")}`;
+/** The field path the envelope of the plugin namespace `name`'s token is bound to, so a token copied to another namespace doesn't decrypt. */
+export function pluginNamespaceTokenField(name: string): string {
+    return `pluginRegistry.namespaces.${name}.token`;
+}
+
+/** What an envelope of the settings row's secret `field` (one of the paths above) is bound to. */
+export function integrationSecretContext(field: string): ConfigCipherContext {
+    return { record: INTEGRATION_SETTINGS_RECORD, uid: INTEGRATION_SETTINGS_UID, field };
 }
 
 /** The fewest and the most STUN servers the section takes. */
@@ -193,16 +191,10 @@ export function normalizeContactEmail(value: unknown, field: string): string {
     return text;
 }
 
-/** The key a plugin namespace's token has in the secret at `PLUGIN_NAMESPACES_SECRET_PATH`: its scope in hex, so it is made only of characters every
- * backend takes (a Kubernetes Secret's keys can't hold `@` or `~`) and two scopes never share one. */
-export function pluginNamespaceTokenKey(name: string): string {
-    return `ns-${Buffer.from(name, "utf-8").toString("hex")}`;
-}
-
 /** The namespaces of a request, and what it said of their tokens. */
 export interface IntegrationNamespacesInput {
-    /** The namespaces, without tokens: what the row holds. */
-    namespaces: IntegrationPluginNamespace[];
+    /** The namespaces, without tokens: the route adds each one's envelope. */
+    namespaces: Omit<IntegrationPluginNamespace, "token">[];
     /** The new token of each namespace that was sent one. */
     tokens: Record<string, string>;
     /** The namespaces whose saved token was sent back as the mask, so is kept. */
@@ -233,7 +225,7 @@ export async function normalizeIntegrationNamespaces(value: unknown): Promise<In
         if (result.namespaces.some((namespace) => namespace.name === normalized.name)) {
             throw invalid(`'namespaces[${index}]' names a scope already on the list.`);
         }
-        const namespace: IntegrationPluginNamespace = { name: normalized.name };
+        const namespace: Omit<IntegrationPluginNamespace, "token"> = { name: normalized.name };
         if (raw.registry !== undefined && raw.registry !== null) {
             namespace.registry = await normalizeIntegrationUrl(raw.registry, `namespaces[${index}].registry`);
         }
@@ -252,7 +244,7 @@ export async function normalizeIntegrationNamespaces(value: unknown): Promise<In
 }
 
 /**
- * Validates one field of a section that isn't a secret or the plugin namespaces, which the route handles with the secret store: a 400 naming the field
+ * Validates one field of a section that isn't a secret or the plugin namespaces, which the route seals itself: a 400 naming the field
  * for a wrong value, the normalized value otherwise.
  */
 export async function normalizeIntegrationField(section: IntegrationSectionName, field: string, value: unknown): Promise<unknown> {
@@ -393,28 +385,23 @@ export function integrationDefaults(config: Record<string, unknown>): Integratio
     };
 }
 
-/** Whether `ref` holds `key`. */
-function refHas(ref: SecretRef | null | undefined, key: string): boolean {
-    return !!ref?.keys?.includes(key);
-}
-
 /** The administrator's value of each field of `section` that is set (`undefined` for one that isn't), in the view's form: secrets as the mask. */
 function adminValues(settings: IntegrationSettings | undefined, section: IntegrationSectionName): Record<string, unknown> {
     switch (section) {
         case "giphy":
             return {
                 enabled: settings?.giphy?.enabled ?? undefined,
-                apiKey: refHas(settings?.giphy?.apiKeyRef, "apiKey") ? secretMask() : undefined,
+                apiKey: settings?.giphy?.apiKey ? secretMask() : undefined,
             };
         case "pluginRegistry": {
             const registry = settings?.pluginRegistry;
             return {
                 url: registry?.url ?? undefined,
-                token: refHas(registry?.tokenRef, "token") ? secretMask() : undefined,
+                token: registry?.token ? secretMask() : undefined,
                 namespaces: registry?.namespaces?.map((namespace) => ({
                     name: namespace.name,
                     ...(namespace.registry ? { registry: namespace.registry } : {}),
-                    ...(refHas(registry.namespaceTokensRef, pluginNamespaceTokenKey(namespace.name)) ? { token: secretMask() } : {}),
+                    ...(namespace.token ? { token: secretMask() } : {}),
                 })),
             };
         }
@@ -457,24 +444,17 @@ export function integrationSettingsView(settings: IntegrationSettings | undefine
 export interface IntegrationsConfigLayer {
     /** The config keys the administrator set, flat (`"giphy:api_key"`), with the secrets' values: never persisted, logged or answered. */
     values: Record<string, unknown>;
-    /** The config keys whose secret the store couldn't give: left out, so the deployment's value applies, for the caller to warn about. */
-    unresolved: string[];
-}
-
-/** The values of the secret at `ref`, or `undefined` when the store can't give them. */
-async function readSecret(store: Pick<SecretStore, "read">, ref: SecretRef): Promise<Record<string, string> | undefined> {
-    try {
-        return await store.read(ref);
-    } catch {
-        return undefined;
-    }
+    /** The row fields (`giphy.apiKey`, `pluginRegistry.namespaces.@acme.token`) whose secret couldn't be decrypted: left out, so the deployment's value
+     * applies, for the caller to warn about (the field only, never why or what). */
+    unreadable: string[];
 }
 
 /**
  * The config layer the server puts directly below its plugin settings (spec 11.1): exactly the keys the administrator set in `settings`, each overriding
- * the deployment's value, with the secrets read from `store` (server-consumed secrets are readable by the server; DNS credentials, which never come
- * through here, are not). Giphy turned off also empties `giphy:api_key`, so a consumer that only reads the key stops using it. A secret the store can't
- * give is left out and named in `unresolved`; a namespace whose token can't be read is kept without it.
+ * the deployment's value, with the secrets decrypted by `cipher` (spec 5.4: the server keeps the layer, and so the plaintext, for the life of the process).
+ * Giphy turned off also empties `giphy:api_key`, so a consumer that only reads the key stops using it. A secret that can't be decrypted (a key that isn't in the
+ * ring, an envelope from another field, a value that isn't an envelope) is left out and named in `unreadable`; a namespace whose token can't be read is kept
+ * without it. Any other failure of the cipher is a bug and is thrown.
  *
  * The deployment's registry credentials stay with the deployment's registry: when the administrator's registry URL is another than the deployment's
  * (`deployment`, its configuration without this layer, flat keys as `integrationDefaults()` takes it), `system:plugins:registry_token` is the
@@ -482,27 +462,31 @@ async function readSecret(store: Pick<SecretStore, "read">, ref: SecretRef): Pro
  * namespaces are set without the tokens of those on the default registry. Otherwise a token meant for a private registry would go to whatever host the
  * URL names.
  */
-export async function buildIntegrationsConfigLayer(
+export function buildIntegrationsConfigLayer(
     settings: IntegrationSettings | undefined,
-    store: Pick<SecretStore, "read">,
+    cipher: Pick<ConfigCipher, "decryptString">,
     deployment: Record<string, unknown>,
-): Promise<IntegrationsConfigLayer> {
+): IntegrationsConfigLayer {
     const keys = INTEGRATION_CONFIG_KEYS;
-    const layer: IntegrationsConfigLayer = { values: {}, unresolved: [] };
+    const layer: IntegrationsConfigLayer = { values: {}, unreadable: [] };
     const set = (key: string, value: unknown): void => {
         if (value !== undefined && value !== null) {
             layer.values[key] = value;
         }
     };
-    const secret = async (ref: SecretRef | undefined, field: string, key: string): Promise<void> => {
-        if (!refHas(ref, field)) {
-            return;
+    /** The plaintext of the secret `envelope` saved in `field`; `undefined` when there is none or it can't be read (then named in `unreadable`). */
+    const secret = (envelope: ConfigEnvelope | null | undefined, field: string): string | undefined => {
+        if (envelope === undefined || envelope === null) {
+            return undefined;
         }
-        const value: string | undefined = (await readSecret(store, ref!))?.[field];
-        if (value === undefined) {
-            layer.unresolved.push(key);
-        } else {
-            layer.values[key] = value;
+        try {
+            return cipher.decryptString(envelope, integrationSecretContext(field));
+        } catch (err) {
+            if (!(err instanceof ConfigSecretUnavailableError)) {
+                throw err;
+            }
+            layer.unreadable.push(field);
+            return undefined;
         }
     };
 
@@ -510,7 +494,7 @@ export async function buildIntegrationsConfigLayer(
     if (settings?.giphy?.enabled === false) {
         layer.values[keys.giphy.apiKey] = "";
     } else {
-        await secret(settings?.giphy?.apiKeyRef, "apiKey", keys.giphy.apiKey);
+        set(keys.giphy.apiKey, secret(settings?.giphy?.apiKey, GIPHY_API_KEY_FIELD));
     }
     set(keys.stun.urls, settings?.stun?.urls);
     for (const field of INTEGRATION_SECTION_FIELDS.signingCa) {
@@ -521,15 +505,10 @@ export async function buildIntegrationsConfigLayer(
     }
     const registry = settings?.pluginRegistry;
     set(keys.pluginRegistry.url, registry?.url);
-    await secret(registry?.tokenRef ?? undefined, "token", keys.pluginRegistry.token);
+    set(keys.pluginRegistry.token, secret(registry?.token, PLUGIN_REGISTRY_TOKEN_FIELD));
     if (registry?.namespaces) {
-        const tokensRef: SecretRef | undefined = registry.namespaceTokensRef ?? undefined;
-        const tokens: Record<string, string> | undefined = tokensRef && tokensRef.keys.length > 0 ? await readSecret(store, tokensRef) : {};
-        if (!tokens) {
-            layer.unresolved.push(keys.pluginRegistry.namespaces);
-        }
-        layer.values[keys.pluginRegistry.namespaces] = registry.namespaces.map((namespace) => {
-            const token: string | undefined = tokens?.[pluginNamespaceTokenKey(namespace.name)];
+        layer.values[keys.pluginRegistry.namespaces] = registry.namespaces.map(({ token: envelope, ...namespace }) => {
+            const token: string | undefined = secret(envelope, pluginNamespaceTokenField(namespace.name));
             return { ...namespace, ...(token !== undefined ? { token } : {}) };
         });
     }

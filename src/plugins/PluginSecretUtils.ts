@@ -40,7 +40,7 @@ function shortened(segment: string, original: string, max: number): string {
 /**
  * A new path for one write of a plugin's secret setting: `plugins/<package>/<key>-<16 random hex digits>`, the package without its `@` (its scope a level
  * of its own) and both with anything but letters, digits, `.`, `_` and `-` replaced, so every backend takes it. Every write goes to a path of its own, never
- * over the secret the row names (as Integrations does, `integrationSecretPath()`): a row that can't be saved afterwards leaves the secret in use untouched,
+ * over the secret the row names (as Integrations did before R3): a row that can't be saved afterwards leaves the secret in use untouched,
  * and two writes racing each other never share a store entry. The secret the row named before is removed once the row is saved.
  *
  * The path is never longer than `MAX_PLUGIN_SECRET_PATH_LENGTH`: a package name may be 214 characters and a key has no limit, so a key past 96

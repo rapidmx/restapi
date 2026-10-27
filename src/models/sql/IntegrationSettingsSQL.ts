@@ -18,7 +18,7 @@ const { Nullable } = ObjectDecorators;
  */
 @DataStore("sql")
 @Entity()
-@Description("The administrator's Integrations settings, overriding the deployment's configuration; secrets only as references into the secret store.")
+@Description("The administrator's Integrations settings, overriding the deployment's configuration; secrets only as encrypted envelopes.")
 @Protect(
     {
         uid: "IntegrationSettings",
@@ -31,7 +31,7 @@ const { Nullable } = ObjectDecorators;
 )
 export class IntegrationSettingsSQL extends BaseEntity implements IntegrationSettings {
     @Column({ type: "simple-json", nullable: true })
-    @Description("GIF search: whether it is on, and where its API key is in the secret store.")
+    @Description("GIF search: whether it is on, and its API key as an encrypted envelope.")
     @Nullable
     public giphy?: IntegrationSettings["giphy"];
 
@@ -51,7 +51,7 @@ export class IntegrationSettingsSQL extends BaseEntity implements IntegrationSet
     public dnsResolver?: IntegrationSettings["dnsResolver"];
 
     @Column({ type: "simple-json", nullable: true })
-    @Description("Where plugins are installed from, with the tokens' places in the secret store.")
+    @Description("Where plugins are installed from, with the tokens as encrypted envelopes.")
     @Nullable
     public pluginRegistry?: IntegrationSettings["pluginRegistry"];
 

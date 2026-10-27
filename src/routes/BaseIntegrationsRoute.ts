@@ -6,49 +6,42 @@
 // method here is defined relative to that.
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, HttpRequest, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { NullSecretStore } from "../secrets/NullSecretStore.js";
+import { noConfigCipher } from "../dns/DnsProviderCredentials.js";
+import type { ConfigCipher } from "../secrets/ConfigCipher.js";
 import { toSecretPatch } from "../secrets/SecretMask.js";
-import type { SecretStore } from "../secrets/SecretStore.js";
 import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import {
-    GIPHY_SECRET_PATH,
+    GIPHY_API_KEY_FIELD,
     INTEGRATION_CONFIG_KEYS,
     INTEGRATION_SECTION_FIELDS,
     INTEGRATION_SETTINGS_UID,
     integrationDefaults,
-    integrationSecretPath,
+    integrationSecretContext,
     integrationSettingsView,
     isIntegrationSection,
     normalizeIntegrationField,
     normalizeIntegrationNamespaces,
-    pluginNamespaceTokenKey,
-    PLUGIN_NAMESPACES_SECRET_PATH,
-    PLUGIN_REGISTRY_SECRET_PATH,
+    pluginNamespaceTokenField,
+    PLUGIN_REGISTRY_TOKEN_FIELD,
     type IntegrationNamespacesInput,
     type IntegrationSettingsResponse,
 } from "../util/IntegrationSettingsUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
 import { findOrCreateSingleton } from "../util/MailboxPolicyUtils.js";
 import { assertNoPathKeys } from "../util/RequestBodyUtils.js";
-import { AuditAction, IntegrationSectionName, IntegrationSettings, SecretRef } from "../models/types.js";
+import { AuditAction, ConfigEnvelope, IntegrationPluginNamespace, IntegrationSectionName, IntegrationSettings } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Get, Param, Post, Put, Request, RequiresTrustedRole, User: AuthUser } = RouteDecorators;
 
 /** How often a write that lost a race to another write of the settings is applied again to the newer row before it gives up with the 409. */
 const MAX_SAVE_ATTEMPTS = 3;
 
-/** A section's secret field kept as one key of one secret: the row field holding its reference, the path its writes go under, and its key there. */
-interface SecretField {
-    refField: string;
-    base: string;
-    key: string;
-}
-
-/** The single-value secrets (the plugin namespaces' tokens are handled with the namespaces). */
-const SECRET_FIELDS: Partial<Record<IntegrationSectionName, Record<string, SecretField>>> = {
-    giphy: { apiKey: { refField: "apiKeyRef", base: GIPHY_SECRET_PATH, key: "apiKey" } },
-    pluginRegistry: { token: { refField: "tokenRef", base: PLUGIN_REGISTRY_SECRET_PATH, key: "token" } },
+/** The single-value secrets, by section and field: the field path their envelope is bound to (the plugin namespaces' tokens are handled with the
+ * namespaces). */
+const SECRET_FIELDS: Partial<Record<IntegrationSectionName, Record<string, string>>> = {
+    giphy: { apiKey: GIPHY_API_KEY_FIELD },
+    pluginRegistry: { token: PLUGIN_REGISTRY_TOKEN_FIELD },
 };
 
 /** What a request asked of a section's fields: a validated value, `null` for back to the deployment's (the secret removed), or a secret's new value. */
@@ -59,17 +52,8 @@ interface SectionInput {
     namespaces?: IntegrationNamespacesInput | null;
 }
 
-/**
- * One change to a field of the stored section. A store write becomes a `setRef` of the reference the store returns, once it has run. A write goes to a
- * path of its own (`integrationSecretPath()` under `base`), never over the secret in use; `keep` names the keys it carries over from the secret it
- * replaces (read from the store when it runs).
- */
-type FieldChange =
-    | { kind: "set"; value: unknown }
-    | { kind: "unset" }
-    | { kind: "setRef"; ref: SecretRef }
-    | { kind: "unsetRef"; seen: SecretRef }
-    | { kind: "write"; base: string; values: Record<string, string>; keep?: { ref: SecretRef; keys: string[] } };
+/** One change to a field of the stored section: a value to set (a secret already sealed) or the field to remove. */
+type FieldChange = { kind: "set"; value: unknown } | { kind: "unset" };
 
 /** What a request changes in one section, worked out against the row as read. */
 interface SectionPlan {
@@ -77,16 +61,14 @@ interface SectionPlan {
     /** The request's fields that change, for the audit entry. */
     keys: Set<string>;
     secretChanged: boolean;
-    /** A secret replaced or cleared was in a backend this deployment doesn't use, so it was left there. */
-    secretLeftBehind: boolean;
-    /** Set when the request changes the plugin namespaces: the tokens' reference it saw (`null` for none). The list and its tokens are one unit, so a
+    /** Set when the request changes the plugin namespaces: the tokens (as saved, by scope) of the row it saw. The list and its tokens are one unit, so a
      * row whose tokens another write changed meanwhile is a 409 rather than one request's list saved with the other's tokens. */
-    namespacesSeen?: SecretRef | null;
+    namespacesSeen?: Record<string, string>;
 }
 
-/** Whether the references `a` and `b` (either may be none) are the same secret. */
-function sameRef(a: SecretRef | null | undefined, b: SecretRef | null | undefined): boolean {
-    return !a || !b ? !a && !b : a.backend === b.backend && a.path === b.path && a.generation === b.generation;
+/** The tokens of `namespaces` by scope, each as the text of its envelope: what tells whether two lists carry the same tokens. */
+function namespaceTokens(namespaces: IntegrationPluginNamespace[] | null | undefined): Record<string, string> {
+    return Object.fromEntries((namespaces ?? []).filter((namespace) => namespace.token).map((namespace) => [namespace.name, JSON.stringify(namespace.token)]));
 }
 
 /** Whether `err` is a write refused because the row's version moved on (`RepoUtils.update()`'s optimistic lock). */
@@ -128,9 +110,8 @@ function requestVersion(body: Record<string, unknown>): number | undefined {
  * - `GET /` every section's values in effect, the deployment's own values (`defaults`, read from config on every request) and where each value comes from
  * (`source`: `"admin"` or `"deployment"`), secrets only as masks.
  * - `PUT /:section` changes a section's fields. A field left out is unchanged, `null` puts it back to the deployment's value, a secret sent back as the
- * mask is kept. Secrets (the Giphy key, the registry token, the namespaces' tokens) are written to the `SecretStore` before the row, under `server/...`,
- * so the row holds references only; with no store (`NullSecretStore`) saving one is a 400. Each write goes to a new path, and the secret the row named
- * before is removed once the row is saved: a row that can't be saved leaves the secret in use as it was.
+ * mask is kept. Secrets (the Giphy key, the registry token, the namespaces' tokens) are encrypted (`ConfigCipher`, bound to the row and the field) and
+ * saved in the row's own write with the rest of the change, so a write that fails changes nothing; without a keyring saving one is a 503.
  * - `POST /:section/reset` (body: optional `keys`, every field when left out) puts fields back to the deployment's values, removing their secrets.
  *
  * Both writes take an optional `version`: a change made against an older one is a 409 before anything is written. A write that changes nothing writes and
@@ -161,12 +142,9 @@ export abstract class BaseIntegrationsRoute<T extends IntegrationSettings> {
     @Config("mail:security:elevation_max_age_seconds", DEFAULT_ELEVATION_MAX_AGE_SECONDS)
     protected elevationMaxAgeSeconds: number = DEFAULT_ELEVATION_MAX_AGE_SECONDS;
 
-    /** Where secrets go. The server registers OpenBao or Kubernetes Secrets; `NullSecretStore` refuses to save any. */
-    @Inject("SecretStore")
-    private secretStore?: SecretStore;
-
-    /** What stands in for a store on a server that registers none: saving a secret is the same 400 as with `NullSecretStore`. */
-    private readonly noSecretStore: SecretStore = new NullSecretStore();
+    /** Encrypts the secrets the row holds. Unset on a server that registers none: saving a secret is then a 503. */
+    @Inject("ConfigCipher")
+    protected cipher?: ConfigCipher;
 
     @Logger
     private logger: any;
@@ -260,8 +238,12 @@ export abstract class BaseIntegrationsRoute<T extends IntegrationSettings> {
         // Nothing to tell without a server.
     }
 
-    private store(): SecretStore {
-        return this.secretStore ?? this.noSecretStore;
+    /** The cipher, or a 503 on a server that has none. */
+    private requireCipher(): ConfigCipher {
+        if (!this.cipher) {
+            throw noConfigCipher("integration secrets");
+        }
+        return this.cipher;
     }
 
     private view(settings: T | undefined): IntegrationSettingsResponse {
@@ -378,72 +360,34 @@ export abstract class BaseIntegrationsRoute<T extends IntegrationSettings> {
         const existing: T | undefined = await this.findSettings();
         this.assertVersion(existing, version);
         const current: Record<string, any> = ((existing?.[section] as Record<string, any> | null | undefined) ?? {});
+        // The request was validated (URL lookups included) before the row was read and its version checked, so nothing slow runs between that check and the
+        // write; the new secrets are encrypted here, once, whatever the write has to retry. A request that changes nothing encrypts nothing.
         const plan: SectionPlan = this.plan(section, input, current);
         if (plan.keys.size === 0) {
             return this.view(existing);
         }
 
-        // The secrets first, so the row never names one that wasn't saved. The request was validated (URL lookups included) before the row was read and
-        // its version checked, so nothing slow runs between that check and the store; a write racing in during the store call is merged by `save()`.
-        const written: SecretRef[] = [];
-        let saved: { settings: T; removed: SecretRef[] };
-        try {
-            for (const [field, change] of Object.entries(plan.changes)) {
-                if (change.kind === "write") {
-                    // The kept keys are carried over from the secret in use (a key it no longer holds is dropped), then the new values.
-                    const previous: Record<string, string> = change.keep ? await this.store().read(change.keep.ref) : {};
-                    const carried: [string, string][] = (change.keep?.keys ?? []).filter((key) => key in previous).map((key) => [key, previous[key]]);
-                    const ref: SecretRef = await this.store().write(integrationSecretPath(change.base), { ...Object.fromEntries(carried), ...change.values });
-                    written.push(ref);
-                    plan.changes[field] = { kind: "setRef", ref };
-                }
-            }
-            saved = await this.save(section, plan, existing, user);
-        } catch (err) {
-            // A store write that failed after another succeeded, or the row: the secrets this request wrote are at paths of their own, so removing
-            // them leaves the store as it was.
-            await this.discardWritten(section, written);
-            throw err;
-        }
-
-        let secretLeftBehind: boolean = plan.secretLeftBehind;
-        // After the row: a failure leaves a secret nothing refers to, never a row whose secret is gone.
-        for (const ref of saved.removed) {
-            try {
-                await this.store().delete(ref);
-            } catch (err: any) {
-                this.logger?.warn(`Could not remove the integration secret at '${ref.path}' from the secret store: ${err?.message}`);
-                secretLeftBehind = true;
-            }
-        }
+        const settings: T = await this.save(section, plan, existing, user);
 
         const details: Record<string, unknown> = { section, keys: [...plan.keys].sort() };
         if (action === AuditAction.INTEGRATION_UPDATE) {
             details.secretChanged = plan.secretChanged;
         }
-        if (secretLeftBehind) {
-            details.secretLeftBehind = true;
-        }
         await this.auditLogUtils!.record({ action, targetType: "IntegrationSettings", targetUid: INTEGRATION_SETTINGS_UID, details }, { req, user });
         try {
-            await this.integrationsChanged(saved.settings);
+            await this.integrationsChanged(settings);
         } catch (err: any) {
             this.logger?.warn(`The integrations changed, but the change could not be announced: ${err?.message}`);
         }
-        return this.view(saved.settings);
+        return this.view(settings);
     }
 
-    /** What `input` changes in the stored section `current`: only what really differs, so a request that changes nothing writes nothing. */
+    /**
+     * What `input` changes in the stored section `current`: only what really differs, so a request that changes nothing writes nothing. A new secret
+     * always counts (a saved one can't be compared with it without decrypting), and is sealed here for its row and field; a 503 without a keyring.
+     */
     private plan(section: IntegrationSectionName, input: SectionInput, current: Record<string, any>): SectionPlan {
-        const plan: SectionPlan = { changes: {}, keys: new Set(), secretChanged: false, secretLeftBehind: false };
-        const backend: string = this.store().backend;
-        /** The change that removes the reference `ref` from the row (deleting the secret after the row unless it's in another backend). */
-        const removeRef = (refField: string, ref: SecretRef): void => {
-            plan.changes[refField] = { kind: "unsetRef", seen: ref };
-            if (ref.backend !== backend) {
-                plan.secretLeftBehind = true;
-            }
-        };
+        const plan: SectionPlan = { changes: {}, keys: new Set(), secretChanged: false };
 
         for (const [field, value] of Object.entries(input.plain)) {
             if (value === null) {
@@ -458,182 +402,95 @@ export abstract class BaseIntegrationsRoute<T extends IntegrationSettings> {
         }
 
         for (const [field, value] of Object.entries(input.secrets)) {
-            const secret: SecretField = SECRET_FIELDS[section]![field];
-            const ref: SecretRef | undefined = current[secret.refField] ?? undefined;
             if (value === null) {
-                if (!ref) {
+                if (current[field] === undefined || current[field] === null) {
                     continue;
                 }
-                removeRef(secret.refField, ref);
+                plan.changes[field] = { kind: "unset" };
             } else {
-                // The whole secret is this one value, so it is written afresh, also over one in a backend this deployment doesn't use (left there).
-                plan.changes[secret.refField] = { kind: "write", base: secret.base, values: { [secret.key]: value } };
-                plan.secretLeftBehind ||= !!ref && ref.backend !== backend;
+                plan.changes[field] = { kind: "set", value: this.requireCipher().encrypt(value, integrationSecretContext(SECRET_FIELDS[section]![field])) };
             }
             plan.keys.add(field);
             plan.secretChanged = true;
         }
 
         if (input.namespaces !== undefined) {
-            this.planNamespaces(plan, input.namespaces, current, removeRef);
+            this.planNamespaces(plan, input.namespaces, current);
         }
         return plan;
     }
 
-    /** The plugin namespaces' part of `plan`: the list on the row, and their tokens in one secret, one key per namespace. */
-    private planNamespaces(
-        plan: SectionPlan,
-        input: IntegrationNamespacesInput | null,
-        current: Record<string, any>,
-        removeRef: (refField: string, ref: SecretRef) => void,
-    ): void {
-        const ref: SecretRef | undefined = current.namespaceTokensRef ?? undefined;
-        this.planNamespaceChanges(plan, input, current, ref, removeRef);
-        if (plan.keys.has("namespaces")) {
-            plan.namespacesSeen = ref ?? null;
-        }
-    }
-
-    /** `planNamespaces()`'s changes: the list, and the secret holding the tokens (`ref`, the one the row names). */
-    private planNamespaceChanges(
-        plan: SectionPlan,
-        input: IntegrationNamespacesInput | null,
-        current: Record<string, any>,
-        ref: SecretRef | undefined,
-        removeRef: (refField: string, ref: SecretRef) => void,
-    ): void {
-        if (input === null) {
-            if (current.namespaces !== undefined && current.namespaces !== null) {
-                plan.changes.namespaces = { kind: "unset" };
-                plan.keys.add("namespaces");
-            }
-            if (ref) {
-                removeRef("namespaceTokensRef", ref);
-                plan.keys.add("namespaces");
-                plan.secretChanged = true;
-            }
-            return;
-        }
-
-        if (JSON.stringify(current.namespaces ?? null) !== JSON.stringify(input.namespaces)) {
-            plan.changes.namespaces = { kind: "set", value: input.namespaces };
-            plan.keys.add("namespaces");
-        }
-        const saved: string[] = ref?.keys ?? [];
-        const foreign: boolean = !!ref && ref.backend !== this.store().backend;
-        const kept: string[] = input.kept.map(pluginNamespaceTokenKey).filter((key) => saved.includes(key));
-        if (foreign && kept.length > 0) {
-            throw new ApiError(
-                ApiErrors.IDENTIFIER_EXISTS,
-                409,
-                `The plugin namespaces' tokens are in the ${ref!.backend} secret store, which this deployment doesn't use - enter every token again.`,
-            );
-        }
-        const values: Record<string, string> = {};
-        for (const [name, token] of Object.entries(input.tokens)) {
-            values[pluginNamespaceTokenKey(name)] = token;
-        }
-        const removed: string[] = saved.filter((key) => !kept.includes(key) && !(key in values));
-        if (Object.keys(values).length === 0 && removed.length === 0) {
-            return;
-        }
-        plan.keys.add("namespaces");
-        plan.secretChanged = true;
-        if (Object.keys(values).length === 0 && kept.length === 0) {
-            removeRef("namespaceTokensRef", ref!);
-        } else {
-            // A new secret with the kept tokens and the new ones; the one the row named is removed once the row is saved (left, when foreign).
-            plan.changes.namespaceTokensRef = { kind: "write", base: PLUGIN_NAMESPACES_SECRET_PATH, values, ...(kept.length > 0 ? { keep: { ref: ref!, keys: kept } } : {}) };
-            plan.secretLeftBehind ||= foreign;
-        }
-    }
-
     /**
-     * `plan` applied to the stored section `current`: the section to save (`null` once nothing is left in it), and the secrets to remove from the store
-     * once it is saved. A reference the store gave this request replaces whatever the row names now (the last write saved wins), and that secret is
-     * removed; a reference this request clears is only cleared (and its secret removed) while the row still holds the one it saw. A change to the plugin
-     * namespaces whose tokens another write changed meanwhile is a 409.
+     * The plugin namespaces' part of `plan`: the list with each namespace's token inside it. A token sent is sealed for its scope, the mask keeps the token
+     * the namespace has now, and any other namespace is saved without one, so a namespace taken off the list loses its token.
      */
-    private applyPlan(plan: SectionPlan, current: Record<string, any> | null | undefined): { section: Record<string, any> | null; removed: SecretRef[] } {
-        const next: Record<string, any> = { ...(current ?? {}) };
-        if (plan.namespacesSeen !== undefined && !sameRef(next.namespaceTokensRef, plan.namespacesSeen)) {
-            throw staleVersion();
+    private planNamespaces(plan: SectionPlan, input: IntegrationNamespacesInput | null, current: Record<string, any>): void {
+        const saved: IntegrationPluginNamespace[] = current.namespaces ?? [];
+        let namespaces: IntegrationPluginNamespace[] | null = null;
+        let sealed: number = 0;
+        if (input !== null) {
+            namespaces = input.namespaces.map((namespace) => {
+                const token: string | undefined = input.tokens[namespace.name];
+                if (token !== undefined) {
+                    sealed++;
+                    return { ...namespace, token: this.requireCipher().encrypt(token, integrationSecretContext(pluginNamespaceTokenField(namespace.name))) };
+                }
+                const kept: ConfigEnvelope | undefined = input.kept.includes(namespace.name) ? saved.find((entry) => entry.name === namespace.name)?.token : undefined;
+                return kept ? { ...namespace, token: kept } : namespace;
+            });
         }
-        const removed: SecretRef[] = [];
-        const backend: string = this.store().backend;
+
+        if (JSON.stringify(current.namespaces ?? null) === JSON.stringify(namespaces)) {
+            return;
+        }
+        plan.changes.namespaces = namespaces === null ? { kind: "unset" } : { kind: "set", value: namespaces };
+        plan.keys.add("namespaces");
+        plan.namespacesSeen = namespaceTokens(saved);
+        const dropped: boolean = saved.some((entry) => entry.token && !namespaces?.find((namespace) => namespace.name === entry.name)?.token);
+        plan.secretChanged ||= sealed > 0 || dropped;
+    }
+
+    /** `plan` applied to the stored section `current`: the section to save, `null` once nothing is left in it. A change to the plugin namespaces whose tokens
+     * another write changed meanwhile is a 409. Any other field is the plan's: the write saved last wins a field both set. */
+    private applyPlan(plan: SectionPlan, current: Record<string, any> | null | undefined): Record<string, any> | null {
+        const next: Record<string, any> = { ...(current ?? {}) };
+        if (plan.namespacesSeen !== undefined) {
+            const now: Record<string, string> = namespaceTokens(next.namespaces);
+            const seen: Record<string, string> = plan.namespacesSeen;
+            if (Object.keys(now).length !== Object.keys(seen).length || Object.entries(now).some(([name, token]) => seen[name] !== token)) {
+                throw staleVersion();
+            }
+        }
         for (const [field, change] of Object.entries(plan.changes)) {
-            const now: SecretRef | undefined = next[field] ?? undefined;
             if (change.kind === "set") {
                 next[field] = change.value;
-            } else if (change.kind === "unset") {
+            } else {
                 delete next[field];
-            } else if (change.kind === "setRef") {
-                next[field] = change.ref;
-                // The secret replaced: the one this request saw, or one another write saved meanwhile. One in another backend is left there.
-                if (now && now.backend === backend) {
-                    removed.push(now);
-                }
-            } else if (change.kind === "unsetRef" && sameRef(now, change.seen)) {
-                delete next[field];
-                if (change.seen.backend === backend) {
-                    removed.push(change.seen);
-                }
             }
         }
-        return { section: Object.keys(next).length > 0 ? next : null, removed };
+        return Object.keys(next).length > 0 ? next : null;
     }
 
     /**
-     * Saves `plan` on the settings row (created empty the first time). When another write saved the row first, the plan is applied again to the newer row,
-     * field by field, up to `MAX_SAVE_ATTEMPTS` times: by then any secret is already in the store, and the request's version was checked before it.
+     * Saves `plan` on the settings row (created empty the first time), with the secrets it carries, in one version-checked write. When another write saved the
+     * row first, the plan is applied again to the newer row, field by field, up to `MAX_SAVE_ATTEMPTS` times: the request's version was checked before it.
      */
-    private async save(section: IntegrationSectionName, plan: SectionPlan, existing: T | undefined, user: JWTUser | undefined): Promise<{ settings: T; removed: SecretRef[] }> {
+    private async save(section: IntegrationSectionName, plan: SectionPlan, existing: T | undefined, user: JWTUser | undefined): Promise<T> {
         let row: T | undefined = existing;
         for (let attempt = 1; ; attempt++) {
             row ??= await findOrCreateSingleton(this.repo!, INTEGRATION_SETTINGS_UID);
-            const { section: next, removed } = this.applyPlan(plan, row[section] as Record<string, any> | null | undefined);
+            const next: Record<string, any> | null = this.applyPlan(plan, row[section] as Record<string, any> | null | undefined);
             try {
-                const settings: T = await this.repo!.update({ uid: row.uid, version: row.version, [section]: next } as any, asEntity(this.repo!, row), {
+                return await this.repo!.update({ uid: row.uid, version: row.version, [section]: next } as any, asEntity(this.repo!, row), {
                     user,
                     version: row.version,
                     ignoreACL: true,
                 });
-                return { settings, removed };
             } catch (err) {
                 if (!isStaleVersionError(err) || attempt >= MAX_SAVE_ATTEMPTS) {
                     throw err;
                 }
                 row = await this.findSettings();
-            }
-        }
-    }
-
-    /**
-     * After the row couldn't be saved: removes each secret this request wrote (each at a path of its own, so the secrets in use are untouched), unless the
-     * row names it after all (a save that failed after it was applied), which is logged. While the row can't be read back, they are left in the store
-     * and logged: a secret nothing refers to does no harm, a row naming one that is gone would. Never throws.
-     */
-    private async discardWritten(section: IntegrationSectionName, written: SecretRef[]): Promise<void> {
-        if (written.length === 0) {
-            return;
-        }
-        let saved: Record<string, any>;
-        try {
-            saved = ((await this.findSettings())?.[section] as Record<string, any> | null | undefined) ?? {};
-        } catch (err: any) {
-            this.logger?.warn(`The integration secrets at ${written.map((ref) => `'${ref.path}'`).join(", ")} were left in the secret store: ${err?.message}`);
-            return;
-        }
-        for (const ref of written) {
-            // Any other value of the section (a switch, the namespaces list) is never the same as a reference.
-            if (Object.values(saved).some((value) => sameRef(value, ref))) {
-                this.logger?.error(`The integration secret at '${ref.path}' was saved with the settings, although saving them failed.`);
-                continue;
-            }
-            try {
-                await this.store().delete(ref);
-            } catch (err: any) {
-                this.logger?.warn(`Could not remove the integration secret at '${ref.path}' from the secret store: ${err?.message}`);
             }
         }
     }

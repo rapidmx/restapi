@@ -9,7 +9,8 @@ import { MongoMemoryServer } from "mongodb-memory-server";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
 import { IntegrationSettingsMongo } from "../../../src/models/mongo/IntegrationSettingsMongo.js";
 import { INTEGRATION_SETTINGS_UID } from "../../../src/util/IntegrationSettingsUtils.js";
-import { InMemorySecretStore, registerTestDoubles } from "../../testDoubles.js";
+import type { ConfigCipher } from "../../../src/secrets/ConfigCipher.js";
+import { registerTestDoubles } from "../../testDoubles.js";
 import { integrationsSuite } from "../integrationsSuite.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({ instance: { port: 9999, dbName: "rrst-test" } });
@@ -43,7 +44,7 @@ describe("Route:IntegrationsMongo Tests", () => {
         config,
         app: () => server.getApplication(),
         prefix: "/mongo",
-        store: () => objectFactory.getInstance<InMemorySecretStore>("SecretStore")!,
+        cipher: () => objectFactory.getInstance<ConfigCipher>("ConfigCipher")!,
         clear: async () => {
             for (const repo of Object.values(repos)) {
                 await repo.clear().catch(() => undefined);

@@ -2,23 +2,22 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-// HTTP behaviour of `system/integrations`, identical on both backends. Secrets go to the (in-memory) secret store only: every test that saves one also
-// checks the stored row and the audit entries never carry its value.
+// HTTP behaviour of `system/integrations`, identical on both backends. Secrets are saved as encrypted envelopes in the settings row, in the one write that
+// saves the rest of the change: every test that saves one also checks the stored row and the audit entries never carry its value.
 import { request } from "@rapidrest/service-core/test";
-import { JWTUtils } from "@rapidrest/core";
+import { ApiError, JWTUtils } from "@rapidrest/core";
 import { ApiErrors } from "@rapidrest/service-core";
 import * as uuid from "uuid";
 import { AuditAction } from "../../src/models/types.js";
-import { NO_SECRET_STORE_MESSAGE } from "../../src/secrets/NullSecretStore.js";
-import { DEFAULT_DOH_ENDPOINT, pluginNamespaceTokenKey } from "../../src/util/IntegrationSettingsUtils.js";
+import { isConfigEnvelope, type ConfigCipher } from "../../src/secrets/ConfigCipher.js";
+import { DEFAULT_DOH_ENDPOINT } from "../../src/util/IntegrationSettingsUtils.js";
 import { setDiscoveryAddressLookup } from "../../src/util/KeyDiscoveryClient.js";
-import type { InMemorySecretStore } from "../testDoubles.js";
 
 export interface IntegrationsSuiteContext {
     config: any;
     app: () => any;
     prefix: string;
-    store: () => InMemorySecretStore;
+    cipher: () => ConfigCipher;
     clear: () => Promise<void>;
     /** The stored settings row, as the database holds it (`undefined`/`null` when there is none). */
     row: () => Promise<any>;
@@ -29,8 +28,6 @@ const MASK = { secret: true };
 const GIPHY_KEY = "giphy-KEY-never-stored";
 const REGISTRY_TOKEN = "npm_REGISTRY_never_stored";
 const NAMESPACE_TOKEN = "npm_NAMESPACE_never_stored";
-/** The path one write of the secret at `base` gets (`integrationSecretPath()`). */
-const SECRET_PATH = (base: string) => new RegExp(`^${base}-[0-9a-f]{16}$`);
 
 export function integrationsSuite(ctx: IntegrationsSuiteContext): void {
     let userToken: string;
@@ -45,7 +42,6 @@ export function integrationsSuite(ctx: IntegrationsSuiteContext): void {
 
     beforeEach(async () => {
         await ctx.clear();
-        ctx.store().reset();
         setDiscoveryAddressLookup(async (hostname) => {
             const addresses: Record<string, string[]> = {
                 "registry.example.com": ["93.184.216.34"],
@@ -59,6 +55,10 @@ export function integrationsSuite(ctx: IntegrationsSuiteContext): void {
             }
             return addresses[hostname];
         });
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
     });
 
     afterAll(() => {
@@ -76,14 +76,15 @@ export function integrationsSuite(ctx: IntegrationsSuiteContext): void {
         return result.body;
     };
     const audits = async () => (await ctx.auditEntries()).filter((entry) => entry.action === AuditAction.INTEGRATION_UPDATE || entry.action === AuditAction.INTEGRATION_RESET);
-    /** The secret the store holds under `base`, at the one path a write gave it; `undefined` when there is none. Never two: a replaced one is removed. */
-    const stored = (base: string): Record<string, string> | undefined => {
-        const entries = [...ctx.store().secrets].filter(([secretPath]) => SECRET_PATH(base).test(secretPath));
-        expect(entries.length).toBeLessThanOrEqual(1);
-        return entries[0]?.[1];
-    };
-    /** Everything persisted outside the secret store: what must never hold a secret's value. */
+    /** What an envelope of `field` of the settings row holds, decrypted as the context it was saved for: the one way a test reads a secret back. */
+    const open = (field: string, sealed: unknown): string => ctx.cipher().decryptString(sealed as any, { record: "IntegrationSettings", uid: "integrations", field });
+    /** Everything persisted: what must never hold a secret's value. */
     const persisted = async () => JSON.stringify({ row: await ctx.row(), audits: await ctx.auditEntries() });
+    /** Makes saving a secret fail as it does on a server without a keyring (503), and answers the spy so a test can see whether anything was encrypted. */
+    const withoutKeyring = () =>
+        vi.spyOn(ctx.cipher(), "encrypt").mockImplementation(() => {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 503, "No configuration keyring is loaded, so secrets can't be saved.");
+        });
 
     describe("GET", () => {
         it("answers a trusted role with the deployment's values, before anything is saved, and writes nothing", async () => {
@@ -107,20 +108,26 @@ export function integrationsSuite(ctx: IntegrationsSuiteContext): void {
             expect((await put("giphy", { apiKey: GIPHY_KEY }, userToken)).status).toBe(403);
             expect((await put("giphy", { apiKey: GIPHY_KEY }, unelevatedToken)).status).toBe(403);
             expect((await reset("giphy", {}, unelevatedToken)).status).toBe(403);
-            expect(ctx.store().secrets.size).toBe(0);
             expect(await ctx.row()).toBeFalsy();
             expect(await audits()).toEqual([]);
         });
 
-        it("saves the Giphy key in the secret store and only a reference on the row, never the value", async () => {
+        it("saves the Giphy key encrypted on the row, bound to it and its field, never the value", async () => {
             const body = await ok(put("giphy", { enabled: true, apiKey: `  ${GIPHY_KEY}\n` }));
             expect(body.giphy).toEqual({ values: { enabled: true, apiKey: MASK }, defaults: { enabled: true, apiKey: null }, source: { enabled: "admin", apiKey: "admin" } });
             expect(body.version).toBeGreaterThan(0);
-            expect(stored("server/giphy")).toEqual({ apiKey: GIPHY_KEY });
             const row = await ctx.row();
             expect(row.uid).toBe("integrations");
-            expect(row.giphy).toEqual({ enabled: true, apiKeyRef: { backend: "openbao", path: expect.stringMatching(SECRET_PATH("server/giphy")), keys: ["apiKey"], generation: expect.any(Number) } });
+            expect(row.giphy.enabled).toBe(true);
+            expect(Object.keys(row.giphy).sort()).toEqual(["apiKey", "enabled"]);
+            expect(isConfigEnvelope(row.giphy.apiKey)).toBe(true);
+            expect(open("giphy.apiKey", row.giphy.apiKey)).toBe(GIPHY_KEY);
             expect(await persisted()).not.toContain(GIPHY_KEY);
+            // Bound to this row and field: copied to another field, row or record type it doesn't decrypt.
+            const cipher = ctx.cipher();
+            expect(() => open("pluginRegistry.token", row.giphy.apiKey)).toThrow();
+            expect(() => cipher.decryptString(row.giphy.apiKey, { record: "IntegrationSettings", uid: "another-row", field: "giphy.apiKey" })).toThrow();
+            expect(() => cipher.decryptString(row.giphy.apiKey, { record: "DnsProvider", uid: "integrations", field: "giphy.apiKey" })).toThrow();
 
             const [entry] = await audits();
             expect(entry).toEqual(expect.objectContaining({ action: AuditAction.INTEGRATION_UPDATE, targetType: "IntegrationSettings", targetUid: "integrations" }));
@@ -132,41 +139,50 @@ export function integrationsSuite(ctx: IntegrationsSuiteContext): void {
             const before = await ctx.row();
             const body = await ok(put("giphy", { enabled: false, apiKey: MASK }));
             expect(body.giphy.values).toEqual({ enabled: false, apiKey: MASK });
-            expect((await ctx.row()).version).toBe(before.version);
-            expect(stored("server/giphy")).toEqual({ apiKey: GIPHY_KEY });
+            const after = await ctx.row();
+            expect(after.version).toBe(before.version);
+            expect(after.giphy.apiKey).toEqual(before.giphy.apiKey);
+            expect(open("giphy.apiKey", after.giphy.apiKey)).toBe(GIPHY_KEY);
             expect(await audits()).toHaveLength(1);
             expect((await ok(put("giphy", {}))).version).toBe(before.version);
         });
 
         it("replaces a secret with a new value, and clears it with null, back to the deployment's", async () => {
             await ok(put("giphy", { apiKey: GIPHY_KEY }));
-            const first = (await ctx.row()).giphy.apiKeyRef.path;
+            const first = (await ctx.row()).giphy.apiKey;
             await ok(put("giphy", { apiKey: "second-key" }));
-            // At a path of its own, so whatever reads the secret knows it changed; the first one is removed once the row names the second.
-            expect((await ctx.row()).giphy.apiKeyRef.path).not.toBe(first);
-            expect(stored("server/giphy")).toEqual({ apiKey: "second-key" });
+            const second = (await ctx.row()).giphy.apiKey;
+            expect(second).not.toEqual(first);
+            expect(open("giphy.apiKey", second)).toBe("second-key");
 
             const body = await ok(put("giphy", { apiKey: null }));
             expect(body.giphy.source.apiKey).toBe("deployment");
             expect(body.giphy.values.apiKey).toBeNull();
-            expect(stored("server/giphy")).toBeUndefined();
             expect((await ctx.row()).giphy ?? null).toBeNull();
             expect((await audits()).map((entry) => entry.details)).toEqual([
                 { section: "giphy", keys: ["apiKey"], secretChanged: true },
                 { section: "giphy", keys: ["apiKey"], secretChanged: true },
                 { section: "giphy", keys: ["apiKey"], secretChanged: true },
             ]);
+            expect(await persisted()).not.toMatch(/giphy-KEY|second-key/);
         });
 
-        it("refuses to save a secret without a secret store (400), and saves nothing else of the request", async () => {
-            ctx.store().refuse = true;
+        it("refuses to save a secret without a keyring (503), and saves nothing else of the request", async () => {
+            withoutKeyring();
             const result = await put("giphy", { enabled: false, apiKey: GIPHY_KEY });
-            expect(result.status).toBe(400);
-            expect(result.body.message).toBe(NO_SECRET_STORE_MESSAGE);
+            expect(result.status).toBe(503);
+            expect(JSON.stringify(result.body)).not.toContain(GIPHY_KEY);
             expect(await ctx.row()).toBeFalsy();
             expect(await audits()).toEqual([]);
-            // What needs no store still saves.
+            // What needs no keyring still saves.
             expect((await ok(put("giphy", { enabled: false }))).giphy.values.enabled).toBe(false);
+        });
+
+        it("clears a secret without needing a keyring", async () => {
+            await ok(put("giphy", { apiKey: GIPHY_KEY }));
+            withoutKeyring();
+            expect((await ok(put("giphy", { apiKey: null }))).giphy.source.apiKey).toBe("deployment");
+            expect((await ctx.row()).giphy ?? null).toBeNull();
         });
 
         it.each([
@@ -174,6 +190,7 @@ export function integrationsSuite(ctx: IntegrationsSuiteContext): void {
             ["a body that isn't an object", "giphy", ["x"], 400],
             ["a dotted key", "giphy", { "giphy.enabled": true }, 400],
             ["an unknown field", "giphy", { enabled: true, apiKeyRef: { backend: "openbao", path: "dns/x", keys: ["apiKey"], generation: 9 } }, 400],
+            ["an envelope sent as a value", "giphy", { apiKey: { $enc: 1, kid: "k", iv: "aXY=", ct: "Y3Q=", tag: "dGFn" } }, 400],
             ["a version that isn't a number", "giphy", { enabled: true, version: "x" }, 400],
             ["a switch that isn't one", "giphy", { enabled: "yes" }, 400],
             ["an empty secret", "giphy", { apiKey: "  " }, 400],
@@ -193,7 +210,6 @@ export function integrationsSuite(ctx: IntegrationsSuiteContext): void {
             const result = await put(section, body);
             expect(result.status, JSON.stringify(result.body)).toBe(status);
             expect(await ctx.row()).toBeFalsy();
-            expect(ctx.store().secrets.size).toBe(0);
         });
 
         it("names the allowed fields for an unknown one, never repeating what was sent", async () => {
@@ -238,7 +254,7 @@ export function integrationsSuite(ctx: IntegrationsSuiteContext): void {
             expect(await audits()).toHaveLength(audited);
         });
 
-        it("keeps the registry token and each namespace's token in the secret store, shown only as masks", async () => {
+        it("keeps the registry token and each namespace's token encrypted on the row, bound to their fields, shown only as masks", async () => {
             const body = await ok(
                 put("pluginRegistry", {
                     url: "https://registry.example.com",
@@ -251,48 +267,71 @@ export function integrationsSuite(ctx: IntegrationsSuiteContext): void {
                 token: MASK,
                 namespaces: [{ name: "@rapidmx" }, { name: "@acme", registry: "https://npm.acme.example.com/", token: MASK }],
             });
-            expect(stored("server/plugin-registry")).toEqual({ token: REGISTRY_TOKEN });
-            expect(stored("server/plugin-namespaces")).toEqual({ [pluginNamespaceTokenKey("@acme")]: NAMESPACE_TOKEN });
-            const row = await ctx.row();
-            expect(row.pluginRegistry.namespaces).toEqual([{ name: "@rapidmx" }, { name: "@acme", registry: "https://npm.acme.example.com/" }]);
+            const registry = (await ctx.row()).pluginRegistry;
+            expect(registry.url).toBe("https://registry.example.com");
+            expect(isConfigEnvelope(registry.token)).toBe(true);
+            expect(open("pluginRegistry.token", registry.token)).toBe(REGISTRY_TOKEN);
+            // The token is inside its namespace, and the namespace without one has none.
+            expect(registry.namespaces).toEqual([{ name: "@rapidmx" }, { name: "@acme", registry: "https://npm.acme.example.com/", token: expect.objectContaining({ $enc: 1 }) }]);
+            expect(open("pluginRegistry.namespaces.@acme.token", registry.namespaces[1].token)).toBe(NAMESPACE_TOKEN);
+            // A token copied to another namespace, or taken for the registry's own, doesn't decrypt.
+            expect(() => open("pluginRegistry.namespaces.@rapidmx.token", registry.namespaces[1].token)).toThrow();
+            expect(() => open("pluginRegistry.token", registry.namespaces[1].token)).toThrow();
             expect(await persisted()).not.toMatch(new RegExp(`${REGISTRY_TOKEN}|${NAMESPACE_TOKEN}`));
             expect((await audits())[0].details).toEqual({ section: "pluginRegistry", keys: ["namespaces", "token", "url"], secretChanged: true });
         });
 
-        it("keeps a namespace's token sent back as the mask, and removes the token of a namespace taken off the list", async () => {
+        it("keeps a namespace's token sent back as the mask, and drops the token of a namespace taken off the list", async () => {
             await ok(put("pluginRegistry", { namespaces: [{ name: "@acme", token: NAMESPACE_TOKEN }, { name: "@other", token: "other-token" }] }));
+            const acme = (await ctx.row()).pluginRegistry.namespaces[0].token;
             const body = await ok(put("pluginRegistry", { namespaces: [{ name: "@acme", token: MASK }, "@public"] }));
             expect(body.pluginRegistry.values.namespaces).toEqual([{ name: "@acme", token: MASK }, { name: "@public" }]);
-            expect(stored("server/plugin-namespaces")).toEqual({ [pluginNamespaceTokenKey("@acme")]: NAMESPACE_TOKEN });
+            const namespaces = (await ctx.row()).pluginRegistry.namespaces;
+            expect(namespaces).toEqual([{ name: "@acme", token: acme }, { name: "@public" }]);
+            expect(open("pluginRegistry.namespaces.@acme.token", namespaces[0].token)).toBe(NAMESPACE_TOKEN);
+            expect(await persisted()).not.toContain("other-token");
 
             // The mask on a namespace that has no saved token keeps nothing.
             const again = await ok(put("pluginRegistry", { namespaces: [{ name: "@public", token: MASK }] }));
             expect(again.pluginRegistry.values.namespaces).toEqual([{ name: "@public" }]);
-            expect(stored("server/plugin-namespaces")).toBeUndefined();
-            expect((await ctx.row()).pluginRegistry.namespaceTokensRef ?? undefined).toBeUndefined();
+            expect((await ctx.row()).pluginRegistry.namespaces).toEqual([{ name: "@public" }]);
+            expect((await audits()).at(-1)!.details).toEqual({ section: "pluginRegistry", keys: ["namespaces"], secretChanged: true });
         });
 
-        it("saves namespaces without tokens without touching the secret store, and resets them with null", async () => {
+        it("replaces a namespace's token with a new one, and drops it when the namespace is sent without one", async () => {
+            await ok(put("pluginRegistry", { namespaces: [{ name: "@acme", token: NAMESPACE_TOKEN }] }));
+            await ok(put("pluginRegistry", { namespaces: [{ name: "@acme", token: "second-token" }] }));
+            expect(open("pluginRegistry.namespaces.@acme.token", (await ctx.row()).pluginRegistry.namespaces[0].token)).toBe("second-token");
+            await ok(put("pluginRegistry", { namespaces: [{ name: "@acme", token: null }] }));
+            expect((await ctx.row()).pluginRegistry.namespaces).toEqual([{ name: "@acme" }]);
+            expect((await audits()).at(-1)!.details).toEqual({ section: "pluginRegistry", keys: ["namespaces"], secretChanged: true });
+            expect(await persisted()).not.toMatch(/second-token|never_stored/);
+        });
+
+        it("saves namespaces without tokens without a keyring, and resets them with null", async () => {
+            const encrypt = withoutKeyring();
             const body = await ok(put("pluginRegistry", { namespaces: ["@public", { name: "@acme", registry: null, token: null }] }));
             expect(body.pluginRegistry.values.namespaces).toEqual([{ name: "@public" }, { name: "@acme" }]);
-            expect(ctx.store().secrets.size).toBe(0);
+            expect(encrypt).not.toHaveBeenCalled();
             expect((await audits())[0].details).toEqual({ section: "pluginRegistry", keys: ["namespaces"], secretChanged: false });
 
-            const reset = await ok(put("pluginRegistry", { namespaces: null }));
-            expect(reset.pluginRegistry.source.namespaces).toBe("deployment");
-            expect(reset.pluginRegistry.values.namespaces).toEqual([{ name: "@rapidmx" }]);
+            const cleared = await ok(put("pluginRegistry", { namespaces: null }));
+            expect(cleared.pluginRegistry.source.namespaces).toBe("deployment");
+            expect(cleared.pluginRegistry.values.namespaces).toEqual([{ name: "@rapidmx" }]);
             // Nothing left to reset changes nothing.
             await ok(put("pluginRegistry", { namespaces: null }));
             expect(await audits()).toHaveLength(2);
         });
 
-        it("refuses a change made against an older version (409), before the secret store is touched", async () => {
+        it("refuses a change made against an older version (409), before anything is encrypted", async () => {
             const first = await ok(put("giphy", { enabled: false }));
             await ok(put("stun", { urls: ["stun:stun.example.com"] }));
+            const encrypt = vi.spyOn(ctx.cipher(), "encrypt");
             const result = await put("giphy", { apiKey: GIPHY_KEY, version: first.version });
             expect(result.status).toBe(409);
             expect(result.body.code).toBe(ApiErrors.INVALID_OBJECT_VERSION);
-            expect(ctx.store().secrets.size).toBe(0);
+            expect(encrypt).not.toHaveBeenCalled();
+            expect((await ctx.row()).giphy.apiKey).toBeUndefined();
             expect((await ok(put("giphy", { apiKey: GIPHY_KEY, version: first.version + 1 }))).giphy.values.apiKey).toEqual(MASK);
             // No row yet is version 0.
             await ctx.clear();
@@ -300,62 +339,18 @@ export function integrationsSuite(ctx: IntegrationsSuiteContext): void {
             expect((await ok(put("giphy", { enabled: true, version: 0 }))).giphy.values.enabled).toBe(true);
         });
 
-        it("checks the version after validating the request, so a change landing during the URL check is refused (409) before the store is written", async () => {
+        it("checks the version after validating the request, so a change landing during the URL check is refused (409) before anything is encrypted", async () => {
             const first = await ok(put("giphy", { enabled: false }));
             setDiscoveryAddressLookup(async () => {
                 setDiscoveryAddressLookup(async () => ["93.184.216.34"]);
                 await ok(put("stun", { urls: ["stun:stun.example.com"] }));
                 return ["93.184.216.34"];
             });
+            const encrypt = vi.spyOn(ctx.cipher(), "encrypt");
             const result = await put("pluginRegistry", { url: "https://registry.example.com", token: REGISTRY_TOKEN, version: first.version });
             expect(result.status).toBe(409);
-            expect(ctx.store().secrets.size).toBe(0);
-        });
-
-        it("merges a change to another section that lands while the secret is being saved", async () => {
-            await ok(put("giphy", { enabled: true }));
-            ctx.store().duringChange = async () => {
-                await ok(put("stun", { urls: ["stun:stun.example.com"] }));
-                await ok(put("giphy", { enabled: false }));
-            };
-            const body = await ok(put("giphy", { apiKey: GIPHY_KEY }));
-            expect(body.giphy.values).toEqual({ enabled: false, apiKey: MASK });
-            expect(body.stun.values.urls).toEqual(["stun:stun.example.com"]);
-            expect((await ctx.row()).giphy.apiKeyRef).toEqual(expect.objectContaining({ backend: "openbao", path: expect.stringMatching(SECRET_PATH("server/giphy")), keys: ["apiKey"] }));
-            expect(stored("server/giphy")).toEqual({ apiKey: GIPHY_KEY });
-        });
-
-        it("writes a secret held in a backend this deployment doesn't use afresh, never sending that reference to the store", async () => {
-            await ok(put("giphy", { apiKey: GIPHY_KEY }));
-            ctx.store().backend = "kubernetes";
-            await ok(put("giphy", { apiKey: "new-key" }));
-            expect((await ctx.row()).giphy.apiKeyRef).toEqual(expect.objectContaining({ backend: "kubernetes", path: expect.stringMatching(SECRET_PATH("server/giphy")) }));
-            expect((await audits()).at(-1)!.details).toEqual({ section: "giphy", keys: ["apiKey"], secretChanged: true, secretLeftBehind: true });
-
-            ctx.store().backend = "openbao";
-            const deleted = vi.spyOn(ctx.store(), "delete");
-            await ok(put("giphy", { apiKey: null }));
-            expect(deleted).not.toHaveBeenCalled();
-            expect((await audits()).at(-1)!.details).toEqual({ section: "giphy", keys: ["apiKey"], secretChanged: true, secretLeftBehind: true });
-            deleted.mockRestore();
-        });
-
-        it("refuses to keep namespace tokens held in a backend this deployment doesn't use (409)", async () => {
-            await ok(put("pluginRegistry", { namespaces: [{ name: "@acme", token: NAMESPACE_TOKEN }] }));
-            ctx.store().backend = "kubernetes";
-            const result = await put("pluginRegistry", { namespaces: [{ name: "@acme", token: MASK }, "@new"] });
-            expect(result.status).toBe(409);
-            // Entering every token again works.
-            await ok(put("pluginRegistry", { namespaces: [{ name: "@acme", token: "again" }] }));
-            expect((await ctx.row()).pluginRegistry.namespaceTokensRef.backend).toBe("kubernetes");
-        });
-
-        it("still saves a cleared secret when the store can't remove it, auditing that it was left behind", async () => {
-            await ok(put("giphy", { apiKey: GIPHY_KEY }));
-            ctx.store().failDelete = true;
-            const body = await ok(put("giphy", { apiKey: null }));
-            expect(body.giphy.source.apiKey).toBe("deployment");
-            expect((await audits()).at(-1)!.details).toEqual({ section: "giphy", keys: ["apiKey"], secretChanged: true, secretLeftBehind: true });
+            expect(encrypt).not.toHaveBeenCalled();
+            expect((await ctx.row()).pluginRegistry ?? null).toBeNull();
         });
     });
 
@@ -366,8 +361,8 @@ export function integrationsSuite(ctx: IntegrationsSuiteContext): void {
             const body = await ok(reset("pluginRegistry"));
             expect(body.pluginRegistry.source).toEqual({ url: "deployment", token: "deployment", namespaces: "deployment" });
             expect(body.giphy.source.enabled).toBe("admin");
-            expect(ctx.store().secrets.size).toBe(0);
             expect((await ctx.row()).pluginRegistry ?? null).toBeNull();
+            expect(await persisted()).not.toMatch(new RegExp(`${REGISTRY_TOKEN}|${NAMESPACE_TOKEN}`));
             const entry = (await audits()).at(-1)!;
             expect(entry.action).toBe(AuditAction.INTEGRATION_RESET);
             expect(entry.details).toEqual({ section: "pluginRegistry", keys: ["namespaces", "token", "url"] });
@@ -377,8 +372,12 @@ export function integrationsSuite(ctx: IntegrationsSuiteContext): void {
             await ok(put("giphy", { enabled: false, apiKey: GIPHY_KEY }));
             const body = await ok(reset("giphy", { keys: ["enabled"] }));
             expect(body.giphy.source).toEqual({ enabled: "deployment", apiKey: "admin" });
-            expect(stored("server/giphy")).toEqual({ apiKey: GIPHY_KEY });
+            expect(open("giphy.apiKey", (await ctx.row()).giphy.apiKey)).toBe(GIPHY_KEY);
             expect((await audits()).at(-1)!.details).toEqual({ section: "giphy", keys: ["enabled"] });
+
+            const secret = await ok(reset("giphy", { keys: ["apiKey"] }));
+            expect(secret.giphy.source).toEqual({ enabled: "deployment", apiKey: "deployment" });
+            expect((await ctx.row()).giphy ?? null).toBeNull();
         });
 
         it("changes and audits nothing when nothing of the section was set", async () => {

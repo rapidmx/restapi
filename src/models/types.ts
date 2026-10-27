@@ -3751,37 +3751,37 @@ export type SigningCaBackend = "rfc8823" | "manual" | "none";
 /** How the server resolves DNS: Node's own resolver, or DNSSEC-validating DNS over HTTPS. */
 export type DnsResolverMode = "node" | "doh-dnssec";
 
-/** A plugin namespace an administrator configured in Integrations: a `PluginNamespace` without its token, which lives in the secret store (keyed by
- * `pluginNamespaceTokenKey()` in `IntegrationSettings.pluginRegistry.namespaceTokensRef`). */
+/** A plugin namespace an administrator configured in Integrations, as stored: a `PluginNamespace` whose npm token, when it has one, is encrypted. */
 export interface IntegrationPluginNamespace {
     /** The npm scope, with its leading `@`. */
     name: string;
     /** The registry this scope is published to (https only), when not the default one. */
     registry?: string;
+    /** The scope's npm token as an envelope bound to the field `pluginRegistry.namespaces.<scope>.token` (spec 5.2). */
+    token?: ConfigEnvelope;
 }
 
 /**
  * The administrator's Integrations settings (`specs/dns_publishing_and_integrations.md` 4.5, 10.2): one singleton row (`INTEGRATION_SETTINGS_UID`), deny-all
  * class ACL, only ever written through `BaseIntegrationsRoute`. Each section overrides some of the deployment's config keys; a field left unset (a section
- * `null` on SQL) means "use the deployment's configured value", and a reset deletes the field. Secrets are held as `SecretRef`s only, their values in the
- * `SecretStore` under `server/...`, never in the database. The row is created empty by the first change: it never copies config into itself, so the
- * deployment's values keep applying wherever the administrator hasn't chosen otherwise.
+ * `null` on SQL) means "use the deployment's configured value", and a reset deletes the field. Secrets are `ConfigEnvelope`s in the fields where the plaintext
+ * would be, encrypted and saved with the rest of the section in the one write of the row (spec 5.2). The row is created empty by the first change: it never
+ * copies config into itself, so the deployment's values keep applying wherever the administrator hasn't chosen otherwise.
  */
 export interface IntegrationSettings extends BaseEntity {
-    /** GIF search in Compose: `giphy:enabled`, `giphy:api_key` (the key at `server/giphy`, key `apiKey`). */
-    giphy?: { enabled?: boolean; apiKeyRef?: SecretRef } | null;
+    /** GIF search in Compose: `giphy:enabled`, `giphy:api_key` (the key as an envelope bound to the field `giphy.apiKey`). */
+    giphy?: { enabled?: boolean; apiKey?: ConfigEnvelope } | null;
     /** The STUN servers meetings use: `integrations:stun:urls`. */
     stun?: { urls?: string[] } | null;
     /** S/MIME signing certificate enrollment: `mail:pki:signing_enrollment:backend`, `mail:pki:rfc8823:directory_url`, `mail:pki:rfc8823:contact_email`. */
     signingCa?: { backend?: SigningCaBackend; directoryUrl?: string; contactEmail?: string } | null;
     /** How the server resolves DNS: `mail:dns:resolver`, `mail:dns:doh:endpoint`. */
     dnsResolver?: { mode?: DnsResolverMode; dohEndpoint?: string } | null;
-    /** Where plugins are installed from: `system:plugins:registry`, `system:plugins:registry_token` (the token at `server/plugin-registry`, key `token`) and
-     * `system:plugins:namespaces` (the namespaces' own tokens at `server/plugin-namespaces`, one key per namespace). */
+    /** Where plugins are installed from: `system:plugins:registry`, `system:plugins:registry_token` (an envelope bound to the field `pluginRegistry.token`) and
+     * `system:plugins:namespaces` (each namespace carrying its own token envelope). */
     pluginRegistry?: {
         url?: string;
-        tokenRef?: SecretRef;
+        token?: ConfigEnvelope;
         namespaces?: IntegrationPluginNamespace[];
-        namespaceTokensRef?: SecretRef;
     } | null;
 }

@@ -6,6 +6,8 @@
 import { IntegrationSettingsMongo } from "../../src/models/mongo/IntegrationSettingsMongo.js";
 import { IntegrationSettingsSQL } from "../../src/models/sql/IntegrationSettingsSQL.js";
 
+const envelope = (kid: string) => ({ $enc: 1 as const, kid, iv: "aXY=", ct: "Y3Q=", tag: "dGFn" });
+
 describe.each([
     ["Mongo", IntegrationSettingsMongo],
     ["SQL", IntegrationSettingsSQL],
@@ -20,11 +22,11 @@ describe.each([
 
     it("copies every section, including one cleared to null", () => {
         const fields = {
-            giphy: { enabled: false, apiKeyRef: { backend: "openbao", path: "server/giphy", keys: ["apiKey"], generation: 2 } },
+            giphy: { enabled: false, apiKey: envelope("k1") },
             stun: { urls: ["stun:stun.example.com"] },
             signingCa: { backend: "rfc8823", directoryUrl: "https://acme.example.com/dir", contactEmail: "pki@example.com" },
             dnsResolver: { mode: "doh-dnssec" },
-            pluginRegistry: { url: "https://registry.example.com", namespaces: [{ name: "@acme" }] },
+            pluginRegistry: { url: "https://registry.example.com", token: envelope("k1"), namespaces: [{ name: "@acme", token: envelope("k2") }] },
         };
         expect(new Settings(fields)).toEqual(expect.objectContaining(fields));
         expect(new Settings({ giphy: null, pluginRegistry: null })).toEqual(expect.objectContaining({ giphy: null, pluginRegistry: null }));

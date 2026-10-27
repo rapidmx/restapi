@@ -24,9 +24,9 @@ export function savedCredentialKeys(credentials: Record<string, unknown> | null 
         .sort();
 }
 
-/** The 503 for a server that has no `ConfigCipher` registered: nothing can be encrypted or decrypted. */
-export function noConfigCipher(): ApiError {
-    return new ApiError(ApiErrors.INTERNAL_ERROR, 503, "Configuration encryption isn't available on this server, so DNS provider credentials can't be handled.");
+/** The 503 for a server that has no `ConfigCipher` registered: nothing can be encrypted or decrypted. `what` names the secrets that can't be handled. */
+export function noConfigCipher(what: string = "DNS provider credentials"): ApiError {
+    return new ApiError(ApiErrors.INTERNAL_ERROR, 503, `Configuration encryption isn't available on this server, so ${what} can't be handled.`);
 }
 
 /** `values` (credential field to plaintext) sealed for provider `uid`. A 503 without a keyring. */

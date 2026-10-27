@@ -2,16 +2,13 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-// Isolated unit tests for what HTTP can't reach on `BaseIntegrationsRoute`: its `@Init` hook, a server without a secret store, the change hook failing,
-// and the races and failures around saving the row after the secret store was written. The route itself is tested over HTTP on both backends in
-// test/routes/integrationsSuite.ts.
+// Isolated unit tests for what HTTP can't reach on `BaseIntegrationsRoute`: its `@Init` hook, a server without a cipher, the change hook failing, and the
+// races and failures around the one write of the row. The route itself is tested over HTTP on both backends in test/routes/integrationsSuite.ts.
 import { ApiError } from "@rapidrest/core";
 import { ApiErrors, RepoUtils } from "@rapidrest/service-core";
-import { NO_SECRET_STORE_MESSAGE } from "../../src/secrets/NullSecretStore.js";
 import { BaseIntegrationsRoute } from "../../src/routes/BaseIntegrationsRoute.js";
 import { AuditLogUtils } from "../../src/util/AuditLogUtils.js";
-import { INTEGRATION_SETTINGS_UID, pluginNamespaceTokenKey } from "../../src/util/IntegrationSettingsUtils.js";
-import { InMemorySecretStore } from "../testDoubles.js";
+import { INTEGRATION_SETTINGS_UID } from "../../src/util/IntegrationSettingsUtils.js";
 
 const MASK = { secret: true };
 
@@ -55,18 +52,27 @@ function memoryRepo(): any {
     return repo;
 }
 
-function routeWith(store: InMemorySecretStore | undefined, repo: any = memoryRepo()): any {
+/** A stand-in for `ConfigCipher` that seals a value as an envelope naming where it belongs (and which seal it was, so two seals of one value differ as
+ * real ones do), so a test can read the value back without a keyring. */
+function fakeCipher(): any {
+    let seals = 0;
+    return {
+        encrypt: vi.fn((value: string, context: any) => ({ $enc: 1, kid: "k1", iv: "iv", ct: `${context.record}/${context.uid}/${context.field}=${value}#${++seals}`, tag: "tag" })),
+    };
+}
+
+/** The value a `fakeCipher()` envelope holds. */
+function sealed(envelope: any): string {
+    return /=(.*)#\d+$/.exec(envelope.ct)![1];
+}
+
+function routeWith(cipher: any = fakeCipher(), repo: any = memoryRepo()): any {
     const route: any = new TestIntegrationsRoute();
-    route.secretStore = store;
+    route.cipher = cipher;
     route.repo = repo;
     route.auditLogUtils = { record: vi.fn() };
     Object.defineProperty(route, "logger", { value: { warn: vi.fn(), error: vi.fn() }, configurable: true });
     return route;
-}
-
-/** The paths the store holds under `base` (each write has one of its own). */
-function pathsUnder(store: InMemorySecretStore, base: string): string[] {
-    return [...store.secrets.keys()].filter((path) => path.startsWith(`${base}-`));
 }
 
 describe("BaseIntegrationsRoute initialize()", () => {
@@ -104,7 +110,7 @@ describe("BaseIntegrationsRoute initialize()", () => {
 
 describe("BaseIntegrationsRoute", () => {
     it("reads the deployment's values from the config it was built with, and answers them before anything is saved", async () => {
-        const route = routeWith(new InMemorySecretStore());
+        const route = routeWith();
         route.configDnsResolver = "doh-dnssec";
         route.configRegistryToken = "REGISTRY-TOKEN";
         const view = await route.get();
@@ -114,27 +120,55 @@ describe("BaseIntegrationsRoute", () => {
     });
 
     it("never answers the user name or password the deployment's registry URL carries", async () => {
-        const route = routeWith(new InMemorySecretStore());
+        const route = routeWith();
         route.configRegistry = "https://ci:s3cret@npm.internal.example.com";
         const view = await route.get();
         expect(view.pluginRegistry.defaults.url).toBe("https://npm.internal.example.com");
         expect(JSON.stringify(view)).not.toContain("s3cret");
     });
 
-    it("refuses to save a secret on a server that registers no secret store, as NullSecretStore does (400)", async () => {
-        const route = routeWith(undefined);
-        await expect(route.update("giphy", { apiKey: "key" }, {}, admin)).rejects.toMatchObject({ status: 400, message: NO_SECRET_STORE_MESSAGE });
+    it("refuses to save a secret on a server that registers no cipher (503), saving nothing, while what needs none still saves", async () => {
+        const route = routeWith(undefined, memoryRepo());
+        route.cipher = undefined;
+        await expect(route.update("giphy", { apiKey: "key" }, {}, admin)).rejects.toMatchObject({ status: 503, message: expect.stringContaining("Configuration encryption isn't available") });
+        await expect(route.update("pluginRegistry", { namespaces: [{ name: "@acme", token: "t" }] }, {}, admin)).rejects.toMatchObject({ status: 503 });
+        expect(route.repo.rows.size).toBe(0);
+        expect(route.auditLogUtils.record).not.toHaveBeenCalled();
         expect((await route.update("giphy", { enabled: false }, {}, admin)).giphy.values.enabled).toBe(false);
+        // Clearing and keeping need no cipher.
+        expect((await route.update("pluginRegistry", { namespaces: ["@public"] }, {}, admin)).pluginRegistry.values.namespaces).toEqual([{ name: "@public" }]);
+        expect((await route.update("giphy", { apiKey: null }, {}, admin)).giphy.source.apiKey).toBe("deployment");
+    });
+
+    it("seals each secret for the settings row and the field it is saved in, in the one write of the row", async () => {
+        const cipher = fakeCipher();
+        const route = routeWith(cipher);
+        await route.update("giphy", { apiKey: " key " }, {}, admin);
+        await route.update("pluginRegistry", { token: "reg", namespaces: [{ name: "@acme", token: "ns" }, "rapidmx"] }, {}, admin);
+        expect(cipher.encrypt.mock.calls).toEqual([
+            ["key", { record: "IntegrationSettings", uid: INTEGRATION_SETTINGS_UID, field: "giphy.apiKey" }],
+            ["reg", { record: "IntegrationSettings", uid: INTEGRATION_SETTINGS_UID, field: "pluginRegistry.token" }],
+            ["ns", { record: "IntegrationSettings", uid: INTEGRATION_SETTINGS_UID, field: "pluginRegistry.namespaces.@acme.token" }],
+        ]);
+        const row = route.repo.rows.get(INTEGRATION_SETTINGS_UID);
+        expect(sealed(row.giphy.apiKey)).toBe("key");
+        expect(sealed(row.pluginRegistry.token)).toBe("reg");
+        expect(row.pluginRegistry.namespaces.map((namespace: any) => namespace.name)).toEqual(["@acme", "@rapidmx"]);
+        expect(sealed(row.pluginRegistry.namespaces[0].token)).toBe("ns");
+        expect(row.pluginRegistry.namespaces[1].token).toBeUndefined();
+        // Two updates, one write each; there is no second store to write to.
+        expect(route.repo.update).toHaveBeenCalledTimes(2);
+        expect(JSON.stringify(route.auditLogUtils.record.mock.calls)).not.toMatch(/"(key|reg|ns)"/);
     });
 
     it("takes a reset without a body as a reset of every field", async () => {
-        const route = routeWith(new InMemorySecretStore());
+        const route = routeWith();
         await route.update("dnsResolver", { mode: "doh-dnssec" }, {}, admin);
         expect((await route.reset("dnsResolver", undefined, {}, admin)).dnsResolver.source.mode).toBe("deployment");
     });
 
     it("announces a saved change through integrationsChanged(), and only logs when that fails", async () => {
-        const route = routeWith(new InMemorySecretStore());
+        const route = routeWith();
         const announced: any[] = [];
         route.integrationsChanged = vi.fn(async (settings: any) => {
             announced.push(settings);
@@ -148,86 +182,83 @@ describe("BaseIntegrationsRoute", () => {
         await expect(BaseIntegrationsRoute.prototype["integrationsChanged" as keyof BaseIntegrationsRoute<any>].call(route, {})).resolves.toBeUndefined();
     });
 
-    it("lets the write saved last win when two replace a secret at once, removing the other's from the store", async () => {
-        const store = new InMemorySecretStore();
+    it("merges a change to another section, and to another field, that lands before the row is written, sealing the secret once", async () => {
+        const cipher = fakeCipher();
         const repo = memoryRepo();
-        const route = routeWith(store, repo);
-        await route.update("giphy", { apiKey: "first" }, {}, admin);
-        const other = routeWith(store, repo);
+        const route = routeWith(cipher, repo);
+        await route.update("giphy", { enabled: true }, {}, admin);
+        const other = routeWith(fakeCipher(), repo);
         repo.beforeUpdate = async (call: number) => {
-            // Lands between this request's store write and its row write: the other write is saved first.
+            if (call === 2) {
+                repo.beforeUpdate = undefined;
+                await other.update("stun", { urls: ["stun:stun.example.com"] }, {}, admin);
+                await other.update("giphy", { enabled: false }, {}, admin);
+            }
+        };
+        const view = await route.update("giphy", { apiKey: "key" }, {}, admin);
+        expect(view.giphy.values).toEqual({ enabled: false, apiKey: MASK });
+        expect(view.stun.values.urls).toEqual(["stun:stun.example.com"]);
+        const row = repo.rows.get(INTEGRATION_SETTINGS_UID);
+        expect(sealed(row.giphy.apiKey)).toBe("key");
+        expect(row.giphy.enabled).toBe(false);
+        // The retry applied the same envelope to the newer row.
+        expect(cipher.encrypt).toHaveBeenCalledTimes(1);
+        expect(repo.update).toHaveBeenCalledTimes(5);
+    });
+
+    it("lets the write saved last win when two replace a secret at once", async () => {
+        const repo = memoryRepo();
+        const route = routeWith(fakeCipher(), repo);
+        await route.update("giphy", { apiKey: "first" }, {}, admin);
+        const other = routeWith(fakeCipher(), repo);
+        repo.beforeUpdate = async (call: number) => {
             if (call === 2) {
                 repo.beforeUpdate = undefined;
                 await other.update("giphy", { apiKey: "racing" }, {}, admin);
             }
         };
         await route.update("giphy", { apiKey: "mine" }, {}, admin);
-        const ref = repo.rows.get(INTEGRATION_SETTINGS_UID).giphy.apiKeyRef;
-        expect(store.secrets.get(ref.path)).toEqual({ apiKey: "mine" });
-        // "first" was removed by the other write, "racing" by this one: nothing is left that no row names.
-        expect(pathsUnder(store, "server/giphy")).toEqual([ref.path]);
+        expect(sealed(repo.rows.get(INTEGRATION_SETTINGS_UID).giphy.apiKey)).toBe("mine");
         expect(repo.update).toHaveBeenCalledTimes(4);
     });
 
-    it("never removes the new secret of a write that replaced the one this request was clearing", async () => {
-        const store = new InMemorySecretStore();
+    it("lets a clear win over a secret another write replaced meanwhile, as the last write to the field", async () => {
         const repo = memoryRepo();
-        const route = routeWith(store, repo);
-        await route.update("giphy", { apiKey: "first" }, {}, admin);
-        const other = routeWith(store, repo);
+        const route = routeWith(fakeCipher(), repo);
+        await route.update("giphy", { enabled: true, apiKey: "first" }, {}, admin);
+        const other = routeWith(fakeCipher(), repo);
         repo.beforeUpdate = async (call: number) => {
             if (call === 2) {
                 repo.beforeUpdate = undefined;
                 await other.update("giphy", { apiKey: "replaced" }, {}, admin);
             }
         };
-        await route.update("giphy", { apiKey: null }, {}, admin);
-        const ref = repo.rows.get(INTEGRATION_SETTINGS_UID).giphy.apiKeyRef;
-        expect(store.secrets.get(ref.path)).toEqual({ apiKey: "replaced" });
-        expect(pathsUnder(store, "server/giphy")).toEqual([ref.path]);
-    });
-
-    it("never removes the new secret of a write that lands while this one clears it from the store after saving the row", async () => {
-        const store = new InMemorySecretStore();
-        const repo = memoryRepo();
-        const route = routeWith(store, repo);
-        await route.update("giphy", { apiKey: "first" }, {}, admin);
-        const other = routeWith(store, repo);
-        // Inside this request's store delete, after its row was saved without the key: the other write saves a new key, which must survive.
-        store.duringChange = async () => {
-            await other.update("giphy", { apiKey: "k2" }, {}, admin);
-        };
         const view = await route.update("giphy", { apiKey: null }, {}, admin);
-        expect(view.giphy.source.apiKey).toBe("deployment");
-        const ref = repo.rows.get(INTEGRATION_SETTINGS_UID).giphy.apiKeyRef;
-        expect(store.secrets.get(ref.path)).toEqual({ apiKey: "k2" });
-        expect(pathsUnder(store, "server/giphy")).toEqual([ref.path]);
+        expect(view.giphy.source).toEqual({ enabled: "admin", apiKey: "deployment" });
+        expect(repo.rows.get(INTEGRATION_SETTINGS_UID).giphy).toEqual({ enabled: true });
     });
 
-    it("clears nothing more when another write cleared the same secret first", async () => {
-        const store = new InMemorySecretStore();
+    it("settles on the cleared secret when another write cleared it first", async () => {
         const repo = memoryRepo();
-        const route = routeWith(store, repo);
+        const route = routeWith(fakeCipher(), repo);
         await route.update("giphy", { enabled: true, apiKey: "first" }, {}, admin);
-        const other = routeWith(store, repo);
+        const other = routeWith(fakeCipher(), repo);
         repo.beforeUpdate = async (call: number) => {
             if (call === 2) {
                 repo.beforeUpdate = undefined;
                 await other.update("giphy", { apiKey: null }, {}, admin);
             }
         };
-        const deleted = vi.spyOn(store, "delete");
         const view = await route.update("giphy", { apiKey: null }, {}, admin);
         expect(view.giphy.source).toEqual({ enabled: "admin", apiKey: "deployment" });
-        expect(deleted).toHaveBeenCalledTimes(1);
+        expect(repo.rows.get(INTEGRATION_SETTINGS_UID).giphy).toEqual({ enabled: true });
     });
 
     it("refuses (409) a change to the plugin namespaces whose tokens another write changed meanwhile, never mixing one's list with the other's tokens", async () => {
-        const store = new InMemorySecretStore();
         const repo = memoryRepo();
-        const route = routeWith(store, repo);
+        const route = routeWith(fakeCipher(), repo);
         await route.update("pluginRegistry", { namespaces: [{ name: "@a", token: "a" }] }, {}, admin);
-        const other = routeWith(store, repo);
+        const other = routeWith(fakeCipher(), repo);
         repo.beforeUpdate = async (call: number) => {
             if (call === 2) {
                 repo.beforeUpdate = undefined;
@@ -238,39 +269,38 @@ describe("BaseIntegrationsRoute", () => {
             code: ApiErrors.INVALID_OBJECT_VERSION,
         });
         const saved = repo.rows.get(INTEGRATION_SETTINGS_UID).pluginRegistry;
-        expect(saved.namespaces).toEqual([{ name: "@c" }]);
-        expect(store.secrets.get(saved.namespaceTokensRef.path)).toEqual({ [pluginNamespaceTokenKey("@c")]: "c" });
-        // This request's secret is gone again, and so is the one the other write replaced.
-        expect(pathsUnder(store, "server/plugin-namespaces")).toEqual([saved.namespaceTokensRef.path]);
+        expect(saved.namespaces.map((namespace: any) => [namespace.name, sealed(namespace.token)])).toEqual([["@c", "c"]]);
         expect(route.auditLogUtils.record).toHaveBeenCalledTimes(1);
 
-        // A change of the list alone is refused the same way when the tokens moved underneath it.
+        // A change of the list alone is refused the same way when the kept token was replaced underneath it.
         repo.beforeUpdate = async () => {
             repo.beforeUpdate = undefined;
             await other.update("pluginRegistry", { namespaces: [{ name: "@c", token: "c2" }] }, {}, admin);
         };
         await expect(route.update("pluginRegistry", { namespaces: [{ name: "@c", token: MASK }, "@d"] }, {}, admin)).rejects.toMatchObject({ status: 409 });
+        expect(repo.rows.get(INTEGRATION_SETTINGS_UID).pluginRegistry.namespaces.map((namespace: any) => namespace.name)).toEqual(["@c"]);
     });
 
-    it("carries over only the kept tokens the store still holds", async () => {
-        const store = new InMemorySecretStore();
+    it("lets the list saved last win when another write changed the namespaces but none of their tokens", async () => {
         const repo = memoryRepo();
-        const route = routeWith(store, repo);
-        await route.update("pluginRegistry", { namespaces: [{ name: "@a", token: "a" }, { name: "@b", token: "b" }] }, {}, admin);
-        const first = repo.rows.get(INTEGRATION_SETTINGS_UID).pluginRegistry.namespaceTokensRef;
-        // The store lost @b's token (edited by hand); keeping both carries @a's only.
-        delete store.secrets.get(first.path)![pluginNamespaceTokenKey("@b")];
-        const view = await route.update("pluginRegistry", { namespaces: [{ name: "@a", token: MASK }, { name: "@b", token: MASK }, { name: "@c", token: "c" }] }, {}, admin);
-        const ref = repo.rows.get(INTEGRATION_SETTINGS_UID).pluginRegistry.namespaceTokensRef;
-        expect(store.secrets.get(ref.path)).toEqual({ [pluginNamespaceTokenKey("@a")]: "a", [pluginNamespaceTokenKey("@c")]: "c" });
-        expect(view.pluginRegistry.values.namespaces).toEqual([{ name: "@a", token: MASK }, { name: "@b" }, { name: "@c", token: MASK }]);
-        expect(store.secrets.has(first.path)).toBe(false);
+        const route = routeWith(fakeCipher(), repo);
+        await route.update("pluginRegistry", { namespaces: [{ name: "@a", token: "a" }] }, {}, admin);
+        const other = routeWith(fakeCipher(), repo);
+        repo.beforeUpdate = async (call: number) => {
+            if (call === 2) {
+                repo.beforeUpdate = undefined;
+                await other.update("pluginRegistry", { namespaces: [{ name: "@a", token: MASK }, "@x"] }, {}, admin);
+            }
+        };
+        await route.update("pluginRegistry", { namespaces: [{ name: "@a", token: MASK }, "@d"] }, {}, admin);
+        const saved = repo.rows.get(INTEGRATION_SETTINGS_UID).pluginRegistry.namespaces;
+        expect(saved.map((namespace: any) => namespace.name)).toEqual(["@a", "@d"]);
+        expect(sealed(saved[0].token)).toBe("a");
     });
 
-    it("gives up with the 409 after losing the race to other writes again and again, removing the secret it wrote", async () => {
-        const store = new InMemorySecretStore();
+    it("gives up with the 409 after losing the race to other writes again and again", async () => {
         const repo = memoryRepo();
-        const route = routeWith(store, repo);
+        const route = routeWith(fakeCipher(), repo);
         repo.beforeUpdate = async () => {
             // Every attempt: another write bumps the row first.
             const row = repo.rows.get(INTEGRATION_SETTINGS_UID);
@@ -278,86 +308,31 @@ describe("BaseIntegrationsRoute", () => {
         };
         await expect(route.update("giphy", { apiKey: "key" }, {}, admin)).rejects.toMatchObject({ code: ApiErrors.INVALID_OBJECT_VERSION });
         expect(repo.update).toHaveBeenCalledTimes(3);
-        expect(store.secrets.size).toBe(0);
+        expect(repo.rows.get(INTEGRATION_SETTINGS_UID).giphy ?? null).toBeNull();
         expect(route.auditLogUtils.record).not.toHaveBeenCalled();
     });
 
-    it("leaves the secret in use untouched when the row can't be saved, so nothing changes unaudited", async () => {
-        const store = new InMemorySecretStore();
+    it("leaves the row as it was when it can't be saved, so nothing changes unaudited or announced", async () => {
         const repo = memoryRepo();
-        const route = routeWith(store, repo);
+        const route = routeWith(fakeCipher(), repo);
+        route.integrationsChanged = vi.fn();
         await route.update("giphy", { apiKey: "first" }, {}, admin);
-        const before = repo.rows.get(INTEGRATION_SETTINGS_UID);
+        const before = structuredClone(repo.rows.get(INTEGRATION_SETTINGS_UID));
         repo.beforeUpdate = async () => {
             throw new Error("datastore down");
         };
         await expect(route.update("giphy", { apiKey: "second" }, {}, admin)).rejects.toThrow("datastore down");
-        expect(repo.update).toHaveBeenCalledTimes(2);
-        // The row still names the first key, which the store still holds; the second is gone again.
         expect(repo.rows.get(INTEGRATION_SETTINGS_UID)).toEqual(before);
-        expect(store.secrets.get(before.giphy.apiKeyRef.path)).toEqual({ apiKey: "first" });
-        expect(pathsUnder(store, "server/giphy")).toEqual([before.giphy.apiKeyRef.path]);
         expect(route.auditLogUtils.record).toHaveBeenCalledTimes(1);
+        expect(route.integrationsChanged).toHaveBeenCalledTimes(1);
         expect(route.logger.error).not.toHaveBeenCalled();
-
-        // A secret that can't be removed again is logged.
-        store.failDelete = true;
-        await expect(route.update("pluginRegistry", { token: "token" }, {}, admin)).rejects.toThrow("datastore down");
-        expect(route.logger.warn).toHaveBeenCalledWith(expect.stringContaining("Could not remove the integration secret at 'server/plugin-registry-"));
     });
 
-    it("leaves what it wrote in the store while the row can't be read back, logging it", async () => {
-        const store = new InMemorySecretStore();
-        const repo = memoryRepo();
-        const route = routeWith(store, repo);
-        await route.update("giphy", { enabled: true }, {}, admin);
-        repo.beforeUpdate = async () => {
-            throw new Error("datastore down");
-        };
-        repo.findOne.mockImplementationOnce(async () => structuredClone(repo.rows.get(INTEGRATION_SETTINGS_UID))).mockImplementationOnce(async () => {
-            throw new Error("datastore gone");
-        });
-        await expect(route.update("giphy", { apiKey: "key" }, {}, admin)).rejects.toThrow("datastore down");
-        expect(pathsUnder(store, "server/giphy")).toHaveLength(1);
-        expect(route.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/'server\/giphy-[0-9a-f]+' were left in the secret store: datastore gone/));
-    });
-
-    it("keeps a secret the row names after all when the save reported a failure after it was applied", async () => {
-        const store = new InMemorySecretStore();
-        const repo = memoryRepo();
-        const route = routeWith(store, repo);
-        await route.update("giphy", { enabled: true }, {}, admin);
-        repo.afterUpdate = async () => {
-            repo.afterUpdate = undefined;
-            throw new Error("connection reset");
-        };
-        await expect(route.update("giphy", { apiKey: "key" }, {}, admin)).rejects.toThrow("connection reset");
-        const ref = repo.rows.get(INTEGRATION_SETTINGS_UID).giphy.apiKeyRef;
-        expect(store.secrets.get(ref.path)).toEqual({ apiKey: "key" });
-        expect(route.logger.error).toHaveBeenCalledWith(expect.stringContaining(`'${ref.path}' was saved with the settings`));
-    });
-
-    it("removes the secret it wrote when the next store write of the same request fails", async () => {
-        const store = new InMemorySecretStore();
-        const route = routeWith(store);
-        const write = store.write.bind(store);
-        vi.spyOn(store, "write").mockImplementation(async (path: string, values: Record<string, string>) => {
-            if (path.startsWith("server/plugin-namespaces-")) {
-                throw new ApiError(ApiErrors.INTERNAL_ERROR, 503, "secret store unavailable");
-            }
-            return await write(path, values);
-        });
-        await expect(route.update("pluginRegistry", { token: "token", namespaces: [{ name: "@acme", token: "ns" }] }, {}, admin)).rejects.toMatchObject({ status: 503 });
-        expect(store.secrets.size).toBe(0);
-        expect(route.repo.rows.size).toBe(0);
-    });
-
-    it("passes on a failure to create the row, with nothing written to the store", async () => {
-        const store = new InMemorySecretStore();
+    it("passes on a failure to create the row", async () => {
         const repo = memoryRepo();
         repo.create.mockImplementation(async () => Promise.reject(new Error("datastore down")));
-        const route = routeWith(store, repo);
+        const route = routeWith(fakeCipher(), repo);
         await expect(route.update("stun", { urls: ["stun:stun.example.com"] }, {}, admin)).rejects.toThrow("datastore down");
-        expect(store.secrets.size).toBe(0);
+        expect(route.auditLogUtils.record).not.toHaveBeenCalled();
     });
 });

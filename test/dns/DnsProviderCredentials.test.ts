@@ -31,6 +31,8 @@ describe("DNS provider credentials", () => {
 
     it("answers 503 for a server without a cipher", () => {
         expect(noConfigCipher()).toMatchObject({ status: 503, message: expect.stringContaining("Configuration encryption isn't available") });
+        expect(noConfigCipher().message).toContain("DNS provider credentials");
+        expect(noConfigCipher("integration secrets").message).toBe("Configuration encryption isn't available on this server, so integration secrets can't be handled.");
     });
 
     it("seals each value for the row and field it belongs to", () => {

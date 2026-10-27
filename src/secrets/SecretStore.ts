@@ -5,8 +5,9 @@
 import { SecretBackend, SecretRef } from "../models/types.js";
 
 /**
- * Holds the credentials an administrator saves in the console (DNS provider credentials, the Giphy key, the plugin registry token, plugin secret settings)
- * outside the database: rows keep only the `SecretRef` a write returns.
+ * Holds the credentials an administrator saves in the console outside the database: rows keep only the `SecretRef` a write returns. Only plugin secret settings
+ * are still kept this way, until restapi's step R4 removes the store: DNS provider credentials and the Integrations secrets (the Giphy key, the registry
+ * and namespace tokens) are encrypted on their own rows (`ConfigCipher`, spec 5).
  *
  * This library defines the abstraction and the server registers the implementation under the DI token `"SecretStore"` (OpenBao KV when the deployment has
  * OpenBao, else Kubernetes Secrets written through the DNS controller), the same split as `BlobStore` and `DkimKeyProvider`. `NullSecretStore` is the default
@@ -14,10 +15,8 @@ import { SecretBackend, SecretRef } from "../models/types.js";
  * secret settings, which a deployment without a store keeps on the plugin's row as it always has (the plugin route never writes them to `NullSecretStore`)
  * until a store is registered and `PluginSecretMigrator` moves them (spec 5.4).
  *
- * Paths are namespaced by consumer: `dns/<provider uid>` (consumed only by external-dns, so the server can write them but never read them back),
- * `server/<name>-<random>` (the Giphy key, the registry token: `integrationSecretPath()`) and `plugins/<package>/<key>-<random>` (plugin secret
- * settings: `pluginSecretPath()`, at most 253 characters). Those two get a new path for every write, never one fixed path per setting, so a policy or a
- * mapping for them covers the prefix.
+ * Plugin secret settings are at `plugins/<package>/<key>-<random>` (`pluginSecretPath()`, at most 253 characters), a new path for every write, never one
+ * fixed path per setting, so a policy or a mapping for them covers the prefix.
  *
  * An implementation never puts a value in a log line or an error message.
  *

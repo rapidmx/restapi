@@ -10,6 +10,7 @@
 import * as fs from "fs";
 import { AuditAction, type ConfigEnvelope } from "../../src/models/types.js";
 import { dnsProviderEnvelopeSource } from "../../src/dns/DnsProviderEnvelopeSource.js";
+import { integrationSettingsEnvelopeSource } from "../../src/util/IntegrationSettingsEnvelopeSource.js";
 import { isConfigEnvelope, type ConfigCipher } from "../../src/secrets/ConfigCipher.js";
 import { ConfigEnvelopeSourceRegistry, type ConfigEnvelopeSource } from "../../src/secrets/ConfigEnvelopeSource.js";
 import type { LocalConfigKeyChannel } from "../../src/secrets/ConfigKeyChannel.js";
@@ -41,6 +42,11 @@ export interface ConfigKeyRotationSuiteContext {
     provider: (uid: string) => Promise<any>;
     clearProviders: () => Promise<void>;
     providerModel: () => any;
+    /** Saves the Integrations settings row (`integrations`) with these sections. */
+    insertIntegrations: (sections: Record<string, unknown>) => Promise<void>;
+    integrations: () => Promise<any>;
+    clearIntegrations: () => Promise<void>;
+    integrationsModel: () => any;
     auditEntries: (action: AuditAction) => Promise<any[]>;
     clearAudit: () => Promise<void>;
 }
@@ -118,6 +124,7 @@ export function configKeyRotationSuite(ctx: ConfigKeyRotationSuiteContext): void
             await ctx.clearState();
             await ctx.clearPlugins();
             await ctx.clearProviders();
+            await ctx.clearIntegrations();
             await ctx.clearAudit();
             ctx.channel().reset();
             await ctx.cipher().reload();
@@ -649,6 +656,41 @@ export function configKeyRotationSuite(ctx: ConfigKeyRotationSuiteContext): void
                 expect(bare.version).toBe(untouched);
                 expect((await ctx.auditEntries(AuditAction.CONFIG_REENCRYPTED))[0].details).toEqual({ targetKid: kid, counts: { DnsProvider: 2 } });
                 expect((await ctx.state()).kidUsage).toEqual({ [kid]: 2 });
+            });
+
+            it("re-encrypts the Integrations settings' secrets with their own envelope source, leaving the other sections and fields alone", async () => {
+                const kid = await activate();
+                job.sources.register(integrationSettingsEnvelopeSource(ctx.integrationsModel()));
+                const seal = (field: string, value: string) => ctx.cipher().encrypt(value, { record: "IntegrationSettings", uid: "integrations", field });
+                await ctx.insertIntegrations({
+                    giphy: { enabled: true, apiKey: seal("giphy.apiKey", "giphy-key") },
+                    stun: { urls: ["stun:stun.example.com"] },
+                    pluginRegistry: {
+                        url: "https://registry.example.com",
+                        token: seal("pluginRegistry.token", "registry-token"),
+                        namespaces: [{ name: "@acme", registry: "https://npm.acme.example", token: seal("pluginRegistry.namespaces.@acme.token", "acme-token") }, { name: "@open" }],
+                    },
+                });
+                await beat("pod-a:1", [OLD.kid, kid], kid);
+
+                await job.run();
+
+                const row = await ctx.integrations();
+                const open = (field: string, envelope: ConfigEnvelope) => ctx.cipher().decrypt(envelope, { record: "IntegrationSettings", uid: "integrations", field });
+                expect(row.giphy.enabled).toBe(true);
+                expect(row.giphy.apiKey.kid).toBe(kid);
+                expect(open("giphy.apiKey", row.giphy.apiKey)).toBe("giphy-key");
+                expect(row.stun).toEqual({ urls: ["stun:stun.example.com"] });
+                expect(row.pluginRegistry.url).toBe("https://registry.example.com");
+                expect(row.pluginRegistry.token.kid).toBe(kid);
+                expect(open("pluginRegistry.token", row.pluginRegistry.token)).toBe("registry-token");
+                expect(row.pluginRegistry.namespaces).toHaveLength(2);
+                expect(row.pluginRegistry.namespaces[0].registry).toBe("https://npm.acme.example");
+                expect(row.pluginRegistry.namespaces[0].token.kid).toBe(kid);
+                expect(open("pluginRegistry.namespaces.@acme.token", row.pluginRegistry.namespaces[0].token)).toBe("acme-token");
+                expect(row.pluginRegistry.namespaces[1].token ?? undefined).toBeUndefined();
+                expect((await ctx.auditEntries(AuditAction.CONFIG_REENCRYPTED))[0].details).toEqual({ targetKid: kid, counts: { IntegrationSettings: 3 } });
+                expect((await ctx.state()).kidUsage).toEqual({ [kid]: 3 });
             });
 
             it("records the counts per key and that the pass completed", async () => {
