@@ -2276,6 +2276,20 @@ export enum AuditAction {
     INTEGRATION_RESET = "integration.reset",
     /** A plugin's plaintext secret setting was moved into the secret store. `details` carries the plugin and the setting's key; never its value. */
     PLUGIN_SECRET_MIGRATED = "plugin.secret_migrated",
+    /** `POST /system/config-keys/rotate` - an elevated administrator started a configuration-key rotation, or marked the running one compromised. `details`
+     * carries `compromised`. */
+    CONFIG_KEY_ROTATION_REQUESTED = "config_key.rotation_requested",
+    /** A rotation added its new key to the keyring (no user: the server did). `details` carries the new `kid` and the `reason` (`manual` or `compromised`). */
+    CONFIG_KEY_ROTATED = "config_key.rotated",
+    /** Every live server copy had loaded a rotation's new key, so it began to encrypt (no user). `details` carries the `kid` and the number of `copies`. */
+    CONFIG_KEY_ACTIVATED = "config_key.activated",
+    /** `POST /system/config-keys/activate` - an elevated administrator activated a rotation's new key before every copy had loaded it. `details` carries the
+     * `kid` and the `staleCopies` that hadn't, by pod name and process id. */
+    CONFIG_KEY_ACTIVATION_FORCED = "config_key.activation_forced",
+    /** Envelopes were re-encrypted with the active key (no user). `details` carries the `targetKid` and the `counts` re-encrypted per record type. */
+    CONFIG_REENCRYPTED = "config.reencrypted",
+    /** A rotation removed an old key from the keyring once no envelope used it (no user). `details` carries the removed `kid`. */
+    CONFIG_KEY_RETIRED = "config_key.retired",
 }
 
 /** The DNS hosting services a `DnsProvider` config can publish through (each an external-dns provider, see `dns/DnsProviderTypes.ts`). */
@@ -2551,6 +2565,26 @@ export interface ConfigKeyRotation {
     lastError?: string;
 }
 
+/** An envelope a re-encryption pass couldn't decrypt, named so the console can say which secret to enter again: never a value or an envelope. */
+export interface ConfigKeyUnreadableEnvelope {
+    record: string;
+    uid: string;
+    field: string;
+    /** The key the envelope names. */
+    kid: string;
+}
+
+/** The re-encryption of every envelope to the active key, as the last full pass left it. */
+export interface ConfigKeyReencryption {
+    targetKid: string;
+    /** Whether the last pass saw every row and wrote every change: a row changed meanwhile or one that failed to save makes it `false`, and the next run goes again. */
+    complete: boolean;
+    startedAt: Date;
+    finishedAt?: Date;
+    /** The envelopes the last pass couldn't decrypt (at most `MAX_UNREADABLE_LISTED`); they stay on their key. */
+    unreadable?: ConfigKeyUnreadableEnvelope[];
+}
+
 /**
  * The configuration keyring's progress, never key material (spec 4.9): one singleton row (`CONFIG_KEY_STATE_UID`), deny-all class ACL. The server copies read
  * `activeKid` to know which key encrypts, and the console reads the rest.
@@ -2564,7 +2598,7 @@ export interface ConfigKeyState extends BaseEntity {
     /** The envelopes per `kid` at the end of the last full re-encryption pass. */
     kidUsage?: Record<string, number> | null;
     countedAt?: Date;
-    reencryption?: { targetKid: string; complete: boolean; startedAt: Date; finishedAt?: Date } | null;
+    reencryption?: ConfigKeyReencryption | null;
     /** The plugin secret settings' encryption (spec 5.7): `encryptedAt` is the first completed run of `PluginSecretEncryptor`, until which secret settings are
      * saved in plaintext, and `reason` says why the run is still waiting for the server's rollout. */
     pluginSecrets?: { encryptedAt?: Date; waitingForRollout?: boolean; checkedAt?: Date; reason?: string } | null;

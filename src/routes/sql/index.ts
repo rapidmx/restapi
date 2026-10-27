@@ -4,6 +4,7 @@ export * from "./AuditLogRouteSQL.js";
 export * from "./BrandingRouteSQL.js";
 export * from "./CalendarEventRouteSQL.js";
 export * from "./CalendarShareLinkRouteSQL.js";
+export * from "./ConfigKeyRouteSQL.js";
 export * from "./ContactListRouteSQL.js";
 export * from "./ContactRouteSQL.js";
 export * from "./DataExportRequestRouteSQL.js";

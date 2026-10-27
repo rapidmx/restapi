@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 // Lightweight, deterministic test-double implementations of this library's pluggable interfaces
 // (`BlobStore`, `SearchProvider`, `SpamScanProvider`, `AvScanProvider`, `MailTransport`, `DnsResolver`,
-// `DkimKeyProvider`, `EncryptionCertificateAuthority`, `SigningCertificateEnrollment`, `SecretStore`, `DnsPublisher`,
+// `DkimKeyProvider`, `EncryptionCertificateAuthority`, `SigningCertificateEnrollment`, `SecretStore`, `ConfigCipher`, `ConfigKeyChannel`, `ConfigKeyringStore`, `DnsPublisher`,
 // `DnsControllerTokenVerifier`), registered with an
 // `ObjectFactory` under the same string names the library's `@Inject("...")` decorators resolve against. Every
 // integration test that boots the shared `test/server-mongo`/`test/server-sql` fixture app needs these
@@ -34,6 +34,11 @@ import type { MailTransport, OutboundMessage, TransportResult } from "../src/tra
 import { NullDkimKeyProvider } from "../src/dkim/NullDkimKeyProvider.js";
 import { NullEncryptionCertificateAuthority } from "../src/pki/NullEncryptionCertificateAuthority.js";
 import { NullSigningCertificateEnrollment } from "../src/pki/NullSigningCertificateEnrollment.js";
+import { ConfigCipher } from "../src/secrets/ConfigCipher.js";
+import { LocalConfigKeyChannel } from "../src/secrets/ConfigKeyChannel.js";
+import { type ConfigKeyring } from "../src/secrets/ConfigKeyring.js";
+import { ConfigKeyringConflictError, type ConfigKeyringSnapshot, type ConfigKeyringStore } from "../src/secrets/ConfigKeyringStore.js";
+import { TEST_CONFIG_KEYRING } from "./config-defaults.js";
 import { NullSecretStore } from "../src/secrets/NullSecretStore.js";
 import type { SecretStore } from "../src/secrets/SecretStore.js";
 import type { EncryptionCertificateAuthority, IssuedCertificate } from "../src/pki/EncryptionCertificateAuthority.js";
@@ -313,6 +318,24 @@ export class StaticDnsResolver implements DnsResolver {
     }
 }
 
+/** A `ConfigKeyringStore` that keeps the test keyring in memory, versioned by a counter, so the routes can start a rotation (the real stores need a cluster). */
+export class InMemoryConfigKeyringStore implements ConfigKeyringStore {
+    private keyring: ConfigKeyring = structuredClone(TEST_CONFIG_KEYRING);
+    private version = 1;
+
+    public async read(): Promise<ConfigKeyringSnapshot> {
+        return { keyring: structuredClone(this.keyring), version: String(this.version) };
+    }
+
+    public async write(keyring: ConfigKeyring, version: string): Promise<void> {
+        if (version !== String(this.version)) {
+            throw new ConfigKeyringConflictError();
+        }
+        this.keyring = structuredClone(keyring);
+        this.version++;
+    }
+}
+
 /**
  * A `SecretStore` that keeps secrets in a `Map` by path, so a test can see exactly what was saved (and that nothing reached the database). `refuse` makes
  * every call behave as `NullSecretStore` (the deployment without a store), and `failDelete` makes `delete()` reject, as a store that is down does.
@@ -542,6 +565,10 @@ export function registerTestDoubles(objectFactory: ObjectFactory): void {
     objectFactory.register(NullEncryptionCertificateAuthority, "EncryptionCertificateAuthority");
     objectFactory.register(NullSigningCertificateEnrollment, "SigningCertificateEnrollment");
     objectFactory.register(InMemorySecretStore, "SecretStore");
+    // The test keyring (`config_encryption:keyring`); the base class has no datastore, so the oldest key encrypts.
+    objectFactory.register(ConfigCipher, "ConfigCipher");
+    objectFactory.register(LocalConfigKeyChannel, "ConfigKeyChannel");
+    objectFactory.register(InMemoryConfigKeyringStore, "ConfigKeyringStore");
     objectFactory.register(InMemoryDnsPublisher, "DnsPublisher");
     objectFactory.register(StaticDnsControllerTokenVerifier, "DnsControllerTokenVerifier");
 }

@@ -6,7 +6,7 @@ import * as crypto from "crypto";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { ConfigEnvelope, ConfigKeyState } from "../models/types.js";
-import { CONFIG_KEY_STATE_UID, ConfigKeyring, newestConfigKey, oldestConfigKey, readConfigKeyring } from "./ConfigKeyring.js";
+import { CONFIG_KEY_STATE_UID, ConfigKeyEntry, ConfigKeyring, newestConfigKey, oldestConfigKey, readConfigKeyring } from "./ConfigKeyring.js";
 const { Config, Destroy, Init, Logger } = ObjectDecorators;
 
 /** The format tag in every envelope's associated data. */
@@ -34,6 +34,15 @@ export interface ConfigCipherContext {
 /** Why a secret can't be read: its key isn't in the ring (`unknown_key`), it isn't a well-formed envelope or doesn't hold a value (`invalid`), or it failed
  * authentication - another record or field, a changed byte or the wrong key (`failed`). */
 export type ConfigSecretUnavailableReason = "unknown_key" | "invalid" | "failed";
+
+/** A loaded key as the console shows it: never its material. */
+export interface ConfigKeyInfo {
+    kid: string;
+    /** ISO 8601, as the keyring records it. */
+    createdAt: string;
+    /** Whether this process encrypts with it. */
+    active: boolean;
+}
 
 /**
  * A stored secret can't be decrypted. It names the record and field (and, for a missing key, the `kid`), never the value, the envelope or a key: the
@@ -130,6 +139,8 @@ export class ConfigCipher {
 
     /** The loaded keys by `kid`, and the one that is newest by `createdAt`. */
     private keys: Map<string, Buffer> = new Map();
+    /** The loaded keyring's entries in the order it lists them, without their material (`keyInfo()`). */
+    private keyDates: { kid: string; createdAt: string }[] = [];
     private newestKid?: string;
     private oldestKid?: string;
     /** `ConfigKeyState.activeKid` as last read. */
@@ -142,6 +153,9 @@ export class ConfigCipher {
     /** The last failure a reload logged, so the same one isn't logged every minute. */
     private lastKeyringError?: string;
     private lastStateError?: string;
+    /** Who is told when the loaded keys or the key this process encrypts with change (`onChange()`), and what they were when it last told them. */
+    private listeners: Set<() => void> = new Set();
+    private lastSignature: string = "";
 
     @Init
     public async init(): Promise<void> {
@@ -188,6 +202,44 @@ export class ConfigCipher {
     /** The `kid` new values are encrypted with, or `undefined` when no keyring is loaded. */
     public currentKid(): string | undefined {
         return this.activeKey()?.kid;
+    }
+
+    /** The `kid`s of the keys this process has loaded: what its keyring heartbeat reports (spec 5.5). */
+    public loadedKids(): string[] {
+        return [...this.keys.keys()];
+    }
+
+    /** The loaded keys by `kid` and creation date, which one encrypts, never key material: what the key console lists. */
+    public keyInfo(): ConfigKeyInfo[] {
+        const active: string | undefined = this.currentKid();
+        return this.keyDates.map((entry) => ({ kid: entry.kid, createdAt: entry.createdAt, active: entry.kid === active }));
+    }
+
+    /**
+     * Calls `listener` after a reload that changed the loaded keys or the key this process encrypts with - also the re-read an unknown `kid` causes - so the
+     * keyring heartbeat reports the change at once instead of at its next beat. A listener that throws is skipped. Returns the function that unsubscribes it.
+     */
+    public onChange(listener: () => void): () => void {
+        this.listeners.add(listener);
+        return () => {
+            this.listeners.delete(listener);
+        };
+    }
+
+    /** Tells the listeners when what `onChange()` watches differs from when they were last told. */
+    private notifyIfChanged(): void {
+        const signature = `${[...this.keys.keys()].sort().join(",")}|${this.currentKid() ?? ""}`;
+        if (signature === this.lastSignature) {
+            return;
+        }
+        this.lastSignature = signature;
+        for (const listener of [...this.listeners]) {
+            try {
+                listener();
+            } catch (err: any) {
+                this.logger?.warn(`ConfigCipher: a change listener failed: ${err?.message}`);
+            }
+        }
     }
 
     /** Whether `value` is an envelope (`isConfigEnvelope()`). */
@@ -302,9 +354,11 @@ export class ConfigCipher {
         if (!ring) {
             return;
         }
-        this.keys = new Map(ring.keys.map((entry) => [entry.kid, Buffer.from(entry.key, "base64")]));
+        this.keys = new Map(ring.keys.map((entry: ConfigKeyEntry) => [entry.kid, Buffer.from(entry.key, "base64")]));
+        this.keyDates = ring.keys.map((entry: ConfigKeyEntry) => ({ kid: entry.kid, createdAt: entry.createdAt }));
         this.newestKid = newestConfigKey(ring)?.kid;
         this.oldestKid = oldestConfigKey(ring)?.kid;
+        this.notifyIfChanged();
     }
 
     /** Reads `ConfigKeyState.activeKid`. Keeps the one it has, and logs once, when the row can't be read. */
@@ -321,6 +375,7 @@ export class ConfigCipher {
             }
             this.activeKid = state?.activeKid ?? undefined;
             this.lastStateError = undefined;
+            this.notifyIfChanged();
         } catch (err: any) {
             if (err.message !== this.lastStateError) {
                 this.lastStateError = err.message;

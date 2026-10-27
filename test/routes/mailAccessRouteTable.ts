@@ -66,6 +66,7 @@ export const ROUTE_TABLE: Record<string, RouteRow> = {
     // --- platform administration (no mail content) -------------------------------------------------------------------
     AuditLogRoute: { kind: "admin", base: "BaseAuditLogRoute", gate: "trusted reads the audit log; nobody writes it through the API" },
     BrandingRoute: { kind: "admin", base: "BaseBrandingRoute", gate: "public read of the branding; trusted writes, audited" },
+    ConfigKeyRoute: { kind: "admin", base: "BaseConfigKeyRoute", gate: "trusted reads (the keys by kid and age, never key material); trusted AND elevated writes - starting a rotation and 'Activate anyway' (assertAdminScope); audited" },
     DistributionListRoute: { kind: "admin", base: "BaseDistributionListRoute", gate: "trusted manages org lists; audited" },
     DnsProviderRoute: { kind: "admin", base: "BaseDnsProviderRoute", gate: "trusted reads; trusted AND elevated writes and queued test/takeover operations (assertAdminScope); credentials only in the secret store, shown as masks; audited" },
     DomainRoute: { kind: "admin", base: "BaseDomainRoute", gate: "trusted manages domains; assigning a DNS provider and managing the apex TXT set need elevation too; audited" },

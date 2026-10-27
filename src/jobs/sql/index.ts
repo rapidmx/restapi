@@ -1,6 +1,7 @@
 export * from "./AcmeEnrollmentDriverJobSQL.js";
 export * from "./AttachmentExtractionJobSQL.js";
 export * from "./CalendarReminderJobSQL.js";
+export * from "./ConfigKeyRotationJobSQL.js";
 export * from "./DataExportJobSQL.js";
 export * from "./DkimRotationJobSQL.js";
 export * from "./DomainVerificationJobSQL.js";

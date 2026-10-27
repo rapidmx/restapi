@@ -668,3 +668,90 @@ describe("ConfigCipher reloading", () => {
         expect(logged).not.toContain("AAAA");
     });
 });
+
+describe("ConfigCipher keys and change notices", () => {
+    let dir: string;
+    let file: string;
+
+    const write = (ring: ConfigKeyring): void => {
+        fs.writeFileSync(file, serializeConfigKeyring(ring));
+    };
+
+    beforeEach(() => {
+        dir = fs.mkdtempSync(path.join(os.tmpdir(), "cipher-"));
+        file = path.join(dir, "keyring.json");
+        write(ringOf(OLD, NEW));
+    });
+
+    afterEach(() => {
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("lists the kids of the keys it has loaded", async () => {
+        const { cipher } = await newCipher({ keyringFile: file });
+        expect(cipher.loadedKids().sort()).toEqual([NEW.kid, OLD.kid].sort());
+    });
+
+    it("lists no kids without a keyring", async () => {
+        const { cipher } = await newCipher({});
+        expect(cipher.loadedKids()).toEqual([]);
+    });
+
+    it("describes each loaded key by kid, creation date and whether it encrypts, never its material", async () => {
+        const { cipher } = await newCipher({ keyringFile: file });
+        const info = cipher.keyInfo();
+        expect(info).toEqual([
+            { kid: OLD.kid, createdAt: OLD.createdAt, active: true },
+            { kid: NEW.kid, createdAt: NEW.createdAt, active: false },
+        ]);
+        expect(JSON.stringify(info)).not.toContain(KEY_OLD);
+        expect(JSON.stringify(info)).not.toContain(KEY_NEW);
+    });
+
+    it("tells a listener when a reload changed the loaded keys or the active key, and not when it changed nothing", async () => {
+        write(ringOf(OLD));
+        const { cipher, state } = await newCipher({ keyringFile: file });
+        const listener = vi.fn();
+        cipher.onChange(listener);
+        await cipher.reload();
+        expect(listener).not.toHaveBeenCalled();
+
+        write(ringOf(OLD, NEW));
+        await cipher.reload();
+        expect(listener).toHaveBeenCalledTimes(1);
+
+        state.activeKid = NEW.kid;
+        await cipher.reload();
+        expect(listener).toHaveBeenCalledTimes(2);
+        await cipher.reload();
+        expect(listener).toHaveBeenCalledTimes(2);
+    });
+
+    it("tells a listener when an unknown kid made it re-read the keyring", async () => {
+        write(ringOf(OLD));
+        const { cipher } = await newCipher({ keyringFile: file });
+        const sealed = await sealedBy([NEW], "from another copy");
+        write(ringOf(OLD, NEW));
+        const listener = vi.fn();
+        cipher.onChange(listener);
+        expect(cipher.decrypt(sealed, CONTEXT)).toBe("from another copy");
+        expect(listener).toHaveBeenCalledTimes(1);
+    });
+
+    it("stops telling a listener that unsubscribed, and keeps going when one throws", async () => {
+        write(ringOf(OLD));
+        const { cipher } = await newCipher({ keyringFile: file });
+        const stopped = vi.fn();
+        const stop = cipher.onChange(stopped);
+        cipher.onChange(() => {
+            throw new Error("boom");
+        });
+        const last = vi.fn();
+        cipher.onChange(last);
+        stop();
+        write(ringOf(OLD, NEW));
+        await cipher.reload();
+        expect(stopped).not.toHaveBeenCalled();
+        expect(last).toHaveBeenCalledTimes(1);
+    });
+});

@@ -6,6 +6,11 @@
 // `config.sql.ts` for SQL-backed ones) - kept as a single factory so a config key added for one variant
 // (e.g. a new job's schedule/batch_size) can't silently drift out of sync with the other.
 
+/** The configuration keyring every test server starts with (`config_encryption:keyring`): one fixed key, so `ConfigCipher` works in any suite. */
+export const TEST_CONFIG_KEYRING = {
+    keys: [{ kid: "te5tkey1", key: Buffer.alloc(32, 7).toString("base64"), createdAt: "2026-01-01T00:00:00.000Z" }],
+};
+
 /**
  * Builds the full nconf defaults object for a test run, parameterized only by which `datastores` are
  * configured - everything else is identical between the Mongo and SQL test variants.
@@ -16,6 +21,9 @@
 export function buildTestConfigDefaults(datastores: Record<string, any>) {
     return {
         service_name: "mail_test_service",
+        // The configuration keyring is given inline, and its store is the registered in-memory `ConfigKeyringStore` (the kubernetes backend resolves what the
+        // server registers) so rotation is available to the routes; the rotation's own suites use a keyring file of their own.
+        config_encryption: { keyring: TEST_CONFIG_KEYRING, keyring_store: { backend: "kubernetes" } },
         version: "1.0",
         // Set explicitly (rather than relying on Server's default of 3000) so the test suite never silently
         // collides with an unrelated process already listening on the default port in a developer's environment.

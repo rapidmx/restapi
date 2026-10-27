@@ -1,6 +1,7 @@
 export * from "./AcmeEnrollmentDriverJobMongo.js";
 export * from "./AttachmentExtractionJobMongo.js";
 export * from "./CalendarReminderJobMongo.js";
+export * from "./ConfigKeyRotationJobMongo.js";
 export * from "./DataExportJobMongo.js";
 export * from "./DkimRotationJobMongo.js";
 export * from "./DomainVerificationJobMongo.js";

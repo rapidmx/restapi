@@ -5,6 +5,7 @@ export * from "./BrandingRouteMongo.js";
 export * from "./CalendarEventRouteMongo.js";
 export * from "./CalendarShareLinkRouteMongo.js";
 export * from "./ContactListRouteMongo.js";
+export * from "./ConfigKeyRouteMongo.js";
 export * from "./ContactRouteMongo.js";
 export * from "./DataExportRequestRouteMongo.js";
 export * from "./DataSubjectErasureRequestRouteMongo.js";
