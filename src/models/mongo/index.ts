@@ -37,6 +37,7 @@ export * from "./NoteMongo.js";
 export * from "./OofReplySuppressionMongo.js";
 export * from "./QuarantineEntryMongo.js";
 export * from "./PluginMongo.js";
+export * from "./IntegrationSettingsMongo.js";
 export * from "./MailboxPolicyMongo.js";
 export * from "./RetentionPolicyMongo.js";
 export * from "./SetupStateMongo.js";

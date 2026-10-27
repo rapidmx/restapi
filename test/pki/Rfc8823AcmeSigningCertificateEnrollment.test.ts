@@ -49,16 +49,30 @@ class FakeAcmeClient {
     public static completeChallengeCallCount = 0;
     public static finalizeCallCount = 0;
     public static certificatePem = "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n";
+    /** The options of every client made, in order: which CA and account each call went to. */
+    public static created: any[] = [];
+    public static updateAccountCalls: any[] = [];
+    public static failUpdateAccount: boolean = false;
 
-    constructor(public opts: any) {}
+    constructor(public opts: any) {
+        FakeAcmeClient.created.push(opts);
+    }
 
     public getAccountUrl(): string {
-        return "https://acme.test/acct/1";
+        return this.opts.accountUrl ?? "https://acme.test/acct/1";
     }
 
     public async createAccount(_data?: any): Promise<any> {
         FakeAcmeClient.createAccountCallCount++;
         return { status: "valid", orders: "https://acme.test/acct/1/orders" };
+    }
+
+    public async updateAccount(data?: any): Promise<any> {
+        if (FakeAcmeClient.failUpdateAccount) {
+            throw new Error("CA unreachable");
+        }
+        FakeAcmeClient.updateAccountCalls.push(data);
+        return { status: "valid" };
     }
 
     public async createOrder(data: any): Promise<any> {
@@ -145,6 +159,9 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
         FakeAcmeClient.orderErrorDetail = true;
         FakeAcmeClient.completeChallengeCallCount = 0;
         FakeAcmeClient.finalizeCallCount = 0;
+        FakeAcmeClient.created = [];
+        FakeAcmeClient.updateAccountCalls = [];
+        FakeAcmeClient.failUpdateAccount = false;
         enrollment = withHealth(new TestEnrollment());
         (enrollment as any).storeDir = path.join(tmpDir, `store-${Math.random()}`);
 
@@ -622,6 +639,104 @@ describe("Rfc8823AcmeSigningCertificateEnrollment Tests", () => {
             const store = JSON.parse(await fs.readFile(path.join((enrollment as any).storeDir, "enrollments.json"), "utf-8"));
             expect(store[enrollmentId].replySentAt).toBeTruthy();
             expect(store[enrollmentId].wrappedKey).toEqual(wrappedKey);
+        });
+    });
+
+    describe("the CA and contact of the ACME account", () => {
+        const NEW_CA = "https://acme.rapidmx.test/directory";
+        const storeDir = (): string => (enrollment as any).storeDir;
+        const record = async (): Promise<any> => JSON.parse(await fs.readFile(path.join(storeDir(), "account.json"), "utf-8"));
+        let logger: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn> };
+
+        beforeEach(() => {
+            logger = { info: vi.fn(), warn: vi.fn() };
+            (enrollment as any).logger = logger;
+        });
+
+        it("registers the same key at a newly configured CA, and keeps driving the requests started at the old one there", async () => {
+            const { enrollmentId: before } = await enrollment.startEnrollment("old@example.com", await generateCsr("old@example.com"));
+            const oldCa: string = (enrollment as any).directoryUrl;
+            expect(await record()).toEqual({ directoryUrl: oldCa, contact: [] });
+            const key: string = await fs.readFile(path.join(storeDir(), "account.key.pem"), "utf-8");
+
+            (enrollment as any).directoryUrl = NEW_CA;
+            FakeAcmeClient.created = [];
+            await enrollment.startEnrollment("new@example.com", await generateCsr("new@example.com"));
+            // A new registration at the new CA (never the old CA's account URL there), with the one key.
+            expect(FakeAcmeClient.createAccountCallCount).toBe(2);
+            expect(FakeAcmeClient.created).toEqual([{ directoryUrl: NEW_CA, accountKey: key }]);
+            expect(await record()).toEqual({ directoryUrl: NEW_CA, contact: [] });
+            await enrollment.startEnrollment("again@example.com", await generateCsr("again@example.com"));
+            expect(FakeAcmeClient.createAccountCallCount).toBe(2);
+
+            // The request started before the switch is driven at its own CA, under its own account.
+            FakeAcmeClient.created = [];
+            await enrollment.recordChallengeToken(before, "t", "reply@acme.test", "<id@acme.test>", "ACME: t");
+            await enrollment.advanceEnrollment(before);
+            expect(FakeAcmeClient.created).toEqual([
+                { directoryUrl: oldCa, accountKey: key, accountUrl: "https://acme.test/acct/1" },
+                { directoryUrl: oldCa, accountKey: key, accountUrl: "https://acme.test/acct/1" },
+            ]);
+        });
+
+        it("drives a request from before its CA was recorded, or whose account key is gone, with the configured CA's account", async () => {
+            const { enrollmentId } = await enrollment.startEnrollment("legacy@example.com", await generateCsr("legacy@example.com"));
+            (enrollment as any).directoryUrl = NEW_CA;
+            const enrollmentsPath: string = path.join(storeDir(), "enrollments.json");
+            const store = JSON.parse(await fs.readFile(enrollmentsPath, "utf-8"));
+            const { directoryUrl: _directory, accountUrl: _account, ...legacy } = store[enrollmentId];
+            await fs.writeFile(enrollmentsPath, JSON.stringify({ ...store, [enrollmentId]: legacy }));
+
+            FakeAcmeClient.created = [];
+            await enrollment.recordChallengeToken(enrollmentId, "t", "reply@acme.test", "<id@acme.test>", "ACME: t");
+            expect(FakeAcmeClient.created.map((opts) => opts.directoryUrl)).toEqual([NEW_CA]);
+
+            const { enrollmentId: orphan } = await enrollment.startEnrollment("orphan@example.com", await generateCsr("orphan@example.com"));
+            (enrollment as any).directoryUrl = "https://acme.third.test/directory";
+            await fs.rm(path.join(storeDir(), "account.key.pem"));
+            FakeAcmeClient.created = [];
+            await enrollment.recordChallengeToken(orphan, "t", "reply@acme.test", "<id@acme.test>", "ACME: t");
+            expect(FakeAcmeClient.created.map((opts) => opts.directoryUrl)).toEqual(["https://acme.third.test/directory"]);
+        });
+
+        it.each([
+            ["missing (an account from before it)", null],
+            ["unreadable", "{"],
+            ["without a contact", JSON.stringify({ directoryUrl: "SAME" })],
+        ])("registers the account again, once, when its record is %s", async (_label, content) => {
+            await enrollment.startEnrollment("seed@example.com", await generateCsr("seed@example.com"));
+            const recordPath: string = path.join(storeDir(), "account.json");
+            if (content === null) {
+                await fs.rm(recordPath);
+            } else {
+                await fs.writeFile(recordPath, content.replace("SAME", (enrollment as any).directoryUrl));
+            }
+            await enrollment.startEnrollment("again@example.com", await generateCsr("again@example.com"));
+            await enrollment.startEnrollment("third@example.com", await generateCsr("third@example.com"));
+            expect(FakeAcmeClient.createAccountCallCount).toBe(2);
+            expect(await record()).toEqual({ directoryUrl: (enrollment as any).directoryUrl, contact: [] });
+        });
+
+        it("sends a changed contact email to the account once, and only logs a failure, trying again next time", async () => {
+            await enrollment.startEnrollment("seed@example.com", await generateCsr("seed@example.com"));
+
+            (enrollment as any).contactEmail = "pki@example.com";
+            await enrollment.startEnrollment("a@example.com", await generateCsr("a@example.com"));
+            await enrollment.startEnrollment("b@example.com", await generateCsr("b@example.com"));
+            expect(FakeAcmeClient.updateAccountCalls).toEqual([{ contact: ["mailto:pki@example.com"] }]);
+            expect(FakeAcmeClient.createAccountCallCount).toBe(1);
+            expect((await record()).contact).toEqual(["mailto:pki@example.com"]);
+
+            (enrollment as any).contactEmail = undefined;
+            FakeAcmeClient.failUpdateAccount = true;
+            await enrollment.startEnrollment("c@example.com", await generateCsr("c@example.com"));
+            expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("could not update the ACME account's contact: CA unreachable"));
+            expect((await record()).contact).toEqual(["mailto:pki@example.com"]);
+
+            FakeAcmeClient.failUpdateAccount = false;
+            await enrollment.startEnrollment("d@example.com", await generateCsr("d@example.com"));
+            expect(FakeAcmeClient.updateAccountCalls.at(-1)).toEqual({ contact: [] });
+            expect((await record()).contact).toEqual([]);
         });
     });
 

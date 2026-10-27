@@ -2263,9 +2263,11 @@ export enum AuditAction {
     /** `PUT /mail/domains/:id/dkim/rotation` - scheduled DKIM rotation was paused or resumed for a domain. `details` carries the domain `name` and
      * `paused`. */
     DKIM_ROTATION_PAUSED = "dkim_rotation.paused",
-    /** An Integrations section was changed. `details` carries the `section`, the changed keys and `secretChanged`; never a secret. */
+    /** An Integrations section was changed. `details` carries the `section`, the changed `keys` and `secretChanged` (and `secretLeftBehind` when a secret
+     * stayed in the store); never a secret. */
     INTEGRATION_UPDATE = "integration.update",
-    /** An Integrations section's admin values were reset to the deployment's. `details` carries the `section` and `keys`. */
+    /** An Integrations section's admin values were reset to the deployment's. `details` carries the `section` and the `keys` that were set (and
+     * `secretLeftBehind` when a secret stayed in the store). */
     INTEGRATION_RESET = "integration.reset",
     /** A plugin's plaintext secret setting was moved into the secret store. `details` carries the plugin and the setting's key; never its value. */
     PLUGIN_SECRET_MIGRATED = "plugin.secret_migrated",
@@ -3613,4 +3615,48 @@ export interface SecretRef {
     /** Bumped on every credentials write: the external-dns Deployment's pod-template annotation and the plugin config-change hash, so a new credential is
      * picked up without the value ever being compared. */
     generation: number;
+}
+
+/** The sections of the admin console's Integrations (`BaseIntegrationsRoute`, `system/integrations`), each overriding some of the deployment's config keys. */
+export type IntegrationSectionName = "giphy" | "stun" | "signingCa" | "dnsResolver" | "pluginRegistry";
+
+/** How S/MIME signing certificates are enrolled: RFC 8823 ACME with a public CA, the manual human-in-the-loop flow, or not at all. */
+export type SigningCaBackend = "rfc8823" | "manual" | "none";
+
+/** How the server resolves DNS: Node's own resolver, or DNSSEC-validating DNS over HTTPS. */
+export type DnsResolverMode = "node" | "doh-dnssec";
+
+/** A plugin namespace an administrator configured in Integrations: a `PluginNamespace` without its token, which lives in the secret store (keyed by
+ * `pluginNamespaceTokenKey()` in `IntegrationSettings.pluginRegistry.namespaceTokensRef`). */
+export interface IntegrationPluginNamespace {
+    /** The npm scope, with its leading `@`. */
+    name: string;
+    /** The registry this scope is published to (https only), when not the default one. */
+    registry?: string;
+}
+
+/**
+ * The administrator's Integrations settings (`specs/dns_publishing_and_integrations.md` 4.5, 10.2): one singleton row (`INTEGRATION_SETTINGS_UID`), deny-all
+ * class ACL, only ever written through `BaseIntegrationsRoute`. Each section overrides some of the deployment's config keys; a field left unset (a section
+ * `null` on SQL) means "use the deployment's configured value", and a reset deletes the field. Secrets are held as `SecretRef`s only, their values in the
+ * `SecretStore` under `server/...`, never in the database. The row is created empty by the first change: it never copies config into itself, so the
+ * deployment's values keep applying wherever the administrator hasn't chosen otherwise.
+ */
+export interface IntegrationSettings extends BaseEntity {
+    /** GIF search in Compose: `giphy:enabled`, `giphy:api_key` (the key at `server/giphy`, key `apiKey`). */
+    giphy?: { enabled?: boolean; apiKeyRef?: SecretRef } | null;
+    /** The STUN servers meetings use: `integrations:stun:urls`. */
+    stun?: { urls?: string[] } | null;
+    /** S/MIME signing certificate enrollment: `mail:pki:signing_enrollment:backend`, `mail:pki:rfc8823:directory_url`, `mail:pki:rfc8823:contact_email`. */
+    signingCa?: { backend?: SigningCaBackend; directoryUrl?: string; contactEmail?: string } | null;
+    /** How the server resolves DNS: `mail:dns:resolver`, `mail:dns:doh:endpoint`. */
+    dnsResolver?: { mode?: DnsResolverMode; dohEndpoint?: string } | null;
+    /** Where plugins are installed from: `system:plugins:registry`, `system:plugins:registry_token` (the token at `server/plugin-registry`, key `token`) and
+     * `system:plugins:namespaces` (the namespaces' own tokens at `server/plugin-namespaces`, one key per namespace). */
+    pluginRegistry?: {
+        url?: string;
+        tokenRef?: SecretRef;
+        namespaces?: IntegrationPluginNamespace[];
+        namespaceTokensRef?: SecretRef;
+    } | null;
 }

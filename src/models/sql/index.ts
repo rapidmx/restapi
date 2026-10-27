@@ -37,6 +37,7 @@ export * from "./NoteSQL.js";
 export * from "./OofReplySuppressionSQL.js";
 export * from "./QuarantineEntrySQL.js";
 export * from "./PluginSQL.js";
+export * from "./IntegrationSettingsSQL.js";
 export * from "./MailboxPolicySQL.js";
 export * from "./RetentionPolicySQL.js";
 export * from "./SetupStateSQL.js";

@@ -43,6 +43,9 @@ const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 x509.cryptoProvider.set(crypto);
 
+/** The ACME directory enrollments go to when `mail:pki:rfc8823:directory_url` isn't configured; what Integrations shows as the deployment's value. */
+export const DEFAULT_RFC8823_DIRECTORY_URL = "https://acme.castle.cloud/acme/directory";
+
 /** Upper bound on `ensureAccount()`'s lost-race re-read loop - see its doc comment. */
 const MAX_INIT_ATTEMPTS = 5;
 
@@ -90,6 +93,12 @@ function certificateDetails(pem: string | undefined): Pick<EnrollmentProgress, "
     }
 }
 
+/** `account.json`: the ACME directory the account in `account.url` was registered at, and the contact it was last given. */
+interface AccountRecord {
+    directoryUrl: string;
+    contact: string[];
+}
+
 /** One in-progress RFC 8823 enrollment, from `startEnrollment()` through to a downloaded certificate.
  * Everything needed to resume across a process restart lives here - see `loadStore()`/`updateStore()`. */
 interface PendingEnrollment {
@@ -106,6 +115,10 @@ interface PendingEnrollment {
      * caller (the inbound correlator, a later piece of this feature) uses this to recognize which
      * pending enrollment an inbound message belongs to. */
     challengeFrom: string;
+    /** The ACME directory and the account the order was created with (`clientFor()`): the order lives at that CA, so it is driven there even after
+     * the configured directory changes. Unset on enrollments from before they were recorded. */
+    directoryUrl?: string;
+    accountUrl?: string;
     /** "token-part2" - the half of the RFC 8823 token this server already knows from the challenge
      * object itself, before the CA's challenge email (carrying "token-part1") ever arrives. */
     tokenPart2: string;
@@ -212,8 +225,8 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
     public readonly name: string = "rfc8823-acme";
     public readonly kind = "rfc8823" as const;
 
-    @Config("mail:pki:rfc8823:directory_url", "https://acme.castle.cloud/acme/directory")
-    private directoryUrl: string = "https://acme.castle.cloud/acme/directory";
+    @Config("mail:pki:rfc8823:directory_url", DEFAULT_RFC8823_DIRECTORY_URL)
+    private directoryUrl: string = DEFAULT_RFC8823_DIRECTORY_URL;
 
     @Config("mail:pki:rfc8823:contact_email")
     private contactEmail?: string;
@@ -310,6 +323,30 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
         return path.join(this.storeDir, "account.url");
     }
 
+    /** Which CA the account in `account.url` belongs to, and the contact it was last given (`AccountRecord`). */
+    private accountRecordPath(): string {
+        return path.join(this.storeDir, "account.json");
+    }
+
+    /** The `contact` of this deployment's account: the configured address as a `mailto:` URI, or none. */
+    private contactUris(): string[] {
+        return this.contactEmail ? [`mailto:${this.contactEmail}`] : [];
+    }
+
+    /** `account.json`, or `undefined` when it is missing or unreadable (an account from before it existed): the account is then registered again. */
+    private async readAccountRecord(): Promise<AccountRecord | undefined> {
+        try {
+            const record: any = JSON.parse((await readFileIfExists(this.accountRecordPath())) ?? "null");
+            return typeof record?.directoryUrl === "string" && Array.isArray(record.contact) ? record : undefined;
+        } catch {
+            return undefined;
+        }
+    }
+
+    private async writeAccountRecord(record: AccountRecord): Promise<void> {
+        await writeFileAtomic(this.accountRecordPath(), JSON.stringify(record), 0o600, 0o700);
+    }
+
     private enrollmentsPath(): string {
         return path.join(this.storeDir, "enrollments.json");
     }
@@ -334,7 +371,12 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
      * key: RFC 8555 §7.3.1 makes `newAccount` idempotent per key (the CA returns the already-registered
      * account with HTTP 200, which `acme-client` handles), so this never creates a second account.
      * - Bounded: gives up with an error after `MAX_INIT_ATTEMPTS` lost races rather than looping forever; a
-     * network failure from `createAccount()` propagates to the caller (the next call simply retries). */
+     * network failure from `createAccount()` propagates to the caller (the next call simply retries).
+     * - **Tied to the CA.** An account exists only at the CA it was registered with, so `account.json` records that CA's directory. When the configured
+     * directory is another one (an administrator switched CAs), or the record is missing (an account from before it), the same key is registered at
+     * the configured CA and `account.url` replaced: `newAccount` answers with the existing account where there is one, and `acme-client` then updates
+     * its contact. A changed contact email is sent to the account (`updateAccount()`) the next time it is used; a failure there is logged and retried
+     * next time, never the enrollment's. */
     private async ensureAccount(): Promise<acme.Client> {
         return withLock(lockKeyForPath(this.accountKeyPath()), async () => {
             for (let attempt = 0; attempt < MAX_INIT_ATTEMPTS; attempt++) {
@@ -346,18 +388,24 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
                     continue;
                 }
 
+                const contact: string[] = this.contactUris();
                 const accountUrl: string | undefined = (await readFileIfExists(this.accountUrlPath()))?.trim();
-                if (accountUrl) {
-                    return this.createClient({ directoryUrl: this.directoryUrl, accountKey, accountUrl });
+                const record: AccountRecord | undefined = accountUrl ? await this.readAccountRecord() : undefined;
+                if (accountUrl && record?.directoryUrl === this.directoryUrl) {
+                    const existing: acme.Client = this.createClient({ directoryUrl: this.directoryUrl, accountKey, accountUrl });
+                    if (JSON.stringify(record.contact) !== JSON.stringify(contact)) {
+                        await this.updateContact(existing, contact);
+                    }
+                    return existing;
                 }
 
                 const client: acme.Client = this.createClient({ directoryUrl: this.directoryUrl, accountKey });
                 await client.createAccount({
                     termsOfServiceAgreed: true,
-                    contact: this.contactEmail ? [`mailto:${this.contactEmail}`] : undefined,
+                    contact: contact.length > 0 ? contact : undefined,
                 });
-                // A present-but-blank URL file can only be a torn write from before these writes were atomic - safe
-                // to replace outright, since the account URL is fully determined by the key.
+                // A present URL file is replaced outright: a blank one can only be a torn write from before these writes were atomic, and any other is
+                // another CA's account (or one from before `account.json`, now registered again here), while the URL is fully determined by the key and CA.
                 let persisted: boolean = true;
                 if (accountUrl === undefined) {
                     persisted = await createFileExclusive(this.accountUrlPath(), client.getAccountUrl(), 0o600, 0o700);
@@ -365,6 +413,7 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
                     await writeFileAtomic(this.accountUrlPath(), client.getAccountUrl(), 0o600, 0o700);
                 }
                 if (persisted) {
+                    await this.writeAccountRecord({ directoryUrl: this.directoryUrl, contact });
                     this.logger?.info(`Rfc8823AcmeSigningCertificateEnrollment: registered ACME account at '${this.directoryUrl}'.`);
                     return client;
                 }
@@ -374,6 +423,33 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
                 `Rfc8823AcmeSigningCertificateEnrollment: could not initialize the ACME account in '${this.storeDir}' after ${MAX_INIT_ATTEMPTS} attempts.`,
             );
         });
+    }
+
+    /** Gives the account `contact` (`ensureAccount()`, under its lock) and records it; a failure is logged, and the next use tries again. */
+    private async updateContact(client: acme.Client, contact: string[]): Promise<void> {
+        try {
+            await client.updateAccount({ contact });
+            await this.writeAccountRecord({ directoryUrl: this.directoryUrl, contact });
+            this.logger?.info("Rfc8823AcmeSigningCertificateEnrollment: updated the ACME account's contact.");
+        } catch (err: any) {
+            this.logger?.warn(`Rfc8823AcmeSigningCertificateEnrollment: could not update the ACME account's contact: ${sanitizeErrorText(err)}`);
+        }
+    }
+
+    /**
+     * The client to drive `enrollment` with: its order lives at the CA it was started with, under the account it was started with. Usually that is the
+     * configured CA (`ensureAccount()`); an enrollment started before the directory was changed keeps its own CA and account, so a switch doesn't strand
+     * the requests already in progress. An enrollment from before these were recorded is the configured CA's.
+     */
+    private async clientFor(enrollment: PendingEnrollment): Promise<acme.Client> {
+        // `directoryUrl` and `accountUrl` are recorded together. The key is the one every account of this deployment has; without it, nothing is left of
+        // the old account, and the configured CA's is the best there is.
+        const accountKey: string | undefined =
+            enrollment.directoryUrl !== undefined && enrollment.directoryUrl !== this.directoryUrl ? await readFileIfExists(this.accountKeyPath()) : undefined;
+        if (accountKey === undefined) {
+            return await this.ensureAccount();
+        }
+        return this.createClient({ directoryUrl: enrollment.directoryUrl!, accountKey, accountUrl: enrollment.accountUrl });
     }
 
     private async loadStore(): Promise<Record<string, PendingEnrollment>> {
@@ -464,6 +540,8 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
                 authorizationUrl: authorization.url,
                 challengeUrl: challenge.url,
                 challengeFrom,
+                directoryUrl: this.directoryUrl,
+                accountUrl: client.getAccountUrl(),
                 tokenPart2,
                 status: "pending",
                 createdAt: new Date().toISOString(),
@@ -564,7 +642,7 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
                 return;
             }
 
-            const client: acme.Client = await this.ensureAccount();
+            const client: acme.Client = await this.clientFor(enrollment);
             // `acme-client`'s own `rfc8555.Challenge` type (not part of this package's public exports,
             // hence the local `FakeHttpChallenge` shape rather than importing it) only models
             // `http-01`/`dns-01`/`tls-alpn-01` - see this method's own doc comment on why `type` is
@@ -767,7 +845,7 @@ export class Rfc8823AcmeSigningCertificateEnrollment implements SigningCertifica
 
             let phase: "reply" | "ca" = "ca";
             try {
-                const client: acme.Client = await this.ensureAccount();
+                const client: acme.Client = await this.clientFor(enrollment);
                 if (enrollment.digest === undefined) {
                     // Waiting for the CA's verification e-mail: only an order the CA already marked invalid changes anything.
                     const order: acme.Order = await client.getOrder({ url: enrollment.orderUrl } as any);

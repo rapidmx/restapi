@@ -359,6 +359,8 @@ export const CORE_CONFIG_NAMESPACES: readonly string[] = [
     "react",
     "static_assets",
     "giphy",
+    // The Integrations config layer (`integrations:stun:urls`; spec 11.1): what an administrator set in the admin console.
+    "integrations",
     "logs",
     "service_name",
     "version",

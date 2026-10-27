@@ -39,6 +39,7 @@ export * from "./MessageRouteMongo.js";
 export * from "./NoteRouteMongo.js";
 export * from "./QuarantineRouteMongo.js";
 export * from "./PluginRouteMongo.js";
+export * from "./IntegrationsRouteMongo.js";
 export * from "./MailboxPolicyRouteMongo.js";
 export * from "./RetentionPolicyRouteMongo.js";
 export * from "./SetupRouteMongo.js";

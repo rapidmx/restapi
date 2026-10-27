@@ -32,6 +32,7 @@ export * from "./BaseMatterExportRequestRoute.js";
 export * from "./BaseMatterSearchRoute.js";
 export * from "./BaseMessageRoute.js";
 export * from "./BasePluginRoute.js";
+export * from "./BaseIntegrationsRoute.js";
 export * from "./BaseMailboxPolicyRoute.js";
 export * from "./BaseQuarantineRoute.js";
 export * from "./BaseRetentionPolicyRoute.js";

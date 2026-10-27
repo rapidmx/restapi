@@ -39,6 +39,7 @@ export * from "./MessageRouteSQL.js";
 export * from "./NoteRouteSQL.js";
 export * from "./QuarantineRouteSQL.js";
 export * from "./PluginRouteSQL.js";
+export * from "./IntegrationsRouteSQL.js";
 export * from "./MailboxPolicyRouteSQL.js";
 export * from "./RetentionPolicyRouteSQL.js";
 export * from "./SetupRouteSQL.js";

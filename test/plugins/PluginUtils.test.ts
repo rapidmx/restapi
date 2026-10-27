@@ -587,6 +587,10 @@ describe("isPluginSettingKeyAllowed", () => {
         }
     });
 
+    // The Integrations config layer's keys (spec 11.1): a plugin can never declare or save what an administrator set in the console.
+    it.each(["integrations", "integrations:stun:urls", "INTEGRATIONS__STUN__URLS", "giphy:enabled"])("refuses the Integrations key %s", (key) => {
+        expect(isPluginSettingKeyAllowed(key)).toBe(false);
+    });
     it.each(["trusted_roles", "AUTH:jwt", "datastores__mongo__url", "mail:transport:ingest:secret", "mail:transport", "System:Plugins", "system", "mail__blob__localfs__path", "Cookies", "shutdown", "mail:default_quota_bytes", "rateLimit:x", "mail:escrow", "cookie_secret"])("refuses %s", (key) => {
         expect(isPluginSettingKeyAllowed(key)).toBe(false);
     });

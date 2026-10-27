@@ -70,6 +70,7 @@ export const ROUTE_TABLE: Record<string, RouteRow> = {
     DnsProviderRoute: { kind: "admin", base: "BaseDnsProviderRoute", gate: "trusted reads; trusted AND elevated writes and queued test/takeover operations (assertAdminScope); credentials only in the secret store, shown as masks; audited" },
     DomainRoute: { kind: "admin", base: "BaseDomainRoute", gate: "trusted manages domains; assigning a DNS provider and managing the apex TXT set need elevation too; audited" },
     EncryptionPolicyRoute: { kind: "admin", base: "BaseEncryptionPolicyRoute", gate: "trusted; audited" },
+    IntegrationsRoute: { kind: "admin", base: "BaseIntegrationsRoute", gate: "trusted reads; trusted AND elevated writes (assertAdminScope); secrets only in the secret store, shown as masks; audited" },
     MailboxPolicyRoute: { kind: "admin", base: "BaseMailboxPolicyRoute", gate: "trusted; audited" },
     PluginRoute: { kind: "admin", base: "BasePluginRoute", gate: "trusted; audited" },
     RetentionPolicyRoute: { kind: "admin", base: "BaseRetentionPolicyRoute", gate: "trusted; audited" },
