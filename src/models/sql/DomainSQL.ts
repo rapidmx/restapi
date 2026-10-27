@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BaseEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
-import { DnsPublicationStatus, Domain } from "../types.js";
+import { ApexTxtSettings, DkimRotationState, DnsPublicationStatus, Domain } from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Column, Entity } = PersistenceDecorators;
@@ -89,7 +89,17 @@ export class DomainSQL extends BaseEntity implements Domain {
     @Column({ type: "simple-json", nullable: true })
     @Description("What the DNS controller and the live check last said about this domain's published records.")
     @Nullable
-    public dnsPublication?: DnsPublicationStatus;
+    public dnsPublication?: DnsPublicationStatus | null;
+
+    @Column({ type: "simple-json", nullable: true })
+    @Description("Whether RapidMX manages this domain's apex TXT set to publish SPF, and the values it keeps there; unset means not managed.")
+    @Nullable
+    public apexTxt?: ApexTxtSettings | null;
+
+    @Column({ type: "simple-json", nullable: true })
+    @Description("The DKIM key rotation in progress, if any.")
+    @Nullable
+    public dkimRotation?: DkimRotationState | null;
 
     constructor(other?: Partial<DomainSQL>) {
         super(other);
@@ -108,6 +118,8 @@ export class DomainSQL extends BaseEntity implements Domain {
             this.aliasOf = "aliasOf" in other ? other.aliasOf : this.aliasOf;
             this.dnsProviderUid = "dnsProviderUid" in other ? other.dnsProviderUid : this.dnsProviderUid;
             this.dnsPublication = "dnsPublication" in other ? other.dnsPublication : this.dnsPublication;
+            this.apexTxt = "apexTxt" in other ? other.apexTxt : this.apexTxt;
+            this.dkimRotation = "dkimRotation" in other ? other.dkimRotation : this.dkimRotation;
         }
     }
 }

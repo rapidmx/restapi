@@ -255,4 +255,65 @@ describe("DomainVerificationJobSQL Tests (real DB + DI)", () => {
         await job.run();
         expect((await checkedJustNow()).sort()).toEqual([never.uid, older.uid, old.uid, recent.uid].sort());
     });
+
+    describe("ownership at _rapidmx-verify and the legacy apex", () => {
+        afterEach(() => {
+            (job as any).acceptLegacyApex = true;
+        });
+
+        it("Verifies at _rapidmx-verify.<domain> and audits where the token was found.", async () => {
+            const domain = await createDomain();
+            dnsResolver.records.set(`_rapidmx-verify.${domain.name}`, [[buildVerificationTxtValue(domain.verificationToken)]]);
+
+            await job.run();
+
+            const entries = await auditLogRepo.find({ where: { action: AuditAction.DOMAIN_VERIFIED } });
+            expect(entries).toHaveLength(1);
+            expect((entries[0] as any).details).toEqual(expect.objectContaining({ name: domain.name, location: "record" }));
+        });
+
+        it("Verifies at the legacy apex while accepted, and records that location.", async () => {
+            const domain = await createDomain();
+            dnsResolver.records.set(domain.name, [[buildVerificationTxtValue(domain.verificationToken)]]);
+
+            await job.run();
+
+            const entries = await auditLogRepo.find({ where: { action: AuditAction.DOMAIN_VERIFIED } });
+            expect((entries[0] as any).details.location).toBe("legacy_apex");
+        });
+
+        it("Leaves a domain whose token is only at the apex unverified once the legacy location is no longer accepted.", async () => {
+            expect((job as any).acceptLegacyApex).toBe(true);
+            (job as any).acceptLegacyApex = false;
+            const domain = await createDomain();
+            dnsResolver.records.set(domain.name, [[buildVerificationTxtValue(domain.verificationToken)]]);
+
+            await job.run();
+
+            const after: any = await domainRepo.findOne({ where: { uid: domain.uid } });
+            expect(after.verified).toBe(false);
+            expect(after.lastCheckedAt).toBeDefined();
+        });
+
+        it("Reads the switch from mail:domain_verification:accept_legacy_apex, the text \"false\" of an environment variable included.", async () => {
+            const key = "mail:domain_verification:accept_legacy_apex";
+            config.set(key, "false");
+            let strict: DomainVerificationJobSQL;
+            try {
+                strict = await objectFactory.newInstance(DomainVerificationJobSQL, { name: "strict" });
+            } finally {
+                config.set(key, undefined);
+            }
+            const apexOnly = await createDomain();
+            dnsResolver.records.set(apexOnly.name, [[buildVerificationTxtValue(apexOnly.verificationToken)]]);
+            const atRecord = await createDomain();
+            dnsResolver.records.set(`_rapidmx-verify.${atRecord.name}`, [[buildVerificationTxtValue(atRecord.verificationToken)]]);
+
+            await strict.run();
+
+            const verified = async (uid: string): Promise<boolean> => ((await domainRepo.findOne({ where: { uid } })) as any).verified;
+            expect(await verified(apexOnly.uid)).toBe(false);
+            expect(await verified(atRecord.uid)).toBe(true);
+        });
+    });
 });

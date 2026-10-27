@@ -2,18 +2,25 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { getDnsProviderType, isDnsProviderType, isNameInZones } from "../dns/DnsProviderTypes.js";
 import type { DnsMxRecord, DnsResolver, DnsSrvRecord } from "../dns/DnsResolver.js";
-import type { DnsRecordType, Domain } from "../models/types.js";
-import { buildVerificationTxtValue, checkDomainVerification } from "./DomainVerificationUtils.js";
+import type { DnsManualReason, DnsProvider, DnsRecordPublication, DnsRecordType, Domain } from "../models/types.js";
+import { buildVerificationRecordName, buildVerificationTxtValue, DEFAULT_ACCEPT_LEGACY_APEX, findDomainVerification } from "./DomainVerificationUtils.js";
 
 // Defined next to `Domain.dnsPublication`, which records publication per record type; re-exported here, where it always lived.
-export type { DnsRecordType };
+export type { DnsManualReason, DnsRecordType };
+
+/** The kinds of record a domain needs. */
+export type DnsRecordKind = "TXT" | "MX" | "CNAME" | "SRV";
+
+/** The SPF record this server recommends: mail for the domain comes from its MX hosts. */
+export const DEFAULT_SPF_VALUE = "v=spf1 mx ~all";
 
 /** The live-checked status of one DNS record this server recommends for a `Domain` - see
  * `checkDnsSetup()`. Always computed fresh, never persisted (unlike `Domain.verified`). */
 export interface DnsRecordCheck {
     type: DnsRecordType;
-    recordKind: "TXT" | "MX" | "CNAME" | "SRV";
+    recordKind: DnsRecordKind;
     /** The exact hostname a lookup for this record type is performed against. */
     recordName: string;
     /** `false` when this app doesn't have enough information yet to know what to recommend (no
@@ -29,121 +36,36 @@ export interface DnsRecordCheck {
     matches: boolean;
     /** The raw live value(s) found, for display/debugging. */
     actualValue?: string;
+    /** Only when asked for (`DnsSetupOptions.publication`), and only for a configured record: whether the record is published automatically -
+     * `"published"` (observed by external-dns and live with exactly the desired values), `"pending"`, `"conflict"` (a record this deployment doesn't
+     * own is there) - or by hand (`"manual"`, with `manualReason`). The live check (`found`/`matches`) stays the source of truth for "is it working". */
+    publication?: DnsRecordPublication["state"];
+    manualReason?: DnsManualReason;
+    /** `ownership` only: the token is (still) at the domain's root, where it lived before `_rapidmx-verify`. The console says it can be moved, or
+     * removed from there once it is at the new name. */
+    legacyApex?: boolean;
 }
 
-function normalizeHost(host: string): string {
-    return host.trim().toLowerCase().replace(/\.$/, "");
+/** What `buildDesiredDnsRecords()` needs beyond the domain: the deployment's mail host, and the Autodiscover host while that plugin is active. */
+export interface DesiredDnsRecordContext {
+    /** `mail:dns:mx_hostname`; empty when not configured. */
+    mxHostname: string;
+    /** `undefined` while `@rapidmx/autodiscover-plugin` isn't active (no Autodiscover records at all); `""` while it is but has no valid public URL
+     * (the records are listed, not configured); else the host. */
+    autodiscoverHostname?: string;
 }
 
-async function checkOwnership(dnsResolver: DnsResolver, domain: Domain): Promise<DnsRecordCheck> {
-    const matches: boolean = await checkDomainVerification(dnsResolver, domain);
-    return {
-        type: "ownership",
-        recordKind: "TXT",
-        recordName: domain.name,
-        configured: true,
-        recommendedValue: buildVerificationTxtValue(domain.verificationToken),
-        found: matches,
-        matches,
-    };
-}
-
-async function checkMx(dnsResolver: DnsResolver, domain: Domain, mxHostname: string): Promise<DnsRecordCheck> {
-    const base: DnsRecordCheck = {
-        type: "mx",
-        recordKind: "MX",
-        recordName: domain.name,
-        configured: !!mxHostname,
-        found: false,
-        matches: false,
-    };
-    if (!mxHostname) {
-        return base;
-    }
-    base.recommendedValue = `10 ${mxHostname}`;
-    try {
-        const records: DnsMxRecord[] = await dnsResolver.resolveMx(domain.name);
-        base.found = records.length > 0;
-        base.matches = records.some((r) => normalizeHost(r.exchange) === normalizeHost(mxHostname));
-        base.actualValue = records.map((r) => `${r.priority} ${r.exchange}`).join(", ");
-    } catch {
-        // found/matches already false - NXDOMAIN/no MX records/network error all just mean "not set up yet".
-    }
-    return base;
-}
-
-async function checkSpf(dnsResolver: DnsResolver, domain: Domain): Promise<DnsRecordCheck> {
-    const base: DnsRecordCheck = {
-        type: "spf",
-        recordKind: "TXT",
-        recordName: domain.name,
-        configured: true,
-        recommendedValue: "v=spf1 mx ~all",
-        found: false,
-        matches: false,
-    };
-    try {
-        const records: string[][] = await dnsResolver.resolveTxt(domain.name);
-        const spfRecord: string | undefined = records.map((chunks) => chunks.join("")).find((v) => /^v=spf1\b/i.test(v));
-        base.found = spfRecord !== undefined;
-        base.matches = spfRecord !== undefined && /\bmx\b/i.test(spfRecord);
-        base.actualValue = spfRecord;
-    } catch {
-        // found/matches already false.
-    }
-    return base;
-}
-
-async function checkDkim(dnsResolver: DnsResolver, domain: Domain): Promise<DnsRecordCheck> {
-    const configured: boolean = !!(domain.dkimSelector && domain.dkimPublicKey);
-    const base: DnsRecordCheck = {
-        type: "dkim",
-        recordKind: "TXT",
-        recordName: configured ? `${domain.dkimSelector}._domainkey.${domain.name}` : "",
-        configured,
-        found: false,
-        matches: false,
-    };
-    if (!configured) {
-        return base;
-    }
-    base.recommendedValue = `v=DKIM1; k=rsa; p=${domain.dkimPublicKey}`;
-    try {
-        const records: string[][] = await dnsResolver.resolveTxt(base.recordName);
-        const joined: string[] = records.map((chunks) => chunks.join(""));
-        base.found = joined.length > 0;
-        base.matches = joined.some((v) => v.includes(`p=${domain.dkimPublicKey}`));
-        base.actualValue = joined.join(" | ");
-    } catch {
-        // found/matches already false.
-    }
-    return base;
-}
-
-async function checkDmarc(dnsResolver: DnsResolver, domain: Domain): Promise<DnsRecordCheck> {
-    const policy: "none" | "quarantine" | "reject" = domain.dmarcPolicy ?? "none";
-    const recordName = `_dmarc.${domain.name}`;
-    const recommendedValue: string =
-        `v=DMARC1; p=${policy};` + (domain.dmarcReportEmail ? ` rua=mailto:${domain.dmarcReportEmail};` : "");
-    const base: DnsRecordCheck = {
-        type: "dmarc",
-        recordKind: "TXT",
-        recordName,
-        configured: true,
-        recommendedValue,
-        found: false,
-        matches: false,
-    };
-    try {
-        const records: string[][] = await dnsResolver.resolveTxt(recordName);
-        const dmarcRecord: string | undefined = records.map((chunks) => chunks.join("")).find((v) => /^v=dmarc1\b/i.test(v));
-        base.found = dmarcRecord !== undefined;
-        base.matches = dmarcRecord !== undefined;
-        base.actualValue = dmarcRecord;
-    } catch {
-        // found/matches already false.
-    }
-    return base;
+/** One record a domain needs: what the checklist recommends and what the DNS controller publishes. */
+export interface DesiredDnsRecord {
+    type: DnsRecordType;
+    recordKind: DnsRecordKind;
+    recordName: string;
+    /** `false` while there isn't enough information to know the value (see `DnsRecordCheck.configured`); such a record is never published. */
+    configured: boolean;
+    /** The value as the checklist shows it. */
+    recommendedValue?: string;
+    /** The values as they are published: one per value of the record set, unquoted (an SRV target ends with a dot). Empty when not configured. */
+    values: string[];
 }
 
 /** The recommended SRV record's priority/weight/port for `_autodiscover._tcp.<domain>` - only the target
@@ -153,123 +75,369 @@ const AUTODISCOVER_SRV_PRIORITY = 0;
 const AUTODISCOVER_SRV_WEIGHT = 0;
 const AUTODISCOVER_SRV_PORT = 443;
 
-/**
- * Checks the `autodiscover.<domain>` CNAME (or A/AAAA - only a CNAME is recommended/checked here) that
- * lets a real mail client's MS-OXDISCO discovery sequence find this deployment's Autodiscover endpoint at
- * its conventional subdomain, without an admin having to remember a non-standard hostname. Requires the
- * `autodiscover.<domain>` hostname to also be covered by this deployment's TLS certificate (a SAN, or its
- * own certificate) - an operational note, not something this check can verify.
- */
-/**
- * Checks the `openpgpkey.<domain>` CNAME that lets OpenPGP clients (Proton Mail, GnuPG, Thunderbird) find this domain's keys in
- * its Web Key Directory with the advanced method (`BaseWkdRoute`), pointing at this deployment's own host (`mail:dns:mx_hostname`).
- * The deployment's TLS certificate must also cover `openpgpkey.<domain>` (the Helm chart's does for its own domain). Without
- * it, clients fall back to the direct method on the bare domain, which only works when that domain is served here too.
- */
-async function checkOpenPgpKeyCname(dnsResolver: DnsResolver, domain: Domain, hostname: string): Promise<DnsRecordCheck> {
-    const recordName = `openpgpkey.${domain.name}`;
-    const base: DnsRecordCheck = { type: "openpgpkey_cname", recordKind: "CNAME", recordName, configured: !!hostname, found: false, matches: false };
-    if (!hostname) {
-        return base;
-    }
-    base.recommendedValue = hostname;
-    try {
-        const records: string[] = await dnsResolver.resolveCname(recordName);
-        base.found = records.length > 0;
-        base.matches = records.some((r) => normalizeHost(r) === normalizeHost(hostname));
-        base.actualValue = records.join(", ");
-    } catch {
-        // Not set up yet.
-    }
-    return base;
+function normalizeHost(host: string): string {
+    return host.trim().toLowerCase().replace(/\.$/, "");
 }
 
-async function checkAutodiscoverCname(dnsResolver: DnsResolver, domain: Domain, publicHostname: string): Promise<DnsRecordCheck> {
-    const recordName = `autodiscover.${domain.name}`;
-    const base: DnsRecordCheck = {
-        type: "autodiscover_cname",
-        recordKind: "CNAME",
-        recordName,
-        configured: !!publicHostname,
-        found: false,
-        matches: false,
-    };
-    if (!publicHostname) {
-        return base;
-    }
-    base.recommendedValue = publicHostname;
-    try {
-        const records: string[] = await dnsResolver.resolveCname(recordName);
-        base.found = records.length > 0;
-        base.matches = records.some((r) => normalizeHost(r) === normalizeHost(publicHostname));
-        base.actualValue = records.join(", ");
-    } catch {
-        // found/matches already false - NXDOMAIN/no CNAME records/network error all just mean "not set up yet".
-    }
-    return base;
+function dkimValue(publicKey: string): string {
+    return `v=DKIM1; k=rsa; p=${publicKey}`;
+}
+
+/** A record whose values are known: the checklist shows the first. */
+function record(type: DnsRecordType, recordKind: DnsRecordKind, recordName: string, values: string[], recommendedValue: string = values[0]): DesiredDnsRecord {
+    return { type, recordKind, recordName, configured: true, recommendedValue, values };
+}
+
+/** A record there isn't enough information for yet. */
+function unconfigured(type: DnsRecordType, recordKind: DnsRecordKind, recordName: string): DesiredDnsRecord {
+    return { type, recordKind, recordName, configured: false, values: [] };
 }
 
 /**
- * Checks the `_autodiscover._tcp.<domain>` SRV record that lets a real mail client's MS-OXDISCO discovery
- * sequence find this deployment's Autodiscover endpoint without a separate `autodiscover.` subdomain -
- * the preferred recommendation over `autodiscover_cname` wherever obtaining a second TLS certificate is
- * constrained, since the SRV target is this deployment's own already-certed public hostname.
+ * Every mail-related DNS record `domain` needs, in the checklist's order: the one source of both the DNS checklist (`checkDnsSetup()`) and the records the
+ * DNS controller publishes, so the two can never drift.
+ *
+ * - `ownership`: the verification token at `_rapidmx-verify.<domain>` (never the apex).
+ * - `mx`, `openpgpkey_cname`: once `mail:dns:mx_hostname` is set.
+ * - `spf`: `v=spf1 mx ~all` at the apex. While the admin has opted the apex TXT set into RapidMX's management (`apexTxt.managed`) it is published as one
+ * set: the chosen SPF value first, then every kept value.
+ * - `dkim`: once the domain has a selector and key; `dkim_next` and `dkim_previous` while a rotation holds them.
+ * - `dmarc`: always (a safe `p=none` by default).
+ * - `autodiscover_cname`, `autodiscover_srv`: only while the Autodiscover plugin is active (see `DesiredDnsRecordContext.autodiscoverHostname`).
  */
-async function checkAutodiscoverSrv(dnsResolver: DnsResolver, domain: Domain, publicHostname: string): Promise<DnsRecordCheck> {
-    const recordName = `_autodiscover._tcp.${domain.name}`;
-    const base: DnsRecordCheck = {
-        type: "autodiscover_srv",
-        recordKind: "SRV",
-        recordName,
-        configured: !!publicHostname,
-        found: false,
-        matches: false,
-    };
-    if (!publicHostname) {
-        return base;
+export function buildDesiredDnsRecords(domain: Domain, ctx: DesiredDnsRecordContext): DesiredDnsRecord[] {
+    const name: string = domain.name;
+    const records: DesiredDnsRecord[] = [record("ownership", "TXT", buildVerificationRecordName(name), [buildVerificationTxtValue(domain.verificationToken)])];
+
+    records.push(ctx.mxHostname ? record("mx", "MX", name, [`10 ${ctx.mxHostname}`]) : unconfigured("mx", "MX", name));
+
+    if (domain.apexTxt?.managed) {
+        const spf: string = domain.apexTxt.spf || DEFAULT_SPF_VALUE;
+        records.push(record("spf", "TXT", name, [spf, ...(domain.apexTxt.keep ?? [])], spf));
+    } else {
+        records.push(record("spf", "TXT", name, [DEFAULT_SPF_VALUE]));
     }
-    base.recommendedValue = `${AUTODISCOVER_SRV_PRIORITY} ${AUTODISCOVER_SRV_WEIGHT} ${AUTODISCOVER_SRV_PORT} ${publicHostname}`;
+
+    if (domain.dkimSelector && domain.dkimPublicKey) {
+        records.push(record("dkim", "TXT", `${domain.dkimSelector}._domainkey.${name}`, [dkimValue(domain.dkimPublicKey)]));
+    } else {
+        records.push(unconfigured("dkim", "TXT", ""));
+    }
+    const next = domain.dkimRotation?.next;
+    if (next?.selector && next.publicKey) {
+        records.push(record("dkim_next", "TXT", `${next.selector}._domainkey.${name}`, [dkimValue(next.publicKey)]));
+    }
+    const previous = domain.dkimRotation?.previous;
+    if (previous?.selector && previous.publicKey) {
+        records.push(record("dkim_previous", "TXT", `${previous.selector}._domainkey.${name}`, [dkimValue(previous.publicKey)]));
+    }
+
+    const policy: "none" | "quarantine" | "reject" = domain.dmarcPolicy ?? "none";
+    records.push(record("dmarc", "TXT", `_dmarc.${name}`, [`v=DMARC1; p=${policy};` + (domain.dmarcReportEmail ? ` rua=mailto:${domain.dmarcReportEmail};` : "")]));
+
+    const openpgpkey: string = `openpgpkey.${name}`;
+    records.push(ctx.mxHostname ? record("openpgpkey_cname", "CNAME", openpgpkey, [ctx.mxHostname]) : unconfigured("openpgpkey_cname", "CNAME", openpgpkey));
+
+    if (ctx.autodiscoverHostname !== undefined) {
+        const host: string = ctx.autodiscoverHostname;
+        const cname: string = `autodiscover.${name}`;
+        const srv: string = `_autodiscover._tcp.${name}`;
+        if (host) {
+            const srvValue: string = `${AUTODISCOVER_SRV_PRIORITY} ${AUTODISCOVER_SRV_WEIGHT} ${AUTODISCOVER_SRV_PORT} ${host}`;
+            records.push(record("autodiscover_cname", "CNAME", cname, [host]));
+            // external-dns needs an SRV target to end with a dot; the checklist shows it the way an admin types it.
+            records.push(record("autodiscover_srv", "SRV", srv, [`${srvValue}.`], srvValue));
+        } else {
+            records.push(unconfigured("autodiscover_cname", "CNAME", cname), unconfigured("autodiscover_srv", "SRV", srv));
+        }
+    }
+    return records;
+}
+
+/**
+ * Why `record` is not published automatically for `domain` through `provider` (the provider config the domain is assigned to, `null`/`undefined` when it
+ * has none or it no longer exists), or `undefined` when it is published. In order: no provider; the name outside the provider's zones (an assignment the
+ * provider no longer covers); a kind the provider can't manage (rfc2136: MX, SRV); SPF while the apex TXT set isn't managed.
+ */
+export function dnsManualReason(
+    record: Pick<DesiredDnsRecord, "type" | "recordKind" | "recordName">,
+    domain: Pick<Domain, "apexTxt">,
+    provider: Pick<DnsProvider, "type" | "zones"> | null | undefined,
+): DnsManualReason | undefined {
+    if (!provider) {
+        return "no_provider";
+    }
+    if (!isNameInZones(record.recordName, provider.zones)) {
+        return "outside_zones";
+    }
+    const unsupported: readonly string[] = isDnsProviderType(provider.type) ? getDnsProviderType(provider.type).unsupportedRecordKinds : [];
+    if (unsupported.includes(record.recordKind)) {
+        return "kind_unsupported";
+    }
+    if (record.type === "spf" && !domain.apexTxt?.managed) {
+        return "apex_txt_unmanaged";
+    }
+    return undefined;
+}
+
+/** What the checklist's publication state is judged from. */
+export interface DnsSetupPublication {
+    /** The provider config the domain is assigned to; `null`/`undefined` when manual (or the assignment names one that is gone). */
+    provider?: Pick<DnsProvider, "type" | "zones"> | null;
+    /** Whether external-dns has observed the domain's current endpoint (`observedGeneration` caught up with `generation`). */
+    observed?: boolean;
+    /** This deployment's external-dns owner id (`rapidmx-<installationId>`): a live record without its ownership record is a conflict. Unknown, none is
+     * reported. */
+    ownerId?: string;
+}
+
+/** Options of `checkDnsSetup()`. */
+export interface DnsSetupOptions {
+    /** Whether the ownership token at the apex still counts (`mail:domain_verification:accept_legacy_apex`). Only the hint depends on it. */
+    acceptLegacyApex?: boolean;
+    /** When set, each configured record also says whether it is published automatically. */
+    publication?: DnsSetupPublication;
+}
+
+/** Whether external-dns's TXT registry record for `recordName` (`rmx-<kind>.<name>`, the prefix `--txt-prefix=rmx-%{record_type}.` gives it) names
+ * `ownerId` as the owner. A failed lookup is "not owned". */
+async function isOwned(dnsResolver: DnsResolver, check: DnsRecordCheck, ownerId: string): Promise<boolean> {
     try {
-        const records: DnsSrvRecord[] = await dnsResolver.resolveSrv(recordName);
-        base.found = records.length > 0;
-        base.matches = records.some((r) => r.port === AUTODISCOVER_SRV_PORT && normalizeHost(r.target) === normalizeHost(publicHostname));
-        base.actualValue = records.map((r) => `${r.priority} ${r.weight} ${r.port} ${r.target}`).join(", ");
+        const records: string[][] = await dnsResolver.resolveTxt(`rmx-${check.recordKind.toLowerCase()}.${check.recordName}`);
+        const owner: RegExp = new RegExp(`(^|,)external-dns/owner=${ownerId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(,|$)`);
+        return records.some((chunks) => owner.test(chunks.join("").replace(/^"|"$/g, "")));
+    } catch {
+        return false;
+    }
+}
+
+/** A live check and, where the lookup answered, every value at the name in the form it is published in (`DesiredDnsRecord.values`): what "published"
+ * compares with the desired values. */
+interface LiveCheck {
+    check: DnsRecordCheck;
+    live?: string[];
+}
+
+/** `value` as compared with a published one: a TXT value as it is (trimmed); otherwise the host it ends with in lowercase without its final dot. */
+function comparable(kind: DnsRecordKind, value: string): string {
+    if (kind === "TXT") {
+        return value.trim();
+    }
+    const parts: string[] = value.trim().split(/\s+/);
+    parts[parts.length - 1] = normalizeHost(parts[parts.length - 1]);
+    return parts.join(" ");
+}
+
+/** Whether the live values at the name are exactly the desired ones, each value once, in any order. */
+function sameValues(kind: DnsRecordKind, live: readonly string[], desired: readonly string[]): boolean {
+    const a: Set<string> = new Set(live.map((value) => comparable(kind, value)));
+    const b: Set<string> = new Set(desired.map((value) => comparable(kind, value)));
+    return a.size === b.size && [...a].every((value) => b.has(value));
+}
+
+/**
+ * The publication state of one configured check: manual with its reason, a conflict when a record this deployment doesn't own is there, published once
+ * observed and live with exactly the desired values, else pending. The live check's own `matches` is looser ("is it working": any DMARC record, an SPF
+ * with `mx`), and the generation external-dns observed may be the one from before the latest change, so a changed value (a stricter DMARC policy, a kept
+ * value added to the apex set) stays pending until it is live.
+ */
+async function publicationOf(dnsResolver: DnsResolver, domain: Domain, desired: DesiredDnsRecord, live: LiveCheck, publication: DnsSetupPublication): Promise<void> {
+    const check: DnsRecordCheck = live.check;
+    const reason: DnsManualReason | undefined = dnsManualReason(desired, domain, publication.provider);
+    if (reason) {
+        check.publication = "manual";
+        check.manualReason = reason;
+        return;
+    }
+    if (check.found && publication.ownerId && !(await isOwned(dnsResolver, check, publication.ownerId))) {
+        check.publication = "conflict";
+        return;
+    }
+    const current: boolean = live.live === undefined || sameValues(desired.recordKind, live.live, desired.values);
+    check.publication = check.matches && current && publication.observed ? "published" : "pending";
+}
+
+/** The ownership check: its token never changes, so the exact match `findDomainVerification()` looks for is what "published" needs too. */
+async function checkOwnership(dnsResolver: DnsResolver, domain: Domain, desired: DesiredDnsRecord, acceptLegacyApex: boolean): Promise<LiveCheck> {
+    const result = await findDomainVerification(dnsResolver, domain, acceptLegacyApex);
+    const check: DnsRecordCheck = { ...base(desired), found: result.atRecord, matches: result.atRecord };
+    if (result.atLegacyApex) {
+        check.legacyApex = true;
+    }
+    return { check };
+}
+
+/** The check of `desired` before its lookup: not found. */
+function base(desired: DesiredDnsRecord): DnsRecordCheck {
+    const check: DnsRecordCheck = { type: desired.type, recordKind: desired.recordKind, recordName: desired.recordName, configured: desired.configured, found: false, matches: false };
+    if (desired.recommendedValue !== undefined) {
+        check.recommendedValue = desired.recommendedValue;
+    }
+    return check;
+}
+
+async function checkMx(dnsResolver: DnsResolver, desired: DesiredDnsRecord, mxHostname: string): Promise<LiveCheck> {
+    const check: DnsRecordCheck = base(desired);
+    if (!desired.configured) {
+        return { check };
+    }
+    try {
+        const records: DnsMxRecord[] = await dnsResolver.resolveMx(desired.recordName);
+        check.found = records.length > 0;
+        check.matches = records.some((r) => normalizeHost(r.exchange) === normalizeHost(mxHostname));
+        check.actualValue = records.map((r) => `${r.priority} ${r.exchange}`).join(", ");
+        return { check, live: records.map((r) => `${r.priority} ${r.exchange}`) };
+    } catch {
+        // found/matches already false - NXDOMAIN/no MX records/network error all just mean "not set up yet".
+        return { check };
+    }
+}
+
+/** A TXT check of an always-configured record (SPF, DMARC): `pick` finds the relevant record among the values at the name, `matches` judges it. */
+async function checkTxt(
+    dnsResolver: DnsResolver,
+    desired: DesiredDnsRecord,
+    pick: (values: string[]) => string | undefined,
+    matches: (value: string) => boolean,
+): Promise<LiveCheck> {
+    const check: DnsRecordCheck = base(desired);
+    try {
+        const values: string[] = (await dnsResolver.resolveTxt(desired.recordName)).map((chunks) => chunks.join(""));
+        const value: string | undefined = pick(values);
+        check.found = value !== undefined;
+        check.matches = value !== undefined && matches(value);
+        check.actualValue = value;
+        return { check, live: values };
     } catch {
         // found/matches already false.
+        return { check };
     }
-    return base;
+}
+
+/** A DKIM key check: any record at the selector's name counts as found, the one carrying the key as matching. */
+async function checkDkim(dnsResolver: DnsResolver, desired: DesiredDnsRecord): Promise<LiveCheck> {
+    const check: DnsRecordCheck = base(desired);
+    if (!desired.configured) {
+        return { check };
+    }
+    const key: string = desired.values[0].slice(desired.values[0].indexOf("p=") + 2);
+    try {
+        const joined: string[] = (await dnsResolver.resolveTxt(desired.recordName)).map((chunks) => chunks.join(""));
+        check.found = joined.length > 0;
+        check.matches = joined.some((v) => v.includes(`p=${key}`));
+        check.actualValue = joined.join(" | ");
+        return { check, live: joined };
+    } catch {
+        // found/matches already false.
+        return { check };
+    }
 }
 
 /**
- * Computes and live-checks every mail-related DNS record this server recommends for `domain`: the
- * existing ownership TXT record (`util/DomainVerificationUtils.ts`), MX, SPF, DKIM (only once an admin
- * has entered a selector/public key), DMARC (always has a safe "none" default), and, only while
- * `@rapidmx/autodiscover-plugin` is active for this deployment, the `autodiscover.<domain>` CNAME and
- * `_autodiscover._tcp.<domain>` SRV records a real mail client's MS-OXDISCO discovery sequence looks for.
- * Each record type is checked independently - a failed lookup for one never blanks out the others.
+ * Checks a CNAME this server recommends (`openpgpkey.<domain>` for the OpenPGP Web Key Directory, `autodiscover.<domain>` for MS-OXDISCO discovery) against
+ * the host it should point at. The deployment's TLS certificate must also cover the name - an operational note, not something this check can verify.
+ */
+async function checkCname(dnsResolver: DnsResolver, desired: DesiredDnsRecord): Promise<LiveCheck> {
+    const check: DnsRecordCheck = base(desired);
+    if (!desired.configured) {
+        return { check };
+    }
+    try {
+        const records: string[] = await dnsResolver.resolveCname(desired.recordName);
+        check.found = records.length > 0;
+        check.matches = records.some((r) => normalizeHost(r) === normalizeHost(desired.values[0]));
+        check.actualValue = records.join(", ");
+        return { check, live: records };
+    } catch {
+        // found/matches already false - NXDOMAIN/no CNAME records/network error all just mean "not set up yet".
+        return { check };
+    }
+}
+
+/**
+ * Checks the `_autodiscover._tcp.<domain>` SRV record that lets a mail client's MS-OXDISCO discovery find this deployment's Autodiscover endpoint without
+ * a separate `autodiscover.` subdomain: the right target on port 443.
+ */
+async function checkSrv(dnsResolver: DnsResolver, desired: DesiredDnsRecord, host: string): Promise<LiveCheck> {
+    const check: DnsRecordCheck = base(desired);
+    if (!desired.configured) {
+        return { check };
+    }
+    try {
+        const records: DnsSrvRecord[] = await dnsResolver.resolveSrv(desired.recordName);
+        check.found = records.length > 0;
+        check.matches = records.some((r) => r.port === AUTODISCOVER_SRV_PORT && normalizeHost(r.target) === normalizeHost(host));
+        const values: string[] = records.map((r) => `${r.priority} ${r.weight} ${r.port} ${r.target}`);
+        check.actualValue = values.join(", ");
+        return { check, live: values };
+    } catch {
+        // found/matches already false.
+        return { check };
+    }
+}
+
+/** The live check of one desired record. */
+async function checkRecord(dnsResolver: DnsResolver, domain: Domain, desired: DesiredDnsRecord, ctx: DesiredDnsRecordContext, acceptLegacyApex: boolean): Promise<LiveCheck> {
+    switch (desired.type) {
+        case "ownership":
+            return await checkOwnership(dnsResolver, domain, desired, acceptLegacyApex);
+        case "mx":
+            return await checkMx(dnsResolver, desired, ctx.mxHostname);
+        case "spf":
+            return await checkTxt(
+                dnsResolver,
+                desired,
+                (values) => values.find((v) => /^v=spf1\b/i.test(v)),
+                (v) => /\bmx\b/i.test(v),
+            );
+        case "dmarc":
+            return await checkTxt(
+                dnsResolver,
+                desired,
+                (values) => values.find((v) => /^v=dmarc1\b/i.test(v)),
+                () => true,
+            );
+        case "dkim":
+        case "dkim_next":
+        case "dkim_previous":
+            return await checkDkim(dnsResolver, desired);
+        case "autodiscover_srv":
+            return await checkSrv(dnsResolver, desired, ctx.autodiscoverHostname ?? "");
+        default:
+            return await checkCname(dnsResolver, desired);
+    }
+}
+
+/**
+ * Computes and live-checks every mail-related DNS record this server recommends for `domain` - exactly the records `buildDesiredDnsRecords()` lists:
+ * ownership at `_rapidmx-verify.<domain>`, MX, SPF, DKIM (with the next and previous selectors during a rotation), DMARC, the `openpgpkey.` CNAME, and,
+ * only while `@rapidmx/autodiscover-plugin` is active, the `autodiscover.<domain>` CNAME and `_autodiscover._tcp.<domain>` SRV records. Each record is
+ * checked independently - a failed lookup for one never blanks out the others.
  *
  * `autodiscoverHostname` distinguishes three states for the two Autodiscover record types. `undefined`
  * means the plugin isn't active here, so both checks are left out of the result entirely - a deployment
  * without it shouldn't get a checklist item for a protocol it doesn't serve. `""` (empty) means the plugin
  * is active but `mail:autodiscover:public_url` isn't set to a valid host yet, so both checks are included
  * with `configured: false`. A real hostname means both checks are included and live-checked against it.
+ *
+ * With `options.publication`, each configured record also says whether it is published automatically, and why not (`dnsManualReason()`).
  */
 export async function checkDnsSetup(
     dnsResolver: DnsResolver,
     domain: Domain,
     mxHostname: string,
     autodiscoverHostname?: string,
+    options: DnsSetupOptions = {},
 ): Promise<DnsRecordCheck[]> {
-    const checks: Promise<DnsRecordCheck>[] = [
-        checkOwnership(dnsResolver, domain),
-        checkMx(dnsResolver, domain, mxHostname),
-        checkSpf(dnsResolver, domain),
-        checkDkim(dnsResolver, domain),
-        checkDmarc(dnsResolver, domain),
-        checkOpenPgpKeyCname(dnsResolver, domain, mxHostname),
-    ];
-    if (autodiscoverHostname !== undefined) {
-        checks.push(checkAutodiscoverCname(dnsResolver, domain, autodiscoverHostname), checkAutodiscoverSrv(dnsResolver, domain, autodiscoverHostname));
-    }
-    return await Promise.all(checks);
+    const ctx: DesiredDnsRecordContext = { mxHostname, autodiscoverHostname };
+    const acceptLegacyApex: boolean = options.acceptLegacyApex ?? DEFAULT_ACCEPT_LEGACY_APEX;
+    return await Promise.all(
+        buildDesiredDnsRecords(domain, ctx).map(async (desired) => {
+            const live: LiveCheck = await checkRecord(dnsResolver, domain, desired, ctx, acceptLegacyApex);
+            if (options.publication && desired.configured) {
+                await publicationOf(dnsResolver, domain, desired, live, options.publication);
+            }
+            return live.check;
+        }),
+    );
 }

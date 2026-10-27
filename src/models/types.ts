@@ -2242,7 +2242,15 @@ export enum AuditAction {
     /** `PUT /mail/domains/:id/dns-provider` - a domain was assigned to a DNS provider config or set back to manual. `details` carries `from` and `to` (provider
      * uids, `null` for manual). */
     DOMAIN_DNS_PROVIDER_ASSIGN = "domain.dns_provider_assign",
-    /** Records this deployment did not own were taken over at a DNS provider. `details` carries the provider, the record names and their old values. */
+    /** `PUT /mail/domains/:id/apex-txt` - the values kept in a domain's managed apex TXT set were edited, or the domain stopped managing the set (its
+     * kept values are then restored as unowned records). `details` carries the domain `name`, `managed` and `keep`. Opting in is `DNS_TAKEOVER`. */
+    DOMAIN_APEX_TXT_UPDATE = "domain.apex_txt_update",
+    /** `POST /system/dns-providers/:id/test` - an elevated administrator queued a credentials test of a DNS provider config. `details` carries its `name`
+     * and the queued `operation` uid. */
+    DNS_PROVIDER_TEST = "dns_provider.test",
+    /** Records this deployment did not own were queued for takeover at a DNS provider (`POST /system/dns-providers/:id/takeover`, or a domain opting
+     * into apex TXT management). `details` carries the `provider`, the `domain`, the `recordNames`, their `oldValues` as the live lookup saw them and the
+     * queued `operation` uid. */
     DNS_TAKEOVER = "dns.takeover",
     /** A DKIM key rotation began. `details` carries the new selector and `reason` (`scheduled`, `manual` or `compromised`). */
     DKIM_ROTATION_STARTED = "dkim_rotation.started",
@@ -2324,7 +2332,22 @@ export interface DnsProvider extends BaseEntity {
  * One of the mail-related DNS record types a domain's setup is checked against (`checkDnsSetup()`). The two `autodiscover_*` types are only ever included
  * while `@rapidmx/autodiscover-plugin` is active for this deployment.
  */
-export type DnsRecordType = "ownership" | "mx" | "spf" | "dkim" | "dmarc" | "openpgpkey_cname" | "autodiscover_cname" | "autodiscover_srv";
+export type DnsRecordType =
+    | "ownership"
+    | "mx"
+    | "spf"
+    | "dkim"
+    | "dkim_next"
+    | "dkim_previous"
+    | "dmarc"
+    | "openpgpkey_cname"
+    | "autodiscover_cname"
+    | "autodiscover_srv";
+
+/** Why a record a domain needs is not published automatically: no provider config publishes the domain, the provider can't hold the record's kind
+ * (rfc2136: MX, SRV), the name lies outside the provider's zones, or the record belongs to the domain's apex TXT set, which RapidMX manages only on
+ * the admin's opt-in (`Domain.apexTxt`). */
+export type DnsManualReason = "no_provider" | "kind_unsupported" | "outside_zones" | "apex_txt_unmanaged";
 
 /** Whether one record a domain needs is published automatically, and if not, why. Same identity as a `DnsRecordCheck`: `type` and `recordName`. */
 export interface DnsRecordPublication {
@@ -2334,7 +2357,7 @@ export interface DnsRecordPublication {
     /** `"published"`: external-dns observed it and the live lookup sees it; `"pending"`: applied, not yet live; `"conflict"`: a record at this name exists
      * that this deployment does not own; `"manual"`: the admin publishes it, see `manualReason`. */
     state: "published" | "pending" | "conflict" | "manual";
-    manualReason?: "no_provider" | "kind_unsupported" | "outside_zones" | "apex_txt_unmanaged";
+    manualReason?: DnsManualReason;
 }
 
 /** What the DNS controller and the live check last said about a domain's published records. Server-managed. */
@@ -2344,6 +2367,98 @@ export interface DnsPublicationStatus {
     records: DnsRecordPublication[];
     lastReconciledAt?: Date;
     lastError?: string;
+}
+
+/**
+ * Whether RapidMX owns a domain's apex TXT record set to publish its SPF record there, and the foreign values it keeps in that set. Owning a set means
+ * owning every value in it (external-dns manages a name and type as one set), so this is only ever on by the admin's explicit opt-in
+ * (`PUT /mail/domains/:id/apex-txt`), and while it is on the console is the only place the set's values are edited.
+ */
+export interface ApexTxtSettings {
+    managed: boolean;
+    /** The values published next to SPF, in the admin's order: site verifications and the like. Never an SPF record or a RapidMX ownership token. Kept
+     * after opting out, so the console can show what was restored. */
+    keep: string[];
+    /** The SPF value published while managed: the domain's existing SPF record verbatim when it already included `mx` at opt-in, else
+     * `v=spf1 mx ~all`. */
+    spf?: string;
+}
+
+/** A domain's DKIM key rotation. Written by the rotation job (restapi step 4); read by the DNS checklist and the desired state, which publish `next`
+ * and `previous` next to the active key while they exist. */
+export interface DkimRotationState {
+    phase: "idle" | "pending" | "switching" | "overlap";
+    next?: { selector: string; publicKey: string; createdAt: Date; liveSince?: Date; reason: "scheduled" | "manual" | "compromised" };
+    previous?: { selector: string; publicKey: string; retireAt?: Date };
+    lastRotatedAt?: Date;
+    paused?: boolean;
+    lastError?: string;
+}
+
+/** What a queued DNS operation does: test a provider config's credentials, take over records this deployment does not own yet, or restore the kept
+ * values of an apex TXT set RapidMX stops managing. */
+export type DnsOperationType = "test" | "takeover" | "restore";
+
+/** Where a queued DNS operation is: waiting for the controller, running, or done. Only `queued` and `running` ones are in the desired state. */
+export type DnsOperationState = "queued" | "running" | "succeeded" | "failed";
+
+/** One record of a DNS operation: what the controller's one-shot Job writes. TXT values are unquoted; the controller quotes them. */
+export interface DnsOperationRecord {
+    dnsName: string;
+    recordType: "A" | "AAAA" | "CNAME" | "MX" | "TXT" | "SRV";
+    targets: string[];
+    ttl?: number;
+}
+
+/**
+ * A one-shot operation the DNS controller runs for the server (a credentials test, a takeover, a restore), queued by the admin routes and handed to the
+ * controller in the desired state until it reports a result. Deny-all class ACL; only the server's routes read and write it.
+ */
+export interface DnsOperation extends BaseEntity {
+    type: DnsOperationType;
+    /** The provider config the operation runs with. */
+    providerUid: string;
+    /** The domain it concerns, when it concerns one. */
+    domainUid?: string;
+    /** The endpoint set whose records it writes: a takeover's ownership records name that regular endpoint. */
+    endpointSetId?: string;
+    records?: DnsOperationRecord[];
+    state: DnsOperationState;
+    /** The controller's result message. Never a credential. */
+    message?: string;
+    /** The uid of the administrator who queued it (unset for one the server queued itself). */
+    requestedBy?: string;
+    startedAt?: Date;
+    finishedAt?: Date;
+}
+
+/**
+ * What the DNS controller last told the server about itself: its handshake (versions and whether they are compatible) and its last status report. One
+ * singleton row (`DNS_CONTROLLER_STATE_UID`), so the console and Diagnostics can say "the controller speaks another API version" or "the controller
+ * has not reported for an hour".
+ */
+export interface DnsControllerState extends BaseEntity {
+    handshake?: {
+        controllerVersion: string;
+        apiVersions: string[];
+        compatible: boolean;
+        selected?: string;
+        reason?: string;
+        at: Date;
+    } | null;
+    /** The Lease holder's last status report: the one that acts. */
+    lastReport?: DnsControllerReportSummary | null;
+    /** The last report of a pod that didn't hold the Lease (a stuck old one during a rollout, a new one waiting for it), which changed nothing. */
+    lastStandbyReport?: DnsControllerReportSummary | null;
+}
+
+/** What `DnsControllerState` keeps of one status report. */
+export interface DnsControllerReportSummary {
+    controllerVersion: string;
+    desiredStateVersion?: number;
+    leaseHolder: boolean;
+    leaseIdentity: string;
+    at: Date;
 }
 
 /**
@@ -2437,7 +2552,14 @@ export interface Domain extends BaseEntity {
     dnsProviderUid?: string | null;
 
     /** What the DNS controller and the live check last said about this domain's published records. Server-managed. */
-    dnsPublication?: DnsPublicationStatus;
+    dnsPublication?: DnsPublicationStatus | null;
+
+    /** Whether RapidMX manages this domain's apex TXT set to publish SPF, and the values it keeps there. Unset means not managed: SPF stays a manual
+     * record. Server-managed: set only through `PUT /:id/apex-txt` (trusted role and elevation, audited). */
+    apexTxt?: ApexTxtSettings | null;
+
+    /** The DKIM key rotation in progress, if any. Server-managed. */
+    dkimRotation?: DkimRotationState | null;
 }
 
 /**

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { MemoryStore, SimpleStore } from "@rapidrest/core";
-import type { DnsResolver } from "../dns/DnsResolver.js";
+import { isDnsNoRecordsError, type DnsResolver } from "../dns/DnsResolver.js";
 
 /**
  * The resolved `_rapidmx.<domain>` federation policy for a remote domain - see
@@ -50,10 +50,6 @@ const DEFAULT_TTL_SECONDS = 24 * 60 * 60;
  * resolver hiccup doesn't mark a real federated peer as non-participating for a day, but non-zero, so a DNS outage
  * isn't hammered on every send. */
 const DEFAULT_TRANSIENT_FAILURE_TTL_SECONDS = 60;
-
-/** Resolver error codes that authoritatively mean "no such record": NXDOMAIN (`ENOTFOUND`) and an existing name
- * without TXT records (`ENODATA`) - Node's `dns` module codes, also used by `DnsResolver` implementations. */
-const AUTHORITATIVE_NEGATIVE_CODES: ReadonlySet<string> = new Set(["ENOTFOUND", "ENODATA"]);
 
 export interface ResolveFederationPolicyOptions {
     /** How long (seconds) a resolved policy is cached before being re-resolved. Default 24h. */
@@ -130,7 +126,7 @@ export async function resolveFederationPolicy(
         }
     } catch (err: any) {
         resolved = undefined;
-        transientFailure = !AUTHORITATIVE_NEGATIVE_CODES.has(err?.code);
+        transientFailure = !isDnsNoRecordsError(err);
     }
 
     if (resolved) {

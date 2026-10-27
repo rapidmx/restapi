@@ -17,6 +17,17 @@ export interface DnsSrvRecord {
     target: string;
 }
 
+/** Resolver error codes that authoritatively mean "no such record": NXDOMAIN (`ENOTFOUND`) and an existing name without records of the type asked
+ * for (`ENODATA`) - Node's `dns` module codes, which `DnsResolver` implementations use too. */
+export const DNS_NO_RECORDS_CODES: ReadonlySet<string> = new Set(["ENOTFOUND", "ENODATA"]);
+
+/** Whether a `DnsResolver` lookup failed because the name has no such records (NXDOMAIN, NODATA), as opposed to a lookup that could not be answered
+ * (SERVFAIL, a timeout, a refused or unvalidated answer), after which nothing is known about the records. */
+export function isDnsNoRecordsError(err: unknown): boolean {
+    const code: unknown = (err as { code?: unknown } | null | undefined)?.code;
+    return typeof code === "string" && DNS_NO_RECORDS_CODES.has(code);
+}
+
 /**
  * A pluggable DNS lookup, used by `Domain` ownership verification (`util/DomainVerificationUtils.ts`)
  * and DNS setup checks (`util/DnsSetupUtils.ts`). Kept behind an interface - like

@@ -12,6 +12,8 @@ export * from "./DataExportRequestMongo.js";
 export * from "./DataSubjectErasureRequestMongo.js";
 export * from "./DeploymentIdentityMongo.js";
 export * from "./DistributionListMongo.js";
+export * from "./DnsControllerStateMongo.js";
+export * from "./DnsOperationMongo.js";
 export * from "./DnsProviderMongo.js";
 export * from "./DomainMongo.js";
 export * from "./EncryptionPolicyMongo.js";

@@ -1,0 +1,35 @@
+{
+    "apiVersion": "dns.rapidmx.io/v1",
+    "kind": "DesiredState",
+    "version": 42,
+    "ownerId": "rapidmx-k3x9q2m7a1b4c8d0",
+    "externalDnsImage": "registry.k8s.io/external-dns/external-dns:v0.23.0",
+    "providers": [
+        {
+            "uid": "cloudflare-main",
+            "type": "cloudflare",
+            "zones": ["example.com"],
+            "options": { "zoneIds": ["0123456789abcdef0123456789abcdef"] },
+            "secretRef": { "backend": "openbao", "path": "dns/cloudflare-main", "keys": ["apiToken"], "generation": 1 },
+            "enabled": true
+        }
+    ],
+    "endpointSets": [
+        {
+            "id": "domain-example-com",
+            "providerUid": "cloudflare-main",
+            "domainUid": "example.com",
+            "records": [
+                { "dnsName": "example.com", "recordType": "MX", "targets": ["10 mail.example.com"], "ttl": 300 },
+                {
+                    "dnsName": "_rapidmx-verify.example.com",
+                    "recordType": "TXT",
+                    "targets": ["rapidmx-domain-verification=3f9c1d"],
+                    "ttl": 300
+                }
+            ]
+        }
+    ],
+    "operations": [],
+    "futureField": "ignored by v1 readers"
+}

@@ -1,0 +1,7 @@
+{
+    "kind": "HandshakeResult",
+    "serverVersion": "1.0.0-beta.47",
+    "apiVersions": ["dns.rapidmx.io/v1"],
+    "compatible": true,
+    "selected": "dns.rapidmx.io/v1"
+}

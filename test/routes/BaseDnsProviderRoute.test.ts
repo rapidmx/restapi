@@ -39,8 +39,10 @@ describe("BaseDnsProviderRoute initialize()", () => {
         await expect((new TestDnsProviderRoute() as any).initialize()).rejects.toThrow("objectFactory is not set.");
     });
 
-    it("builds the provider, domain and audit repos and the audit service once", async () => {
+    it("builds the provider, domain and audit repos, the audit service and the operation and controller-state repos once, and finds the publisher", async () => {
         const route: any = new TestDnsProviderRoute();
+        route.dnsOperationClass = { name: "OperationModel" };
+        route.dnsControllerStateClass = { name: "StateModel" };
         const factory = withFactory(route);
         await route.initialize();
         expect(factory.newInstance.mock.calls.map(([type, opts]: any) => [type, opts.name])).toEqual([
@@ -48,20 +50,23 @@ describe("BaseDnsProviderRoute initialize()", () => {
             [RepoUtils, "DomainModel"],
             [RepoUtils, "AuditModel"],
             [AuditLogUtils, "AuditModel"],
+            [RepoUtils, "OperationModel"],
+            [RepoUtils, "StateModel"],
+            ["DnsPublisher", "default"],
         ]);
-        expect(factory.newInstance).toHaveBeenLastCalledWith(AuditLogUtils, { name: "AuditModel", args: [route.auditLogRepo] });
+        expect(factory.newInstance).toHaveBeenCalledWith(AuditLogUtils, { name: "AuditModel", args: [route.auditLogRepo] });
     });
 
     it("rebuilds nothing already set, and skips what has no model class", async () => {
         const preset: any = new TestDnsProviderRoute();
         const presetFactory = withFactory(preset);
-        Object.assign(preset, { repo: {}, domainRepo: {}, auditLogRepo: {}, auditLogUtils: {} });
+        Object.assign(preset, { repo: {}, domainRepo: {}, auditLogRepo: {}, auditLogUtils: {}, dnsPublisher: {} });
         await preset.initialize();
         expect(presetFactory.newInstance).not.toHaveBeenCalled();
 
         const bare: any = new TestDnsProviderRoute();
         const bareFactory = withFactory(bare);
-        Object.assign(bare, { dnsProviderClass: undefined, domainClass: undefined, auditLogClass: undefined });
+        Object.assign(bare, { dnsProviderClass: undefined, domainClass: undefined, auditLogClass: undefined, dnsPublisher: {} });
         await bare.initialize();
         expect(bareFactory.newInstance).not.toHaveBeenCalled();
     });

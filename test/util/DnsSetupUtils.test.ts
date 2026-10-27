@@ -63,6 +63,7 @@ describe("checkDnsSetup() Tests", () => {
             expect(ownership.found).toBe(true);
             expect(ownership.matches).toBe(true);
             expect(ownership.recommendedValue).toBe(buildVerificationTxtValue(domain.verificationToken));
+            expect(ownership.recordName).toBe("_rapidmx-verify.example.com");
         });
 
         it("Does not match when no TXT record is found.", async () => {
@@ -420,7 +421,7 @@ describe("checkDnsSetup() Tests", () => {
         const domain = makeDomain({ dkimSelector: "default", dkimPublicKey: "key123" });
         const resolver = makeResolver({
             resolveTxt: vi.fn().mockImplementation(async (hostname: string) => {
-                if (hostname === "example.com") {
+                if (hostname === "_rapidmx-verify.example.com") {
                     return [[buildVerificationTxtValue(domain.verificationToken)]];
                 }
                 throw new Error("no records");

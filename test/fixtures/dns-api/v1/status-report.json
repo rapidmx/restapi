@@ -1,0 +1,10 @@
+{
+    "apiVersion": "dns.rapidmx.io/v1",
+    "kind": "StatusReport",
+    "controllerVersion": "0.1.0",
+    "desiredStateVersion": 42,
+    "lease": { "holder": true, "identity": "mail-dns-controller-7c9f8-abcde" },
+    "providers": [{ "providerUid": "cloudflare-main", "readyReplicas": 1, "lastSyncAt": "2026-10-27T10:00:00Z" }],
+    "endpoints": [{ "endpointSetId": "domain-example-com", "generation": 3, "observedGeneration": 3 }],
+    "operations": []
+}

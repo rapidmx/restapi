@@ -6,6 +6,10 @@
 // method here is defined relative to that.
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, HttpRequest, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
+import { DEFAULT_PUBLISH_TTL, domainDnsRecordsV1, domainEndpointSetId, domainProvider } from "../dns/DnsDesiredState.js";
+import type { DnsRecordV1 } from "../dns/DnsDesiredStateApiV1.js";
+import { notifyDnsPublisher, resolveDnsPublisher, type DnsPublisher } from "../dns/DnsPublisher.js";
+import type { DnsResolver } from "../dns/DnsResolver.js";
 import {
     assertDnsProviderCredentials,
     assertDnsProviderSecretValues,
@@ -22,18 +26,45 @@ import {
 import { maskSecretRef, toSecretPatch, type SecretMask } from "../secrets/SecretMask.js";
 import type { SecretStore } from "../secrets/SecretStore.js";
 import { AuditLogUtils } from "../util/AuditLogUtils.js";
+import {
+    autodiscoverHostnameFor,
+    DNS_CONTROLLER_STATE_UID,
+    findAllRows,
+    queueDnsOperation,
+    toPublicDnsOperation,
+    type PublicDnsOperation,
+} from "../util/DnsPublishingUtils.js";
+import { buildDesiredDnsRecords, dnsManualReason } from "../util/DnsSetupUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
 import { assertNoPathKeys, isDuplicateKeyError } from "../util/RequestBodyUtils.js";
-import { AuditAction, DnsProvider, DnsProviderOptionValue, DnsProviderStatus, DnsProviderType, Domain, SecretRef } from "../models/types.js";
+import {
+    AuditAction,
+    DnsControllerState,
+    DnsOperation,
+    DnsProvider,
+    DnsProviderOptionValue,
+    DnsProviderStatus,
+    DnsProviderType,
+    DnsRecordType,
+    Domain,
+    SecretRef,
+} from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Delete, Get, Param, Post, Put, Request, RequiresTrustedRole, User: AuthUser } = RouteDecorators;
 
 /** The longest display name a provider config takes. */
 export const MAX_DNS_PROVIDER_NAME_LENGTH = 100;
 
-/** The most rows read in one page (`RepoUtils.find()`'s own ceiling). */
-const PAGE_LIMIT = 1000;
+/** The most operations `GET /:id/operations` lists: the latest. */
+const OPERATIONS_LISTED = 50;
+
+/** What `GET /controller` answers: what the DNS controller last said about itself, `null` for what it never said. */
+export interface PublicDnsControllerState {
+    handshake: DnsControllerState["handshake"] | null;
+    lastReport: DnsControllerState["lastReport"] | null;
+    lastStandbyReport: DnsControllerState["lastStandbyReport"] | null;
+}
 
 /** What a name another config already has is refused with: by the check before anything is written, and by the unique index when two writes race. */
 const NAME_TAKEN_MESSAGE: string = "A DNS provider with this name already exists.";
@@ -156,7 +187,11 @@ function changedOptionKeys(before: Record<string, DnsProviderOptionValue>, after
  * **Access:** reads need a trusted role, every write a trusted role AND an elevated token (`assertAdminScope()`): credentials that can edit a zone can
  * redirect its mail. Every write is audited with the keys that changed, never a credential's value.
  *
- * The queued test and takeover operations (`POST /:id/test`, `POST /:id/takeover`) need the desired-state API and arrive with it.
+ * - `POST /:id/test` and `POST /:id/takeover` queue an operation the DNS controller runs (a credentials test, the takeover of records this deployment
+ * doesn't own yet); `GET /:id/operations` lists a config's latest ones with their results.
+ * - `GET /controller` says what the DNS controller last reported about itself: its handshake (API versions) and its last status report.
+ *
+ * Every change that moves what is published is announced to the controller (`DnsPublisher`).
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -168,6 +203,12 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
 
     /** Supplied by the Mongo/SQL concrete subclasses so this route can persist an `AuditLogEntry` without depending on either backend directly. */
     protected abstract auditLogClass: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses: the operations queued for the DNS controller. */
+    protected dnsOperationClass?: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses: what the DNS controller last said about itself. */
+    protected dnsControllerStateClass?: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -185,6 +226,27 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
 
     @Logger
     private logger: any;
+
+    /** What a takeover's audit entry records the old values with. */
+    @Inject("DnsResolver")
+    private dnsResolver?: DnsResolver;
+
+    /** The deployment's mail host, the Autodiscover URL and the TTL: what a takeover's records are built with, exactly as the desired state builds them. */
+    @Config("mail:dns:mx_hostname", "")
+    private mxHostname: string = "";
+
+    @Config("mail:autodiscover:public_url", "")
+    private autodiscoverPublicUrl: string = "";
+
+    @Config("mail:dns:publish:ttl", DEFAULT_PUBLISH_TTL)
+    private publishTtlSeconds: number = DEFAULT_PUBLISH_TTL;
+
+    /** Announces changes to the DNS desired state; `NullDnsPublisher` on a server that registers none. */
+    protected dnsPublisher?: DnsPublisher;
+
+    protected operationRepo?: RepoUtils<DnsOperation>;
+
+    protected controllerStateRepo?: RepoUtils<DnsControllerState>;
 
     protected repo?: RepoUtils<T>;
 
@@ -213,6 +275,20 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
         if (!this.auditLogUtils && this.auditLogRepo) {
             this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, { name: this.auditLogClass.name, args: [this.auditLogRepo] });
         }
+        if (!this.operationRepo && this.dnsOperationClass) {
+            this.operationRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.dnsOperationClass.name, args: [this.dnsOperationClass] });
+        }
+        if (!this.controllerStateRepo && this.dnsControllerStateClass) {
+            this.controllerStateRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.dnsControllerStateClass.name, args: [this.dnsControllerStateClass] });
+        }
+        if (!this.dnsPublisher) {
+            this.dnsPublisher = await resolveDnsPublisher(this._objectFactory, this.logger);
+        }
+    }
+
+    /** Announces that the config `uid`'s part of the desired state changed. Never throws. */
+    private async announce(uid: string): Promise<void> {
+        await notifyDnsPublisher(this.dnsPublisher, { scope: "provider", providerUid: uid }, this.logger);
     }
 
     private async audit(req: HttpRequest, user: JWTUser | undefined, action: AuditAction, provider: DnsProvider, details: Record<string, unknown>): Promise<void> {
@@ -227,18 +303,6 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
         return provider;
     }
 
-    /** Every row of `repo` matching `query`, page by page in uid order. `limit`/`page` go in the query too: the SQL backend reads them only from there. */
-    private async findAll<R>(repo: RepoUtils<any>, query: Record<string, unknown>): Promise<R[]> {
-        const rows: R[] = [];
-        for (let page = 0; ; page++) {
-            const batch: R[] = await repo.find({ ...query, sort: "uid", limit: PAGE_LIMIT, page } as any, { ignoreACL: true, limit: PAGE_LIMIT, page, skipCache: true });
-            rows.push(...batch);
-            if (batch.length < PAGE_LIMIT) {
-                return rows;
-            }
-        }
-    }
-
     /** How many domains are assigned to the config `uid`. */
     private async domainCount(uid: string): Promise<number> {
         return await this.domainRepo!.count({ dnsProviderUid: uid } as any, { ignoreACL: true });
@@ -248,7 +312,7 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
      * index on `nameKey`. Compared here rather than in a query, where a name such as `eq(x)` would be read as a search operator. */
     private async assertNameFree(name: string, exceptUid?: string): Promise<void> {
         const nameKey: string = name.toLowerCase();
-        const all: T[] = await this.findAll<T>(this.repo!, {});
+        const all: T[] = await findAllRows<T>(this.repo!, {});
         if (all.some((provider) => provider.uid !== exceptUid && provider.name.toLowerCase() === nameKey)) {
             throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, NAME_TAKEN_MESSAGE);
         }
@@ -287,10 +351,19 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
         return listDnsProviderTypes();
     }
 
+    /** What the DNS controller last said about itself: its handshake (so the console can say "the controller speaks another API version"), the Lease
+     * holder's last status report, and the last report of a pod that didn't hold the Lease. A trusted role. */
+    @RequiresTrustedRole()
+    @Get("/controller")
+    public async controller(): Promise<PublicDnsControllerState> {
+        const state: DnsControllerState | undefined = this.controllerStateRepo ? await this.controllerStateRepo.findOne(DNS_CONTROLLER_STATE_UID, { ignoreACL: true, skipCache: true }) : undefined;
+        return { handshake: state?.handshake ?? null, lastReport: state?.lastReport ?? null, lastStandbyReport: state?.lastStandbyReport ?? null };
+    }
+
     @RequiresTrustedRole()
     @Get()
     public async list(): Promise<PublicDnsProvider[]> {
-        const providers: T[] = await this.findAll<T>(this.repo!, {});
+        const providers: T[] = await findAllRows<T>(this.repo!, {});
         const result: PublicDnsProvider[] = [];
         for (const provider of providers) {
             result.push(this.toPublic(provider, await this.domainCount(provider.uid)));
@@ -349,6 +422,7 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
             optionKeys: Object.keys(options).sort(),
             credentialsChanged: secretRef !== undefined,
         });
+        await this.announce(created.uid);
         return this.toPublic(created, 0);
     }
 
@@ -387,7 +461,7 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
         const options: Record<string, DnsProviderOptionValue> = normalizeDnsProviderOptions(spec, body.options !== undefined ? body.options : existing.options, zones);
         if (JSON.stringify(zones) !== JSON.stringify(existing.zones)) {
             // Every assigned domain, however many: one past the first page falling outside would otherwise silently stop being published.
-            const assigned: Domain[] = await this.findAll<Domain>(this.domainRepo!, { dnsProviderUid: existing.uid });
+            const assigned: Domain[] = await findAllRows<Domain>(this.domainRepo!, { dnsProviderUid: existing.uid });
             const outside: Domain | undefined = assigned.find((domain) => !isNameInZones(domain.name, zones));
             if (outside) {
                 throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, `'${outside.name}' is assigned to this DNS provider and would fall outside its zones - assign it elsewhere first.`);
@@ -456,10 +530,13 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
                     rowWriteFailed: true,
                     rowMatchesStore,
                 });
+                // The credentials did change: the controller rolls the instance onto them.
+                await this.announce(existing.uid);
             }
             throw mapNameTaken(err);
         }
         await this.audit(req, user, AuditAction.DNS_PROVIDER_UPDATE, updated, { name: updated.name, fields, optionKeys, credentialsChanged, ...leftBehind });
+        await this.announce(updated.uid);
         return this.toPublic(updated, await this.domainCount(updated.uid));
     }
 
@@ -567,9 +644,169 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
                 `${count} domain(s), such as '${first?.name}', are assigned to this DNS provider - assign them elsewhere first.`,
             );
         }
+        // A restore puts a domain's apex TXT values back after RapidMX released the set (an opt-out, a deleted domain): it runs only through this
+        // config's credentials, so the config stays until the controller has run it.
+        const pending: DnsOperation[] = await this.pendingOperations(existing.uid);
+        const restore: DnsOperation | undefined = pending.find((operation) => operation.type === "restore");
+        if (restore) {
+            throw new ApiError(
+                ApiErrors.IDENTIFIER_EXISTS,
+                409,
+                `The DNS controller still has to restore the apex TXT records of '${restore.domainUid ?? "a domain"}' through this DNS provider - delete it once that has run.`,
+            );
+        }
         await this.repo!.delete(existing.uid, { user, ignoreACL: true });
+        // Nothing can run a test or takeover through a config that is gone: they end here instead of being handed to the controller forever.
+        for (const operation of pending) {
+            await this.cancelOperation(operation, "the DNS provider config was deleted");
+        }
         // After the row: a failure here leaves credentials nothing refers to, never a row whose credentials are gone.
         const secretLeftBehind: boolean = existing.secretRef ? !(await this.deleteSecret(existing.secretRef)) : false;
         await this.audit(req, user, AuditAction.DNS_PROVIDER_DELETE, existing, { name: existing.name, type: existing.type, secretLeftBehind });
+        await this.announce(existing.uid);
+    }
+
+    /** The config `uid`'s operations still queued or running; none on a server that doesn't register the model. */
+    private async pendingOperations(uid: string): Promise<DnsOperation[]> {
+        if (!this.operationRepo) {
+            return [];
+        }
+        const [queued, running] = await Promise.all([
+            findAllRows<DnsOperation>(this.operationRepo, { providerUid: uid, state: "queued" }),
+            findAllRows<DnsOperation>(this.operationRepo, { providerUid: uid, state: "running" }),
+        ]);
+        return [...queued, ...running];
+    }
+
+    /** Marks `operation` failed with `reason`, so the controller is no longer handed it. Logged, never thrown: what made it pointless already happened. */
+    private async cancelOperation(operation: DnsOperation, reason: string): Promise<void> {
+        try {
+            await this.operationRepo!.update(
+                { uid: operation.uid, version: operation.version, state: "failed", message: `Cancelled: ${reason}.`, finishedAt: new Date() } as any,
+                asEntity(this.operationRepo!, operation),
+                { version: operation.version, ignoreACL: true },
+            );
+        } catch (err: any) {
+            this.logger?.warn(`Could not cancel the DNS operation '${operation.uid}' after ${reason}: ${err?.message}`);
+        }
+    }
+
+    /** The operations repository, or a 503 on a server that doesn't register the model. */
+    private operations(): RepoUtils<DnsOperation> {
+        if (!this.operationRepo) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 503, "DNS operations aren't available on this server.");
+        }
+        return this.operationRepo;
+    }
+
+    /**
+     * Queues a credentials test: the DNS controller runs external-dns once with the config's credentials and arguments (`--dry-run --once`) and reports
+     * whether it authenticated and found the zones, which `GET /:id/operations` then shows. A trusted role and an elevated token; audited
+     * (`DNS_PROVIDER_TEST`).
+     */
+    @RequiresTrustedRole()
+    @Post("/:id/test")
+    public async test(@Param("id") id: string, @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<PublicDnsOperation> {
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
+        const provider: T = await this.findProvider(id);
+        const operation: DnsOperation = await queueDnsOperation(this.operations(), this.dnsOperationClass, { type: "test", providerUid: provider.uid, requestedBy: user?.uid });
+        await this.audit(req, user, AuditAction.DNS_PROVIDER_TEST, provider, { name: provider.name, operation: operation.uid });
+        await notifyDnsPublisher(this.dnsPublisher, { scope: "operation", operationUid: operation.uid }, this.logger);
+        return toPublicDnsOperation(operation);
+    }
+
+    /** The live values of `record`, as text, for the audit entry of a takeover; none when the lookup fails. */
+    private async liveValues(record: DnsRecordV1): Promise<string[]> {
+        try {
+            switch (record.recordType) {
+                case "MX":
+                    return (await this.dnsResolver!.resolveMx(record.dnsName)).map((r) => `${r.priority} ${r.exchange}`);
+                case "SRV":
+                    return (await this.dnsResolver!.resolveSrv(record.dnsName)).map((r) => `${r.priority} ${r.weight} ${r.port} ${r.target}`);
+                case "CNAME":
+                    return await this.dnsResolver!.resolveCname(record.dnsName);
+                case "TXT":
+                    return (await this.dnsResolver!.resolveTxt(record.dnsName)).map((chunks) => chunks.join(""));
+                default:
+                    return [];
+            }
+        } catch {
+            return [];
+        }
+    }
+
+    /**
+     * Queues the takeover of a domain's records this deployment doesn't own yet (spec 9.3): the controller's one-shot Job overwrites them with the wanted
+     * values and this deployment's ownership records, after which the regular instance manages them. Body: `domainUid`, and optionally `records`, the
+     * record types to take over (all the domain publishes through this config when left out). The domain must be assigned to this config, and every
+     * type asked for must be one it publishes through it (a 400 naming the others, such as MX on rfc2136, which can't hold it). The apex TXT set is never
+     * taken over here: `PUT mail/domains/:id/apex-txt` alone manages it. A trusted role and an elevated token; audited (`DNS_TAKEOVER`) with the values
+     * the live lookup sees now.
+     */
+    @RequiresTrustedRole()
+    @Post("/:id/takeover")
+    public async takeover(@Param("id") id: string, obj: any, @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<PublicDnsOperation> {
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
+        const body: Record<string, unknown> = obj && typeof obj === "object" && !Array.isArray(obj) ? obj : {};
+        if (typeof body.domainUid !== "string" || !body.domainUid) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'domainUid' must name the domain whose records to take over.");
+        }
+        const provider: T = await this.findProvider(id);
+        const domain: Domain | undefined = await this.domainRepo!.findOne(body.domainUid.toLowerCase(), { ignoreACL: true });
+        if (!domain || domainProvider(domain, [provider]) !== provider) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "That domain isn't published through this DNS provider.");
+        }
+        const ctx = { mxHostname: this.mxHostname, autodiscoverHostname: autodiscoverHostnameFor(this.autodiscoverPublicUrl), ttl: this.publishTtlSeconds };
+        const takeable: DnsRecordType[] = buildDesiredDnsRecords(domain, ctx)
+            .map((record) => record.type)
+            .filter((type) => type !== "spf");
+        let types: DnsRecordType[] = takeable;
+        if (body.records !== undefined) {
+            if (!Array.isArray(body.records) || body.records.length === 0 || !body.records.every((type) => typeof type === "string" && takeable.includes(type as DnsRecordType))) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'records' must list record types of this domain: ${takeable.join(", ")}. The apex TXT set (SPF) is managed through the domain's apex-txt setting.`);
+            }
+            types = body.records as DnsRecordType[];
+        }
+        // A record type the domain lists but doesn't publish through this config (not configured yet, or a kind the provider can't hold) can't be taken
+        // over: asked for by name, it is refused rather than left out unnoticed.
+        const publishable: DnsRecordType[] = buildDesiredDnsRecords(domain, ctx)
+            .filter((record) => record.configured && !dnsManualReason(record, domain, provider))
+            .map((record) => record.type);
+        const unpublishable: DnsRecordType[] = body.records === undefined ? [] : types.filter((type) => !publishable.includes(type));
+        if (unpublishable.length > 0) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `Not published through this DNS provider, so not taken over: ${unpublishable.join(", ")}.`);
+        }
+        // Never empty: the ownership record at `_rapidmx-verify.<domain>` is always published through the config covering the domain.
+        const records: DnsRecordV1[] = domainDnsRecordsV1(domain, provider, ctx, types);
+        const operation: DnsOperation = await queueDnsOperation(this.operations(), this.dnsOperationClass, {
+            type: "takeover",
+            providerUid: provider.uid,
+            domainUid: domain.uid,
+            endpointSetId: domainEndpointSetId(domain.uid),
+            records,
+            requestedBy: user?.uid,
+        });
+        const oldValues: string[] = (await Promise.all(records.map((record) => this.liveValues(record)))).flat();
+        await this.audit(req, user, AuditAction.DNS_TAKEOVER, provider, {
+            provider: provider.uid,
+            domain: domain.name,
+            recordNames: [...new Set(records.map((record) => record.dnsName))],
+            oldValues,
+            operation: operation.uid,
+        });
+        await notifyDnsPublisher(this.dnsPublisher, { scope: "operation", operationUid: operation.uid }, this.logger);
+        return toPublicDnsOperation(operation);
+    }
+
+    /** The config's latest operations (at most `OPERATIONS_LISTED`), newest first, with their state and the controller's result. A trusted role. */
+    @RequiresTrustedRole()
+    @Get("/:id/operations")
+    public async listOperations(@Param("id") id: string): Promise<PublicDnsOperation[]> {
+        const provider: T = await this.findProvider(id);
+        const operations: DnsOperation[] = await findAllRows<DnsOperation>(this.operations(), { providerUid: provider.uid });
+        return operations
+            .sort((a, b) => new Date(b.dateCreated ?? 0).getTime() - new Date(a.dateCreated ?? 0).getTime())
+            .slice(0, OPERATIONS_LISTED)
+            .map(toPublicDnsOperation);
     }
 }

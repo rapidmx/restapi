@@ -4,7 +4,8 @@
 ///////////////////////////////////////////////////////////////////////////////
 // Lightweight, deterministic test-double implementations of this library's pluggable interfaces
 // (`BlobStore`, `SearchProvider`, `SpamScanProvider`, `AvScanProvider`, `MailTransport`, `DnsResolver`,
-// `DkimKeyProvider`, `EncryptionCertificateAuthority`, `SigningCertificateEnrollment`, `SecretStore`), registered with an
+// `DkimKeyProvider`, `EncryptionCertificateAuthority`, `SigningCertificateEnrollment`, `SecretStore`, `DnsPublisher`,
+// `DnsControllerTokenVerifier`), registered with an
 // `ObjectFactory` under the same string names the library's `@Inject("...")` decorators resolve against. Every
 // integration test that boots the shared `test/server-mongo`/`test/server-sql` fixture app needs these
 // registered *before* `server.start()`, because `Server` eagerly instantiates every route it discovers -
@@ -16,6 +17,8 @@ import "reflect-metadata";
 import * as x509 from "@peculiar/x509";
 import type { BlobPutOptions, BlobRange, BlobStore } from "../src/blob/BlobStore.js";
 import type { DnsMxRecord, DnsResolver, DnsSrvRecord } from "../src/dns/DnsResolver.js";
+import type { DnsControllerTokenVerifier } from "../src/dns/DnsControllerTokenVerifier.js";
+import type { DnsDesiredStateChange, DnsPublisher } from "../src/dns/DnsPublisher.js";
 import type {
     CandidateQuery,
     CandidateResultPage,
@@ -270,44 +273,43 @@ export class RecordingMailTransport implements MailTransport {
 /**
  * A `DnsResolver` backed by an in-memory `Map` a test populates directly (`resolver.records.set("example.com",
  * [["rapidmx-domain-verification=abc123"]])`) rather than ever touching real DNS. Throws (matching a real
- * resolver's NXDOMAIN/no-records behavior) for any hostname with no entry.
+ * resolver's NXDOMAIN/no-records behavior, `code: "ENOTFOUND"`) for any hostname with no entry, and a lookup
+ * that can't be answered (`code: "ETIMEOUT"`, as a resolver that timed out or got SERVFAIL) for every name in
+ * `failing`.
  */
 export class StaticDnsResolver implements DnsResolver {
     public records: Map<string, string[][]> = new Map();
     public mxRecords: Map<string, DnsMxRecord[]> = new Map();
     public cnameRecords: Map<string, string[]> = new Map();
     public srvRecords: Map<string, DnsSrvRecord[]> = new Map();
+    public failing: Set<string> = new Set();
 
-    public async resolveTxt(hostname: string): Promise<string[][]> {
-        const records: string[][] | undefined = this.records.get(hostname);
+    /** The entry of `map` for `hostname`: a failed lookup for a name in `failing`, NXDOMAIN for one without an entry. */
+    private lookup<R>(map: Map<string, R>, hostname: string, type: string): R {
+        if (this.failing.has(hostname)) {
+            throw Object.assign(new Error(`StaticDnsResolver: query${type} ETIMEOUT ${hostname}`), { code: "ETIMEOUT" });
+        }
+        const records: R | undefined = map.get(hostname);
         if (!records) {
-            throw new Error(`StaticDnsResolver: no TXT records for '${hostname}'`);
+            throw Object.assign(new Error(`StaticDnsResolver: no ${type} records for '${hostname}'`), { code: "ENOTFOUND" });
         }
         return records;
+    }
+
+    public async resolveTxt(hostname: string): Promise<string[][]> {
+        return this.lookup(this.records, hostname, "TXT");
     }
 
     public async resolveMx(hostname: string): Promise<DnsMxRecord[]> {
-        const records: DnsMxRecord[] | undefined = this.mxRecords.get(hostname);
-        if (!records) {
-            throw new Error(`StaticDnsResolver: no MX records for '${hostname}'`);
-        }
-        return records;
+        return this.lookup(this.mxRecords, hostname, "MX");
     }
 
     public async resolveCname(hostname: string): Promise<string[]> {
-        const records: string[] | undefined = this.cnameRecords.get(hostname);
-        if (!records) {
-            throw new Error(`StaticDnsResolver: no CNAME records for '${hostname}'`);
-        }
-        return records;
+        return this.lookup(this.cnameRecords, hostname, "CNAME");
     }
 
     public async resolveSrv(hostname: string): Promise<DnsSrvRecord[]> {
-        const records: DnsSrvRecord[] | undefined = this.srvRecords.get(hostname);
-        if (!records) {
-            throw new Error(`StaticDnsResolver: no SRV records for '${hostname}'`);
-        }
-        return records;
+        return this.lookup(this.srvRecords, hostname, "SRV");
     }
 }
 
@@ -384,6 +386,76 @@ export class InMemorySecretStore implements SecretStore {
     }
 
     private readonly generations: Map<string, number> = new Map();
+}
+
+/**
+ * A `DnsPublisher` keeping the desired-state version in memory, as the server's Redis counter does across replicas: every change bumps it and answers
+ * the long polls waiting on it. `changes` records what was reported, so a test can check that a write announced itself.
+ */
+export class InMemoryDnsPublisher implements DnsPublisher {
+    public changes: DnsDesiredStateChange[] = [];
+    private current: number = 0;
+    private waiters: Set<() => void> = new Set();
+
+    /** Forgets what was reported (the version keeps counting, as it does across a server's life). */
+    public reset(): void {
+        this.changes = [];
+    }
+
+    public async changed(change: DnsDesiredStateChange): Promise<void> {
+        this.changes.push(change);
+        this.current++;
+        for (const wake of [...this.waiters]) {
+            wake();
+        }
+    }
+
+    public async version(): Promise<number> {
+        return this.current;
+    }
+
+    public async waitForChange(since: number, timeoutMs: number, signal?: AbortSignal): Promise<number> {
+        if (this.current > since || signal?.aborted) {
+            return this.current;
+        }
+        await new Promise<void>((resolve) => {
+            const done = () => {
+                clearTimeout(timer);
+                this.waiters.delete(wake);
+                signal?.removeEventListener("abort", done);
+                resolve();
+            };
+            const wake = () => {
+                if (this.current > since) {
+                    done();
+                }
+            };
+            const timer = setTimeout(done, timeoutMs);
+            this.waiters.add(wake);
+            signal?.addEventListener("abort", done);
+        });
+        return this.current;
+    }
+}
+
+/** The subject the test servers accept DNS controller calls from (`mail:dns:controller:subject` in the test config). */
+export const TEST_DNS_CONTROLLER_SUBJECT = "system:serviceaccount:mail:mail-dns-controller";
+/** A token `StaticDnsControllerTokenVerifier` verifies as the controller's. */
+export const TEST_DNS_CONTROLLER_TOKEN = "controller-projected-token";
+/** A token it verifies, but as another ServiceAccount's. */
+export const TEST_OTHER_SERVICE_ACCOUNT_TOKEN = "other-projected-token";
+
+/** A `DnsControllerTokenVerifier` that knows two tokens and refuses every other, as a JWKS check refuses a bad signature. */
+export class StaticDnsControllerTokenVerifier implements DnsControllerTokenVerifier {
+    public async verify(token: string): Promise<{ subject: string }> {
+        if (token === TEST_DNS_CONTROLLER_TOKEN) {
+            return { subject: TEST_DNS_CONTROLLER_SUBJECT };
+        }
+        if (token === TEST_OTHER_SERVICE_ACCOUNT_TOKEN) {
+            return { subject: "system:serviceaccount:mail:intruder" };
+        }
+        throw new Error("invalid token");
+    }
 }
 
 /**
@@ -470,4 +542,6 @@ export function registerTestDoubles(objectFactory: ObjectFactory): void {
     objectFactory.register(NullEncryptionCertificateAuthority, "EncryptionCertificateAuthority");
     objectFactory.register(NullSigningCertificateEnrollment, "SigningCertificateEnrollment");
     objectFactory.register(InMemorySecretStore, "SecretStore");
+    objectFactory.register(InMemoryDnsPublisher, "DnsPublisher");
+    objectFactory.register(StaticDnsControllerTokenVerifier, "DnsControllerTokenVerifier");
 }

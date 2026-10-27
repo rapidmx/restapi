@@ -1,0 +1,7 @@
+{
+    "kind": "HandshakeResult",
+    "serverVersion": "2.0.0",
+    "apiVersions": ["dns.rapidmx.io/v2"],
+    "compatible": false,
+    "reason": "no API version in common: the controller speaks dns.rapidmx.io/v1, the server dns.rapidmx.io/v2"
+}

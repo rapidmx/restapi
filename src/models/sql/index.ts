@@ -12,6 +12,8 @@ export * from "./DataExportRequestSQL.js";
 export * from "./DataSubjectErasureRequestSQL.js";
 export * from "./DeploymentIdentitySQL.js";
 export * from "./DistributionListSQL.js";
+export * from "./DnsControllerStateSQL.js";
+export * from "./DnsOperationSQL.js";
 export * from "./DnsProviderSQL.js";
 export * from "./DomainSQL.js";
 export * from "./EncryptionPolicySQL.js";

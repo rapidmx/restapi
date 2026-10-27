@@ -1,0 +1,5 @@
+{
+    "kind": "Handshake",
+    "controllerVersion": "0.1.0",
+    "apiVersions": ["dns.rapidmx.io/v1"]
+}

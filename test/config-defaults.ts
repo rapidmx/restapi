@@ -70,6 +70,17 @@ export function buildTestConfigDefaults(datastores: Record<string, any>) {
             },
             dns: {
                 mx_hostname: "mail.rapidmx-test.example.com",
+                // The DNS controller's calls (`/internal/dns`) are accepted from this ServiceAccount only - `StaticDnsControllerTokenVerifier`'s
+                // controller token. A long poll answers after a second, so the suites that wait for one stay quick.
+                controller: { subject: "system:serviceaccount:mail:mail-dns-controller" },
+                desired_state: { long_poll_seconds: 1 },
+                publish: {
+                    hosts: [
+                        { name: "mail.rapidmx-test.example.com", type: "address" },
+                        { name: "auth.rapidmx-test.example.com", type: "cname" },
+                    ],
+                    addresses: ["203.0.114.7", "10.0.0.1"],
+                },
             },
             // Matches the `authserv-id` (`mx.example.com`) used by every test fixture's `Authentication-Results`
             // header - see `ScanQueueJob`'s `trustedAuthservId`/`util/AuthenticationResultsUtils.ts`'s

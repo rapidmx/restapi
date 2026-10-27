@@ -331,10 +331,8 @@ describe("Route:DomainMongo Tests", () => {
                 dmarcPolicy: "quarantine",
             });
             const resolver = objectFactory.getInstance<StaticDnsResolver>("DnsResolver")!;
-            resolver.records.set("setup-me.com", [
-                [buildVerificationTxtValue(domain.verificationToken)],
-                ["v=spf1 mx ~all"],
-            ]);
+            resolver.records.set("_rapidmx-verify.setup-me.com", [[buildVerificationTxtValue(domain.verificationToken)]]);
+            resolver.records.set("setup-me.com", [["v=spf1 mx ~all"]]);
             resolver.mxRecords.set("setup-me.com", [{ priority: 10, exchange: "mail.rapidmx-test.example.com" }]);
             resolver.records.set("default._domainkey.setup-me.com", [["v=DKIM1; k=rsa; p=MIGfMA0GCSq"]]);
             resolver.records.set("_dmarc.setup-me.com", [["v=DMARC1; p=quarantine;"]]);
@@ -346,6 +344,7 @@ describe("Route:DomainMongo Tests", () => {
             expect(result.status).toBe(200);
             const byType = Object.fromEntries(result.body.map((c: any) => [c.type, c]));
             expect(byType.ownership.matches).toBe(true);
+            expect(byType.ownership.recordName).toBe("_rapidmx-verify.setup-me.com");
             expect(byType.mx.configured).toBe(true);
             expect(byType.mx.matches).toBe(true);
             expect(byType.spf.matches).toBe(true);

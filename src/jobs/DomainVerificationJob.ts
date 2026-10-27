@@ -7,13 +7,14 @@ import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-
 import { asEntity } from "../util/EntityUtils.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
 import { AuditLogUtils } from "../util/AuditLogUtils.js";
-import { checkDomainVerification } from "../util/DomainVerificationUtils.js";
+import { DEFAULT_ACCEPT_LEGACY_APEX, findDomainVerification, type DomainVerificationResult } from "../util/DomainVerificationUtils.js";
 import { AuditAction, Domain } from "../models/types.js";
 const { Config, Inject, Init, Logger } = ObjectDecorators;
 
 /**
- * Periodically checks every enabled-but-unverified `Domain` for its DNS ownership TXT record
- * (`checkDomainVerification()`, shared with `BaseDomainRoute.verify()`'s on-demand action), so an admin
+ * Periodically checks every enabled-but-unverified `Domain` for its DNS ownership TXT record at
+ * `_rapidmx-verify.<domain>`, or at the apex while that legacy location is accepted
+ * (`findDomainVerification()`, shared with `BaseDomainRoute.verify()`'s on-demand action), so an admin
  * doesn't have to manually trigger a check after adding the record - it's simply found on the next pass.
  * Once verified, a domain is never queried again by this job (see `Domain.verified`'s own doc comment).
  *
@@ -41,6 +42,10 @@ export abstract class DomainVerificationJob<D extends Domain> extends Background
 
     @Config("mail:jobs:domain_verification:batch_size", 100)
     private batchSize: number = 100;
+
+    /** Whether a token at the domain's root, its old location, still verifies it (`mail:domain_verification:accept_legacy_apex`). */
+    @Config("mail:domain_verification:accept_legacy_apex", DEFAULT_ACCEPT_LEGACY_APEX)
+    private acceptLegacyApex: boolean = DEFAULT_ACCEPT_LEGACY_APEX;
 
     @Inject("DnsResolver")
     private dnsResolver?: DnsResolver;
@@ -112,7 +117,8 @@ export abstract class DomainVerificationJob<D extends Domain> extends Background
 
         for (const domain of candidates) {
             try {
-                const verified: boolean = await checkDomainVerification(this.dnsResolver, domain);
+                const result: DomainVerificationResult = await findDomainVerification(this.dnsResolver, domain, this.acceptLegacyApex);
+                const verified: boolean = result.verified;
                 const patch: any = { uid: domain.uid, version: domain.version, lastCheckedAt: new Date() };
                 if (verified) {
                     patch.verified = true;
@@ -124,7 +130,7 @@ export abstract class DomainVerificationJob<D extends Domain> extends Background
                 await this.domainRepo.update(patch, asEntity(this.domainRepo, domain), { version: domain.version, ignoreACL: true });
 
                 if (verified) {
-                    await this.auditLogUtils!.record({ action: AuditAction.DOMAIN_VERIFIED, targetType: "Domain", targetUid: domain.uid, details: { name: domain.name } });
+                    await this.auditLogUtils!.record({ action: AuditAction.DOMAIN_VERIFIED, targetType: "Domain", targetUid: domain.uid, details: { name: domain.name, location: result.location } });
                 }
             } catch (err: any) {
                 this.logger?.warn(`DomainVerificationJob: failed to check domain '${domain.name}': ${err.message}`);

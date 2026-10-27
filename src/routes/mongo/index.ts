@@ -10,6 +10,7 @@ export * from "./DataExportRequestRouteMongo.js";
 export * from "./DataSubjectErasureRequestRouteMongo.js";
 export * from "./DirectoryRouteMongo.js";
 export * from "./DistributionListRouteMongo.js";
+export * from "./DnsDesiredStateRouteMongo.js";
 export * from "./DnsProviderRouteMongo.js";
 export * from "./DomainRouteMongo.js";
 export * from "./EncryptionPolicyRouteMongo.js";
