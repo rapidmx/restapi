@@ -9,6 +9,18 @@ any one machine's global Claude memory), so it travels with the code.
 decision, finding, or reverted approach worth remembering, add a dated entry under Session Log.
 Keep entries terse — this is a reference, not a transcript.
 
+## Agent model assignments (JP, 2026-10-28)
+
+Standing rule for every AI agent working on this project (applies to all RapidMX and RapidREST repositories):
+
+| Kind of work | Model |
+|---|---|
+| Design (specs, plans, architecture proposals) | Opus 5.5 (`claude-opus-5-5`) |
+| Architectural review | Opus 5.5 (`claude-opus-5-5`) |
+| Code review (finding and verifying defects in diffs or code) | Sonnet 5.5 (`claude-sonnet-5-5`) |
+| Fixes (implementing review findings and other code changes) | Sonnet 5.5 (`claude-sonnet-5-5`) |
+| Simple operations (file operations, renames, project initialization and similar mechanical tasks) | Haiku 5.5 (`claude-haiku-5-5`) |
+
 ## Standing design decisions & constraints
 
 - **Vulnerability/review threat model: externally-exploitable only.** This library is a power
@@ -5049,15 +5061,3 @@ Spec: `specs/dns_publishing_and_integrations.md` (§18 has the step list). Steps
   - Verified (stage 1, before review): `yarn build`; `PluginRoute` SQL/Mongo 119/119 each, `PluginSecretMigrator` SQL/Mongo 12/12 each (one DB suite at a time), unit `PluginSecretUtils`, `PluginSecretMigrator`, `BasePluginRoute`, `PluginUtils`, `maskSecretSettings`; 22 covering files (plugins, models, erasure jobs, route init/trusted-role/mail-access tables, secrets) 749/749 sequentially; the changed files 100% lines/functions; the paging test confirmed failing with a plain `find({})`.
   - Review resolved: (1) a kept `$secretRef` carried to a new version (PUT `packageVersion`, mask + version, upload replace) skipped `checkSettingValue()` -> `checkKeptPluginSecrets()` reads back each kept secret whose definition's value rule (type/min/max/option values) changed and validates it (400 naming the setting, 503 `PluginSecretUnreadableError` when unreadable/foreign backend); `carriedSettings()` is async and takes the live manifest. (2) rolling update: spec now requires the resolving plugin host in a server release *before* the one that registers a real store / runs the migrator. (3) server default-plugin seeding (`PluginStateStore.describeDefault()`) must store secret defaults via the new exported `storePluginSecretSettings()` (the route uses it too). (4) rollback could delete a secret the row still names when the row-restore lost a race -> the secret-removal undo (now always pushed) re-reads the row and skips refs it still names; a failed re-read fails the step (rollback logs, secrets left). (5) `pluginSecretPath()` capped at 253 (`MAX_PLUGIN_SECRET_PATH_LENGTH`): key segment > 96 chars, then package segment > remaining room, cut + `_` + 8 hex of sha256 of the whole name. (6) `SecretStore` doc + spec 5.1/5.3 note the plugin no-store exception and per-write paths. Each new test (route suite x2 + upload suite, both backends via the shared suites; unit path bound) confirmed failing with its fix disabled.
   - Verified (stage 3): `yarn build`; 29 covering files (secrets, plugins, models, PluginRoute SQL+Mongo 122 each, migrator SQL+Mongo, BasePluginRoute, route init/trusted roles/mail access) 891/891 with `--no-file-parallelism`; `PluginSecretUtils`, `BasePluginRoute`, `PluginUtils`, `PluginSecretMigrator` 100% lines/functions/statements, 98.98% branches.
-
-## Agent model assignments (JP, 2026-10-28)
-
-Standing rule for every AI agent working on this project (applies to all RapidMX and RapidREST repositories):
-
-| Kind of work | Model |
-|---|---|
-| Design (specs, plans, architecture proposals) | Opus 5.5 (`claude-opus-5-5`) |
-| Architectural review | Opus 5.5 (`claude-opus-5-5`) |
-| Code review (finding and verifying defects in diffs or code) | Sonnet 5.5 (`claude-sonnet-5-5`) |
-| Fixes (implementing review findings and other code changes) | Sonnet 5.5 (`claude-sonnet-5-5`) |
-| Simple operations (file operations, renames, project initialization and similar mechanical tasks) | Haiku 5.5 (`claude-haiku-5-5`) |
