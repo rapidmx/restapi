@@ -7,6 +7,7 @@ import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, HttpRequest, HttpResponse, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { createClient } from "redis";
 import { BlobStore } from "../blob/BlobStore.js";
+import { isSecretMask, secretMask } from "../secrets/SecretMask.js";
 import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { AuditAction, Plugin, PluginManifest, PluginSettingDefinition, PluginSource } from "../models/types.js";
@@ -245,20 +246,16 @@ export function isSecretSetting(key: string, manifest?: Pick<PluginManifest, "se
 
 /**
  * What a response says of a saved setting that is a secret (`isSecretSetting()`: a key naming a secret, password, credential, token or api key, or
- * one the manifest marks secret): the object `{ "secret": true }` in place of its value, so a stored API key or shared secret is never sent back to the
- * console - the row keeps the value, and the server's own configuration loads it from there. A setting with no saved value has no entry.
+ * one the manifest marks secret): the mask `{ "secret": true }` (`secretMask()`, the same one the secret store's credentials are shown as) in place of its
+ * value, so a stored API key or shared secret is never sent back to the console - the row keeps the value, and the server's own configuration loads it from
+ * there. A setting with no saved value has no entry. A form that left the setting alone sends the mask back (`isSecretMask()`).
  */
 export function maskSecretSettings(settings: Record<string, unknown> | undefined, manifest?: Pick<PluginManifest, "settings">): Record<string, unknown> {
     const masked: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(settings ?? {})) {
-        masked[key] = isSecretSetting(key, manifest) && value !== undefined && value !== null ? { secret: true } : value;
+        masked[key] = isSecretSetting(key, manifest) && value !== undefined && value !== null ? secretMask() : value;
     }
     return masked;
-}
-
-/** Whether `value` is what `maskSecretSettings()` shows in place of a secret: a form that left the setting alone sends it back as it was given. */
-function isMaskedSecret(value: unknown): boolean {
-    return typeof value === "object" && value !== null && !Array.isArray(value) && (value as any).secret === true && Object.keys(value).length === 1;
 }
 
 /**
@@ -1320,7 +1317,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
                 }
                 // The placeholder a secret setting was shown as means "left alone": the saved value stays.
                 for (const [key, value] of Object.entries(candidate)) {
-                    if (isMaskedSecret(value)) {
+                    if (isSecretMask(value)) {
                         if (existing.settings?.[key] === undefined) {
                             delete candidate[key];
                         } else {

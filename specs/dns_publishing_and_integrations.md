@@ -69,7 +69,7 @@ Grounding for the design below. Paths are relative to each repo.
 
 - A plugin's settings are saved on its `Plugin` row (`Plugin.settings`), **in plaintext**, and loaded by the server's plugin host into the first nconf layer (`PLUGIN_SETTINGS_STORE = "plugins"`), so a saved setting wins over the command line, environment and defaults.
 - `CORE_CONFIG_NAMESPACES` (`src/plugins/PluginUtils.ts`, mirrored by the server's `PROTECTED_PLUGIN_SETTING_KEYS` in `src/config.defaults.ts`) lists the namespaces a plugin setting may never **declare or save**. `giphy`, `mail:dns`, `mail:pki`, `mail:domains` and `system:plugins` are on it. Reading is not restricted: the meet plugin already reads `trusted_roles` and `auth` with `@Config`.
-- A secret setting (`isSecretSetting()`: key words, `secret: true` or `type: "password"` in the manifest) is masked in responses as `{ "secret": true }` (`maskSecretSettings()`), and sending the mask back means "left alone" (`isMaskedSecret()`).
+- A secret setting (`isSecretSetting()`: key words, `secret: true` or `type: "password"` in the manifest) is masked in responses as `{ "secret": true }` (`maskSecretSettings()`), and sending the mask back means "left alone" (`isSecretMask()`; both helpers, with `secretMask()`, now live in `src/secrets/SecretMask.ts`, shared with the secret store, 5.1).
 - The server's Diagnostics page hides config values named on an explicit list (`server/src/diagnostics/hiddenSettings.ts`, which already lists `giphy:api_key`, `system:plugins:registry_token` and `mail:pki:openbao:token`), never by name-guessing.
 
 ### 2.6 Kubernetes, OpenBao and configuration (server)
@@ -238,7 +238,8 @@ restapi defines the abstraction; the server registers the implementation (DI tok
 
 ```ts
 export interface SecretStore {
-    readonly backend: "openbao" | "kubernetes";
+    /** "none" only for NullSecretStore: what code that can do without a store (the plugin-secret migration, 5.4) checks. */
+    readonly backend: "openbao" | "kubernetes" | "none";
     /** Replaces the whole secret at `path` with `values`; returns the reference to persist. */
     write(path: string, values: Record<string, string>): Promise<SecretRef>;
     /** Merges `values` into the secret (unspecified keys kept): what a write-only form with some fields left alone sends. */
@@ -250,7 +251,13 @@ export interface SecretStore {
 }
 ```
 
-restapi ships `NullSecretStore` (every call throws "no secret store is configured"), so a deployment without one refuses to save credentials rather than storing them anywhere else.
+restapi ships `NullSecretStore` (`backend: "none"`), so a deployment without one refuses to save credentials rather than storing them anywhere else. Each operation fails the way its caller needs:
+
+- `write()` and `patch()` reject with a **400** "no secret store is configured" (`NO_SECRET_STORE_MESSAGE`), which a route saving credentials passes on.
+- `read()` rejects with a **503** (`NO_SECRET_STORE_READ_MESSAGE`): the request that needed a server-side secret (a Giphy search) isn't at fault, so it isn't a 400; the consumer treats the secret as unset.
+- `delete()` **resolves**: nothing was ever stored through it, and a row holding a reference from a deployment that had a store (a restored database, a redeploy without OpenBao) must still be deletable, so deleting a DNS provider or uninstalling a plugin is never blocked. A caller that wants to note that the secret was left behind compares `ref.backend` with `backend`. Every store's `delete()` resolves for a secret that is already gone.
+
+The mask is shared with plugin settings (`src/secrets/SecretMask.ts`): `secretMask()` and `isSecretMask()` are what `maskSecretSettings()` and the plugin route use, `maskSecretRef(ref)` shows each key of a `SecretRef` as the mask, and `toSecretPatch(input, fields, multiLineFields?)` turns a write-only form's credentials into the argument of `patch()`: a string sets (surrounding whitespace, such as a pasted newline, trimmed), `null` clears, the mask or an absent field is left alone. It is a 400 for an empty or whitespace-only value, a control character inside a value (tab and line breaks allowed only in `multiLineFields`, such as Google's `serviceAccountJson`), any other value, and an unknown field. The error names the field, or for an unknown one lists the allowed fields, and never repeats anything sent, since a credential sent by mistake as a key would otherwise be reflected. `SecretRef` and `SecretBackend` live in `models/types.ts`, next to the entities that hold them.
 
 Paths are namespaced by consumer: `dns/<provider uid>` (DNS credentials, consumed only by external-dns), `server/<name>` (Giphy key, registry token) and `plugins/<package>/<key>` (plugin secrets).
 
@@ -700,7 +707,7 @@ Today nothing is live (2.6). Reusing the plugin rolling restart (adding the `Int
 ### 11.1 The integrations config layer and `HostConfig`
 
 - The server adds an nconf layer `integrations` directly below `plugins`; `integrations` is added to `CORE_CONFIG_NAMESPACES`, so a plugin can never declare or save these keys. On start and on every change notice the server rebuilds the layer from the `IntegrationSettings` row, resolving secret references.
-- restapi gains a static, read-only accessor `HostConfig.get(key)`, which the server installs at startup over its live nconf instance (`HostConfig.install(config)`). Before installation it returns `undefined`. It is how code that was built with `@Config` (a startup snapshot) reads a value at use time, plugins included, without reaching into `ObjectFactory`'s protected `config`.
+- restapi gains a static, read-only accessor `HostConfig.get(key)`, which the server installs at startup over its live nconf instance (`HostConfig.install(config)`). Before installation it returns `undefined` (`HostConfig.isInstalled()` says which). Plugins share the class with the server (restapi is their peer dependency), so nothing can write the server's configuration through it or redirect what it reads: it has no setter; an object or array value is returned as a deep copy; a configuration is installed **once** (the server does it before loading any plugin, and a later `install()` throws); `install()` returns the only handle that uninstalls it (for tests and shutdown); the installed source is module-private; and the class is frozen, so `get` can't be replaced. It is how code that was built with `@Config` (a startup snapshot) reads a value at use time, plugins included, without reaching into `ObjectFactory`'s protected `config`.
 
 ### 11.2 Propagation
 
@@ -933,4 +940,4 @@ From JP, 2026-10-27:
 
 ## Status
 
-Design, revised 2026-10-27 (dedicated dns-controller project, versioned API, spike results, `_rapidmx-verify`). The dns-controller C1 skeleton exists in its own repository; no restapi or server code yet.
+Design, revised 2026-10-27 (dedicated dns-controller project, versioned API, spike results, `_rapidmx-verify`). The dns-controller C1 skeleton exists in its own repository. restapi step 1 (`SecretStore`, `NullSecretStore`, `SecretRef`, the shared masks, `HostConfig`) is implemented; no server code yet.

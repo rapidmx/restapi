@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { isProtectedSettingKey, maskSecretSettings } from "../../src/routes/BasePluginRoute.js";
+import { isSecretMask } from "../../src/secrets/SecretMask.js";
 
 describe("maskSecretSettings()", () => {
     it("shows a saved secret as { secret: true } and every other setting as it is", () => {
@@ -28,5 +29,12 @@ describe("isProtectedSettingKey()", () => {
         for (const key of ["mail:eas:sync_window_size", "authentication", "mail:security_x", "mail:escrowed"]) {
             expect(isProtectedSettingKey(key), key).toBe(false);
         }
+    });
+});
+
+describe("maskSecretSettings() and the secret store's mask", () => {
+    it("shows a plugin secret as the same mask the integrations routes use, so one form control handles both", () => {
+        const masked: Record<string, unknown> = maskSecretSettings({ "mail:x:api_key": "s3cr3t" });
+        expect(isSecretMask(masked["mail:x:api_key"])).toBe(true);
     });
 });

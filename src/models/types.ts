@@ -3307,3 +3307,23 @@ export interface PublicAppearancePreferences {
     background?: AppearanceBackground;
     updatedAt: string;
 }
+
+/** Where a secret store keeps credentials: OpenBao KV when the deployment has OpenBao, else Kubernetes Secrets in the release namespace. */
+export type SecretBackend = "openbao" | "kubernetes";
+
+/**
+ * Where a secret is, never what it is: the only form in which a credential an administrator saved (a DNS provider's API token, the Giphy key, the plugin
+ * registry token, a plugin's secret setting) appears on a row. The value lives in the deployment's `SecretStore`, never in the database, an audit entry or a
+ * response - a response shows each of `keys` as the mask (`maskSecretRef()`).
+ */
+export interface SecretRef {
+    backend: SecretBackend;
+    /** OpenBao: the KV path under the deployment's integrations prefix. Kubernetes: the key prefix inside the Secret. Namespaced by consumer:
+     * `dns/<provider uid>`, `server/<name>` or `plugins/<package>/<key>`. */
+    path: string;
+    /** The keys present (never their values), so the console can show "set" per field. */
+    keys: string[];
+    /** Bumped on every credentials write: the external-dns Deployment's pod-template annotation and the plugin config-change hash, so a new credential is
+     * picked up without the value ever being compared. */
+    generation: number;
+}
