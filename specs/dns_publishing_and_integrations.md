@@ -1192,13 +1192,15 @@ Done before the rework, none released: restapi steps 1 to 7 (`ade9731`, `befb6b5
 
 ## Open Questions
 
-None blocks implementation. Raised while finalizing (2026-10-28); the spec states each as it will be built unless JP objects:
-
-1. **Plugin secret saves before the first encryption run are plaintext** (5.7). It follows from the rollout gate: a pod of the previous release must not be handed an envelope while it still runs, so encrypting on save starts only once the encryption run has completed once.
-2. **The rollout check reads pods, not the Deployment** (5.7). The existing Diagnostics Role has `get`/`list` on `pods` but no `deployments` rule, so the check is "every pod matching the server's selector has this pod's `pod-template-hash`", which is the same condition as no pod of an older ReplicaSet. Reading `observedGeneration`/`updatedReplicas` as well would add a read-only `get` on that one Deployment by `resourceNames`.
-3. **"Activate anyway" doesn't relax re-encryption or retirement** (5.5). Re-encryption would make every existing value unreadable to the stale copy, so it still waits until that copy is gone or has the key; only values saved after the forced activation are unreadable to it meanwhile.
+None.
 
 ## Resolved Decisions
+
+From JP, 2026-10-28 (final approval round):
+
+- APPROVED: **Plugin secret saves before the first encryption run are plaintext** (5.7). It follows from the rollout gate: a pod of the previous release must not be handed an envelope while it still runs, so encrypting on save starts only once the encryption run has completed once.
+- APPROVED: **The rollout check reads pods, not the Deployment** (5.7). The existing Diagnostics Role has `get`/`list` on `pods` but no `deployments` rule, so the check is "every pod matching the server's selector has this pod's `pod-template-hash`", which is the same condition as no pod of an older ReplicaSet. Reading `observedGeneration`/`updatedReplicas` as well would add a read-only `get` on that one Deployment by `resourceNames`.
+- APPROVED: **"Activate anyway" doesn't relax re-encryption or retirement** (5.5). Re-encryption would make every existing value unreadable to the stale copy, so it still waits until that copy is gone or has the key; only values saved after the forced activation are unreadable to it meanwhile.
 
 From JP, 2026-10-27:
 
