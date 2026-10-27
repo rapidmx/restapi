@@ -44,6 +44,11 @@ export class SetupStateSQL extends BaseEntity implements SetupState {
     @Nullable
     public currentStep?: string;
 
+    @Column({ type: "simple-json", nullable: true })
+    @Description("Every domain name seeded from the deployment's configuration, never created again.")
+    @Nullable
+    public seededDomains?: string[];
+
     constructor(other?: Partial<SetupStateSQL>) {
         super(other);
 
@@ -51,6 +56,7 @@ export class SetupStateSQL extends BaseEntity implements SetupState {
             this.startedAt = "startedAt" in other ? other.startedAt : this.startedAt;
             this.completedAt = "completedAt" in other ? other.completedAt : this.completedAt;
             this.currentStep = "currentStep" in other ? other.currentStep : this.currentStep;
+            this.seededDomains = "seededDomains" in other ? other.seededDomains : this.seededDomains;
         }
     }
 }

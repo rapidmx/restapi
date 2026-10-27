@@ -2,7 +2,6 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import * as crypto from "crypto";
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import {
     ApiErrorMessages,
@@ -40,23 +39,19 @@ import {
 } from "../util/DkimRotationUtils.js";
 import { checkDnsSetup, type DnsRecordCheck } from "../util/DnsSetupUtils.js";
 import { DEFAULT_ACCEPT_LEGACY_APEX, findDomainVerification, type DomainVerificationResult } from "../util/DomainVerificationUtils.js";
-import { isReservedDomainName } from "../util/DomainUtils.js";
+import { prepareNewDomain, validateDmarcPolicy, validateDomainAliasOf } from "../util/DomainUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields } from "../util/RequestBodyUtils.js";
 import { ApexTxtSettings, AuditAction, DeploymentIdentity, DkimRotationReason, DkimRotationState, DnsOperation, DnsProvider, Domain } from "../models/types.js";
 const { Get, Param, Post, Put, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
-/** A host name in lowercase: dot-separated labels of letters, digits and hyphens (a label neither starts nor ends with one, at most 63 characters), at most 253 in all. */
-const DOMAIN_NAME_PATTERN: RegExp = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
 
 const { Config, Init, Inject } = ObjectDecorators;
 
-const DMARC_POLICIES = new Set(["none", "quarantine", "reject"]);
-
-/** The fields only this class (and `DomainVerificationJob`, the DNS controller's status reports and the DKIM rotation job) ever set: dropped from a plain
- * `PUT` (so a client round-tripping a domain still works), refused by `PUT /:id/:property`, and never taken from a create. `dnsProviderUid` changes only
- * through `PUT /:id/dns-provider`, `apexTxt` only through `PUT /:id/apex-txt`, `dkimRotation` only through the rotation job and the `dkim/...` routes,
- * `dkimManaged` only when the server sets or imports a key. */
+/** The fields only this class (and `DomainVerificationJob`, the DNS controller's status reports, the DKIM rotation job and `DomainSeeder`) ever set:
+ * dropped from a plain `PUT` (so a client round-tripping a domain still works), refused by `PUT /:id/:property`, and never taken from a create.
+ * `dnsProviderUid` changes only through `PUT /:id/dns-provider`, `apexTxt` only through `PUT /:id/apex-txt`, `dkimRotation` only through the rotation job
+ * and the `dkim/...` routes, `dkimManaged` only when the server sets or imports a key, `origin` only on create (`"console"` here, `"seed"` by the seeder). */
 const SERVER_MANAGED_DOMAIN_FIELDS: string[] = [
     "uid",
     "verified",
@@ -68,6 +63,7 @@ const SERVER_MANAGED_DOMAIN_FIELDS: string[] = [
     "apexTxt",
     "dkimRotation",
     "dkimManaged",
+    "origin",
 ];
 
 /** The fields whose change moves a domain's published records: an update touching any of them is announced to the DNS controller. */
@@ -105,14 +101,6 @@ const DKIM_ROTATION_REFUSALS: Record<DkimRotationBlocker, string> = {
     unknown_key: "The DKIM key provider can't tell whether it holds this domain's key, so it isn't rotated.",
 };
 
-/** Rejects an explicitly-provided `dmarcPolicy` that isn't one of the three real DMARC policy values -
- * `undefined` (not provided at all) is left alone, matching every other optional field's semantics. */
-function validateDmarcPolicy(dmarcPolicy: unknown): void {
-    if (dmarcPolicy !== undefined && !DMARC_POLICIES.has(dmarcPolicy as string)) {
-        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `dmarcPolicy must be one of: ${[...DMARC_POLICIES].join(", ")}.`);
-    }
-}
-
 /**
  * Extends the standard `CRUDRoute` CRUD scaffolding for `Domain` with trusted-role-only access to every
  * action - same admin-only pattern `BaseDistributionListRoute`/`BaseTransportRuleRoute` already
@@ -121,8 +109,8 @@ function validateDmarcPolicy(dmarcPolicy: unknown): void {
  * reason documented on `BaseDistributionListRoute`).
  *
  * `create()`/`update()` own the entire lifecycle of `verified`/`verificationToken`/`verifiedAt` - none of
- * those three fields is ever taken from the caller's request body, only ever set by this class itself (see
- * `assignUidAndCheckCollision()`'s reserved-TLD carve-out) or by `verify()` below, so a `PUT` can never be
+ * those three fields is ever taken from the caller's request body, only ever set by `prepareNewDomain()` (see
+ * its reserved-TLD carve-out), shared with `DomainSeeder`, or by `verify()` below, so a `PUT` can never be
  * used to bypass DNS ownership proof.
  *
  * @author Jean-Philippe Steinmetz
@@ -262,47 +250,6 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
     @Config("mail:transport:provider", "postfix")
     protected transportProvider: string = "postfix";
 
-    private newVerificationToken(): string {
-        return crypto.randomBytes(32).toString("base64url");
-    }
-
-    /** Fills in `o.dkimSelector`/`o.dkimPublicKey` from `dkimKeyProvider` unless the caller already
-     * supplied both fields itself (an explicit caller-supplied pair - an admin importing their own
-     * externally-managed OpenDKIM key - always wins) or the registered provider doesn't manage key
-     * material at all (`NullDkimKeyProvider`, the default - see `DkimKeyProvider`'s own doc comment). A
-     * no-op (leaves whatever the caller sent, including nothing) in either of those cases. `dkimManaged` says
-     * which: `false` for an imported pair (never rotated), `true` for the provider's. */
-    private async ensureDkimFields(o: Partial<T>): Promise<void> {
-        if (o.dkimSelector && o.dkimPublicKey) {
-            (o as any).dkimManaged = false;
-            return;
-        }
-        const keyPair = await this.dkimKeyProvider!.ensureKeyPair(o.name!);
-        if (!keyPair) {
-            return;
-        }
-        (o as any).dkimSelector = keyPair.selector;
-        (o as any).dkimPublicKey = keyPair.publicKey;
-        (o as any).dkimManaged = true;
-    }
-
-    /** Validates a candidate `aliasOf` (already normalized to lowercase): it must name an existing `Domain`
-     * other than `uid` itself (no self-alias), and that `Domain` must not itself be an alias (no chains - see
-     * `Domain.aliasOf`'s own doc comment: every alias resolves in exactly one hop). Called with `aliasOf`
-     * already stripped to `undefined` for an empty string, so this only ever runs on a real candidate value. */
-    private async validateAliasOf(aliasOf: string, uid: string): Promise<void> {
-        if (aliasOf === uid) {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A domain cannot be an alias of itself.");
-        }
-        const target: T | undefined = await this.repoUtils!.findOne(aliasOf, { ignoreACL: true });
-        if (!target) {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${aliasOf}' is not a domain known to this server - add it first.`);
-        }
-        if (target.aliasOf) {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${aliasOf}' is itself an alias of '${target.aliasOf}' - a domain cannot alias another alias.`);
-        }
-    }
-
     /** Refuses to leave a dangling alias: rejects a 409 if any other `Domain` currently names `uid` via its
      * own `aliasOf`. Checked by `delete()` before a primary domain (or a domain that has never been aliased)
      * can be removed - without this, deleting `powerlevel.gg` while `plc.gg` still names it as `aliasOf`
@@ -315,55 +262,6 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
                 409,
                 `Cannot delete '${uid}' while '${dependents[0].name}' is still configured as an alias of it - delete or repoint that domain first.`,
             );
-        }
-    }
-
-    /** Normalizes `o.name`, derives `uid` from it, and rejects a 409 on collision against an existing
-     * `Domain`. Mutates `o` in place - assigns `uid`, and starts a freshly created domain unverified with a
-     * new token (DNS ownership has never been checked for it yet), unless `o.name` is under a reserved,
-     * never-publicly-resolvable TLD (see `isReservedDomainName()`), in which case it starts already
-     * verified instead. A caller-supplied `aliasOf` (see `Domain.aliasOf`'s own doc comment) is normalized
-     * and validated the same way `validateAliasOf()` validates one on `update()`. */
-    private async assignUidAndCheckCollision(o: Partial<T>): Promise<void> {
-        if (!o.name) {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
-        }
-        validateDmarcPolicy(o.dmarcPolicy);
-        if (typeof o.name !== "string") {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A domain's name must be text.");
-        }
-        const uid: string = normalizeAddress(o.name);
-        // Everything below (the DKIM key file's name, every address-domain comparison) reads the name the way it is stored: the normalized one, a
-        // valid host name - checked before a key is generated for it.
-        if (!DOMAIN_NAME_PATTERN.test(uid)) {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A domain's name must be a host name: letters, digits and hyphens in dot-separated labels.");
-        }
-        (o as any).name = uid;
-        (o as any).uid = uid;
-        (o as any).verificationToken = this.newVerificationToken();
-        await this.ensureDkimFields(o);
-        if (typeof o.aliasOf === "string") {
-            (o as any).aliasOf = normalizeAddress(o.aliasOf) || undefined;
-        }
-        if (o.aliasOf) {
-            await this.validateAliasOf(o.aliasOf, uid);
-        }
-        if (isReservedDomainName(uid)) {
-            // A reserved/special-use TLD (.local, .internal, etc. - see `isReservedDomainName()`'s own doc
-            // comment) is never resolvable via public DNS, so ownership can't be proven that way. Adding
-            // one here is itself the admin's assertion of control over their own internal namespace (this
-            // is a legitimate, common setup for an internal-only mail system) - skip the DNS-proof workflow
-            // entirely and start already verified, rather than leaving it permanently stuck unverified.
-            (o as any).verified = true;
-            (o as any).verifiedAt = new Date();
-        } else {
-            (o as any).verified = false;
-            (o as any).verifiedAt = undefined;
-        }
-
-        const existing: T | undefined = await this.repoUtils!.findOne(uid, { ignoreACL: true });
-        if (existing) {
-            throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "This domain has already been added.");
         }
     }
 
@@ -383,7 +281,9 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
             delete (o as any).apexTxt;
             delete (o as any).dkimRotation;
             delete (o as any).dkimManaged;
-            await this.assignUidAndCheckCollision(o);
+            await prepareNewDomain(o, this.repoUtils!, this.dkimKeyProvider);
+            // Added here, not seeded from the deployment's configuration: what tells the setup wizard this deployment has domains of its own.
+            (o as any).origin = "console";
             if (seenUids.has((o as any).uid)) {
                 throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "Duplicate domain within the same request.");
             }
@@ -432,7 +332,7 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         }
 
         // `RepoUtils.update()` requires `obj.uid === existing.uid` (it's an identity match, not a rename) -
-        // `name` drives `uid` (see `assignUidAndCheckCollision()`), so changing it here isn't supported;
+        // `name` drives `uid` (see `prepareNewDomain()`), so changing it here isn't supported;
         // delete and re-create instead, the same as every other uid-derived-from-a-field entity in this
         // library (e.g. `DistributionList.primarySmtpAddress`).
         if (patch.name !== undefined && normalizeAddress(patch.name) !== existing.uid) {
@@ -452,9 +352,9 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
                 // Only checked on a genuine new alias assignment, not a no-op round-trip of the existing value -
                 // matches every other "only act on a real change" guard in this class. Refuses turning a domain
                 // that other domains already alias INTO an alias itself, which is the same one-hop-only rule
-                // `validateAliasOf()` enforces from the other direction (a fresh alias can't target an alias).
+                // `validateDomainAliasOf()` enforces from the other direction (a fresh alias can't target an alias).
                 await this.assertNoDependentAliases(existing.uid);
-                await this.validateAliasOf(patch.aliasOf, existing.uid);
+                await validateDomainAliasOf(this.repoUtils!, patch.aliasOf, existing.uid);
             }
         }
 

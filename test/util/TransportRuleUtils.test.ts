@@ -369,7 +369,7 @@ describe("TransportRuleUtils Tests", () => {
             expect((await context("<svg><plaintext><style>x</style></plaintext></svg><style>y</style><p>Hello</p>")).bodyText).toBe("Hello x x");
         });
 
-        it("anyRecipientExternal is false when mail:domains is unconfigured (empty).", async () => {
+        it("anyRecipientExternal is false when the server has no verified domains (empty list).", async () => {
             const raw = Buffer.from("From: sender@example.com\r\n\r\nBody\r\n");
             const context = await buildTransportRuleContext(raw, "sender@example.com", ["a@outside.com"], []);
             expect(context.anyRecipientExternal).toBe(false);

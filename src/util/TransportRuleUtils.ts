@@ -37,8 +37,8 @@ export interface TransportRuleMatchContext {
     /** The full envelope recipient list for this SMTP transaction (before any per-recipient resolution/
      * distribution-list expansion). */
     recipientAddresses: string[];
-    /** `true` if any address in `recipientAddresses` has a domain not in this server's configured
-     * `mail:domains` - precomputed by the caller (`buildTransportRuleContext()`) rather than re-derived here,
+    /** `true` if any address in `recipientAddresses` has a domain not among this server's domains (the
+     * verified ones) - precomputed by the caller (`buildTransportRuleContext()`) rather than re-derived here,
      * keeping `matchesTransportRuleConditions()` itself a pure function of its two arguments. */
     anyRecipientExternal: boolean;
     hasAttachment: boolean;
@@ -343,7 +343,8 @@ function htmlText(html: string, nested: boolean = false): string {
  * Builds a `TransportRuleMatchContext` from a raw RFC 5322 message and its envelope - a lightweight
  * `mailparser` parse (subject/body-preview/attachment filenames only, no spam/AV scanning), run once per
  * SMTP transaction at ingest time, before per-recipient resolution/fan-out. `domains` is this server's
- * configured `mail:domains` list, used to compute `anyRecipientExternal`.
+ * domains, the enabled and verified `Domain` rows (`BaseMailIngestRoute` passes `getVerifiedDomainNames()`),
+ * used to compute `anyRecipientExternal`.
  *
  * `plusAddressingEnabled` (mirrors `BaseMailIngestRoute`'s own config toggle - see `findMailboxByAddress()`)
  * additionally includes each recipient's plus-stripped base address in `recipientAddresses`: without it, a

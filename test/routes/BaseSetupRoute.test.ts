@@ -2,9 +2,9 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-// Isolated unit test for BaseSetupRoute.saveStep()'s retry of a save that lost a concurrent save's race - deterministic
-// here, where the real HTTP+DB suite (test/routes/systemSettingsSuite.ts) can only race for real. Every other behavior
-// of this class is exercised there.
+// Isolated unit test for BaseSetupRoute.saveStep()'s retry of a save that lost a concurrent save's race, and for a domain
+// seeded between toStatus()'s two counts - deterministic here, where the real HTTP+DB suite
+// (test/routes/systemSettingsSuite.ts) can only race for real. Every other behavior of this class is exercised there.
 import config from "../config.js";
 import { ApiErrorMessages, ApiErrors, ObjectFactory } from "@rapidrest/service-core";
 import { ApiError, Logger } from "@rapidrest/core";
@@ -16,14 +16,14 @@ class TestSetupRoute extends BaseSetupRoute<any> {
     protected auditLogClass: any = class {};
 }
 
-describe("BaseSetupRoute Tests (saveStep() retry only)", () => {
+describe("BaseSetupRoute Tests (saveStep() retry and toStatus() counts only)", () => {
     const objectFactory: ObjectFactory = new ObjectFactory(config, Logger());
     const conflict = () => new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, ApiErrorMessages.INVALID_OBJECT_VERSION);
 
     function newRoute(update: any): any {
         const route: any = objectFactory.newInstance<TestSetupRoute>(TestSetupRoute, { initialize: false });
         route.repo = { findOne: vi.fn().mockResolvedValue({ uid: "setup-state", version: 1, startedAt: new Date(0) }), update };
-        route.domainRepo = { find: vi.fn().mockResolvedValue([]) };
+        route.domainRepo = { count: vi.fn().mockResolvedValue(0) };
         return route;
     }
 
@@ -37,6 +37,15 @@ describe("BaseSetupRoute Tests (saveStep() retry only)", () => {
         expect(await route.saveStep({ currentStep: "domain" })).toEqual(expect.objectContaining({ required: true, currentStep: "domain" }));
         expect(update).toHaveBeenCalledTimes(3);
         expect(route.repo.findOne).toHaveBeenCalledTimes(3);
+    });
+
+    it("stays required when a domain is seeded between its two counts", async () => {
+        const route = newRoute(vi.fn());
+        route.repo.findOne = vi.fn().mockResolvedValue(undefined);
+        // One domain in all, then two seeded ones: the seeder created the second between the reads. Only seeded domains, so setup is required.
+        route.domainRepo.count = vi.fn().mockResolvedValueOnce(1).mockResolvedValueOnce(2);
+        expect(await route.get()).toEqual(expect.objectContaining({ required: true }));
+        expect(route.domainRepo.count).toHaveBeenCalledTimes(2);
     });
 
     it("gives up after a few attempts, and never retries any other error", async () => {

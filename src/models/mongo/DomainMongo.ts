@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ObjectDecorators } from "@rapidrest/core";
 import { BaseMongoEntity, DocDecorators, ModelDecorators, PersistenceDecorators } from "@rapidrest/service-core";
-import { ApexTxtSettings, DkimRotationState, DnsPublicationStatus, Domain } from "../types.js";
+import { ApexTxtSettings, DkimRotationState, DnsPublicationStatus, Domain, DomainOrigin } from "../types.js";
 const { Description } = DocDecorators;
 const { DataStore, Protect } = ModelDecorators;
 const { Column, Entity } = PersistenceDecorators;
@@ -106,6 +106,11 @@ export class DomainMongo extends BaseMongoEntity implements Domain {
     @Nullable
     public dkimManaged?: boolean | null;
 
+    @Column()
+    @Description("Where the domain came from: 'seed' from the deployment's configuration, 'console' through the API; unset on older rows.")
+    @Nullable
+    public origin?: DomainOrigin | null;
+
     constructor(other?: Partial<DomainMongo>) {
         super(other);
 
@@ -126,6 +131,7 @@ export class DomainMongo extends BaseMongoEntity implements Domain {
             this.apexTxt = "apexTxt" in other ? other.apexTxt : this.apexTxt;
             this.dkimRotation = "dkimRotation" in other ? other.dkimRotation : this.dkimRotation;
             this.dkimManaged = "dkimManaged" in other ? other.dkimManaged : this.dkimManaged;
+            this.origin = "origin" in other ? other.origin : this.origin;
         }
     }
 }

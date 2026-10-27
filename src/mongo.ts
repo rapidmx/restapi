@@ -5,3 +5,4 @@
 export * from "./models/mongo.js";
 export * from "./routes/mongo.js";
 export * from "./jobs/mongo.js";
+export * from "./util/mongo.js";

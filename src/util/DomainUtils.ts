@@ -2,10 +2,13 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ObjectDecorators } from "@rapidrest/core";
-import type { RepoUtils } from "@rapidrest/service-core";
+import * as crypto from "crypto";
+import { ApiError, ObjectDecorators } from "@rapidrest/core";
+import { ApiErrorMessages, ApiErrors, type RepoUtils } from "@rapidrest/service-core";
+import type { DkimKeyProvider } from "../dkim/DkimKeyProvider.js";
 import type { DnsResolver } from "../dns/DnsResolver.js";
-import { addressDomainOf } from "./AddressUtils.js";
+import type { Domain } from "../models/types.js";
+import { addressDomainOf, normalizeAddress } from "./AddressUtils.js";
 import { resolveFederationPolicy } from "./FederationUtils.js";
 
 const { Logger } = ObjectDecorators;
@@ -24,6 +27,106 @@ const RESERVED_TLDS = new Set(["local", "localhost", "test", "example", "invalid
 export function isReservedDomainName(name: string): boolean {
     const labels: string[] = name.toLowerCase().split(".");
     return RESERVED_TLDS.has(labels[labels.length - 1]);
+}
+
+/** A host name in lowercase: dot-separated labels of letters, digits and hyphens (a label neither starts nor ends with one, at most 63 characters), at most 253 in all. */
+export const DOMAIN_NAME_PATTERN: RegExp = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
+
+const DMARC_POLICIES = new Set(["none", "quarantine", "reject"]);
+
+/** Rejects an explicitly-provided `dmarcPolicy` that isn't one of the three real DMARC policy values -
+ * `undefined` (not provided at all) is left alone, matching every other optional field's semantics. */
+export function validateDmarcPolicy(dmarcPolicy: unknown): void {
+    if (dmarcPolicy !== undefined && !DMARC_POLICIES.has(dmarcPolicy as string)) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `dmarcPolicy must be one of: ${[...DMARC_POLICIES].join(", ")}.`);
+    }
+}
+
+/** Validates a candidate `aliasOf` (already normalized to lowercase): it must name an existing `Domain`
+ * other than `uid` itself (no self-alias), and that `Domain` must not itself be an alias (no chains - see
+ * `Domain.aliasOf`'s own doc comment: every alias resolves in exactly one hop). Called with `aliasOf`
+ * already stripped to `undefined` for an empty string, so this only ever runs on a real candidate value. */
+export async function validateDomainAliasOf(domainRepo: RepoUtils<any>, aliasOf: string, uid: string): Promise<void> {
+    if (aliasOf === uid) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A domain cannot be an alias of itself.");
+    }
+    const target: Domain | undefined = await domainRepo.findOne(aliasOf, { ignoreACL: true });
+    if (!target) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${aliasOf}' is not a domain known to this server - add it first.`);
+    }
+    if (target.aliasOf) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${aliasOf}' is itself an alias of '${target.aliasOf}' - a domain cannot alias another alias.`);
+    }
+}
+
+/** Fills in `o.dkimSelector`/`o.dkimPublicKey` from `dkimKeyProvider` unless the caller already
+ * supplied both fields itself (an explicit caller-supplied pair - an admin importing their own
+ * externally-managed OpenDKIM key - always wins) or the registered provider doesn't manage key
+ * material at all (`NullDkimKeyProvider`, the default - see `DkimKeyProvider`'s own doc comment). A
+ * no-op (leaves whatever the caller sent, including nothing) in either of those cases. `dkimManaged` says
+ * which: `false` for an imported pair (never rotated), `true` for the provider's. */
+async function ensureDkimFields(o: Partial<Domain>, dkimKeyProvider: DkimKeyProvider | undefined): Promise<void> {
+    if (o.dkimSelector && o.dkimPublicKey) {
+        o.dkimManaged = false;
+        return;
+    }
+    const keyPair = await dkimKeyProvider?.ensureKeyPair(o.name!);
+    if (!keyPair) {
+        return;
+    }
+    o.dkimSelector = keyPair.selector;
+    o.dkimPublicKey = keyPair.publicKey;
+    o.dkimManaged = true;
+}
+
+/**
+ * The one create path of a `Domain`, shared by the console's `POST mail/domains` (`BaseDomainRoute.create()`) and `DomainSeeder`, so a seeded domain is
+ * made exactly as an added one: normalizes `o.name` (a host name, else 400) and derives `uid` from it, validates `dmarcPolicy` and `aliasOf`, mints a new
+ * verification token, asks `dkimKeyProvider` for a key pair (see `ensureDkimFields()`), and rejects a 409 when the domain already exists. Mutates `o` in
+ * place. A freshly created domain starts unverified (DNS ownership has never been checked for it yet), unless `o.name` is under a reserved,
+ * never-publicly-resolvable TLD (see `isReservedDomainName()`), in which case it starts already verified instead.
+ */
+export async function prepareNewDomain(o: Partial<Domain>, domainRepo: RepoUtils<any>, dkimKeyProvider: DkimKeyProvider | undefined): Promise<void> {
+    if (!o.name) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+    }
+    validateDmarcPolicy(o.dmarcPolicy);
+    if (typeof o.name !== "string") {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A domain's name must be text.");
+    }
+    const uid: string = normalizeAddress(o.name);
+    // Everything below (the DKIM key file's name, every address-domain comparison) reads the name the way it is stored: the normalized one, a
+    // valid host name - checked before a key is generated for it.
+    if (!DOMAIN_NAME_PATTERN.test(uid)) {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A domain's name must be a host name: letters, digits and hyphens in dot-separated labels.");
+    }
+    o.name = uid;
+    o.uid = uid;
+    o.verificationToken = crypto.randomBytes(32).toString("base64url");
+    await ensureDkimFields(o, dkimKeyProvider);
+    if (typeof o.aliasOf === "string") {
+        o.aliasOf = normalizeAddress(o.aliasOf) || undefined;
+    }
+    if (o.aliasOf) {
+        await validateDomainAliasOf(domainRepo, o.aliasOf, uid);
+    }
+    if (isReservedDomainName(uid)) {
+        // A reserved/special-use TLD (.local, .internal, etc. - see `isReservedDomainName()`'s own doc
+        // comment) is never resolvable via public DNS, so ownership can't be proven that way. Adding
+        // one here is itself the admin's assertion of control over their own internal namespace (this
+        // is a legitimate, common setup for an internal-only mail system) - skip the DNS-proof workflow
+        // entirely and start already verified, rather than leaving it permanently stuck unverified.
+        o.verified = true;
+        o.verifiedAt = new Date();
+    } else {
+        o.verified = false;
+        o.verifiedAt = undefined;
+    }
+
+    const existing: Domain | undefined = await domainRepo.findOne(uid, { ignoreACL: true });
+    if (existing) {
+        throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "This domain has already been added.");
+    }
 }
 
 /**

@@ -7,7 +7,7 @@
 import config from "../config.js";
 import { Logger } from "@rapidrest/core";
 import { ObjectFactory } from "@rapidrest/service-core";
-import { createFederatedPeerCheck, DomainUtils, extractPublicHostname } from "../../src/util/DomainUtils.js";
+import { createFederatedPeerCheck, DomainUtils, extractPublicHostname, prepareNewDomain } from "../../src/util/DomainUtils.js";
 
 function fakeRepo(domains: any[]) {
     return {
@@ -198,5 +198,23 @@ describe("extractPublicHostname() Tests", () => {
 
     it("Returns '' for a URL carrying credentials.", () => {
         expect(extractPublicHostname("https://user:pass@mail.example.com")).toBe("");
+    });
+});
+
+describe("prepareNewDomain()", () => {
+    it("refuses a missing name or one that isn't text (400), before anything is generated for it", async () => {
+        const keys = { ensureKeyPair: vi.fn() };
+        for (const name of [undefined, "", 5, { a: 1 }]) {
+            await expect(prepareNewDomain({ name } as any, fakeRepo([]) as any, keys)).rejects.toMatchObject({ status: 400 });
+        }
+        expect(keys.ensureKeyPair).not.toHaveBeenCalled();
+    });
+
+    it("leaves the DKIM fields unset without a key provider, as a deployment that registers none keeps the manual model", async () => {
+        const domain: any = { name: " New.Example.com " };
+        await prepareNewDomain(domain, fakeRepo([]) as any, undefined);
+        expect(domain).toEqual(expect.objectContaining({ name: "new.example.com", uid: "new.example.com", verified: false }));
+        expect(domain.dkimSelector).toBeUndefined();
+        expect(domain.dkimManaged).toBeUndefined();
     });
 });

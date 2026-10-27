@@ -57,7 +57,7 @@ export class FsDkimKeyProvider implements DkimKeyProvider {
     private logger: any;
 
     /** `<key_dir>/<domain>`, the start of every file of `domain`. `domain` is always a normalized `Domain.name` (see
-     * `BaseDomainRoute.assignUidAndCheckCollision()` -> `normalizeAddress()`), never raw caller input, but the filename is guarded the same
+     * `util/DomainUtils.ts`'s `prepareNewDomain()` -> `normalizeAddress()`), never raw caller input, but the filename is guarded the same
      * defense-in-depth way `LocalFsBlobStore.resolvePath()` guards its own keys. */
     private domainFilePrefix(domain: string): string {
         return path.join(this.keyDir, domain.toLowerCase().replace(/[\\/]/g, "_"));

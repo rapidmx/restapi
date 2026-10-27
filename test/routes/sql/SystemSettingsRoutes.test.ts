@@ -13,6 +13,7 @@ import { MailboxPolicySQL } from "../../../src/models/sql/MailboxPolicySQL.js";
 import { SetupStateSQL } from "../../../src/models/sql/SetupStateSQL.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 import { MAILBOX_POLICY_UID } from "../../../src/util/MailboxPolicyUtils.js";
+import { SETUP_STATE_UID } from "../../../src/util/SetupStateUtils.js";
 import { systemSettingsSuite } from "../systemSettingsSuite.js";
 
 describe("Route:MailboxPolicySQL + SetupSQL Tests", () => {
@@ -47,13 +48,23 @@ describe("Route:MailboxPolicySQL + SetupSQL Tests", () => {
                 await repo.clear();
             }
         },
-        addDomain: async () => {
+        addDomain: async (fields = {}) => {
             const name = `${uuid.v4()}.example.com`;
-            await repos.DomainSQL.save(new DomainSQL({ uid: name, name, enabled: true, verified: false, verificationToken: "t" }));
+            await repos.DomainSQL.save(new DomainSQL({ uid: name, name, enabled: true, verified: false, verificationToken: "t", ...fields }));
         },
+        domainRow: async (uid) => await repos.DomainSQL.findOne({ where: { uid } }),
         savePolicy: async (fields) => {
             await repos.MailboxPolicySQL.save(new MailboxPolicySQL({ uid: MAILBOX_POLICY_UID, ...fields }));
         },
         auditActions: async () => (await repos.AuditLogEntrySQL.find()).map((entry: any) => entry.action),
+        saveSetupState: async (fields) => {
+            await repos.SetupStateSQL.save(new SetupStateSQL({ uid: SETUP_STATE_UID, ...fields } as any));
+        },
+        setSeededDomains: async (names) => {
+            const row: any = await repos.SetupStateSQL.findOne({ where: { uid: SETUP_STATE_UID } });
+            row.seededDomains = names;
+            await repos.SetupStateSQL.save(row);
+        },
+        setupRow: async () => await repos.SetupStateSQL.findOne({ where: { uid: SETUP_STATE_UID } }),
     });
 });

@@ -63,6 +63,13 @@ describe.each([
         expect(new Domain({ dnsProviderUid: "cf-x", dnsPublication: publication })).toEqual(expect.objectContaining({ dnsProviderUid: "cf-x", dnsPublication: publication }));
         expect(new Domain({ dnsProviderUid: null }).dnsProviderUid).toBeNull();
     });
+
+    it("leaves a domain's origin unset, as on rows from before seeding, and copies it", () => {
+        expect(new Domain({ name: "example.com" }).origin).toBeUndefined();
+        expect(new Domain({ origin: "seed" }).origin).toBe("seed");
+        expect(new Domain({ origin: "console" }).origin).toBe("console");
+        expect(new Domain({ origin: null }).origin).toBeNull();
+    });
 });
 
 describe.each([

@@ -13,6 +13,7 @@ import { MailboxPolicyMongo } from "../../../src/models/mongo/MailboxPolicyMongo
 import { SetupStateMongo } from "../../../src/models/mongo/SetupStateMongo.js";
 import { registerTestDoubles } from "../../testDoubles.js";
 import { MAILBOX_POLICY_UID } from "../../../src/util/MailboxPolicyUtils.js";
+import { SETUP_STATE_UID } from "../../../src/util/SetupStateUtils.js";
 import { systemSettingsSuite } from "../systemSettingsSuite.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({ instance: { port: 9999, dbName: "rrst-test" } });
@@ -51,13 +52,21 @@ describe("Route:MailboxPolicyMongo + SetupMongo Tests", () => {
                 await repo.clear().catch(() => undefined);
             }
         },
-        addDomain: async () => {
+        addDomain: async (fields = {}) => {
             const name = `${uuid.v4()}.example.com`;
-            await repos.DomainMongo.save(new DomainMongo({ uid: name, name, enabled: true, verified: false, verificationToken: "t" }));
+            await repos.DomainMongo.save(new DomainMongo({ uid: name, name, enabled: true, verified: false, verificationToken: "t", ...fields }));
         },
+        domainRow: async (uid) => await repos.DomainMongo.findOne({ uid } as any),
         savePolicy: async (fields) => {
             await repos.MailboxPolicyMongo.save(new MailboxPolicyMongo({ uid: MAILBOX_POLICY_UID, ...fields }));
         },
         auditActions: async () => (await repos.AuditLogEntryMongo.find({}).toArray()).map((entry: any) => entry.action),
+        saveSetupState: async (fields) => {
+            await repos.SetupStateMongo.save(new SetupStateMongo({ uid: SETUP_STATE_UID, ...fields }));
+        },
+        setSeededDomains: async (names) => {
+            await repos.SetupStateMongo.updateOne({ uid: SETUP_STATE_UID } as any, { $set: { seededDomains: names }, $inc: { version: 1 } } as any);
+        },
+        setupRow: async () => await repos.SetupStateMongo.findOne({ uid: SETUP_STATE_UID } as any),
     });
 });

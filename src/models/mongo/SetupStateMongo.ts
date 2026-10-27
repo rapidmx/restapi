@@ -44,6 +44,11 @@ export class SetupStateMongo extends BaseMongoEntity implements SetupState {
     @Nullable
     public currentStep?: string;
 
+    @Column()
+    @Description("Every domain name seeded from the deployment's configuration, never created again.")
+    @Nullable
+    public seededDomains?: string[];
+
     constructor(other?: Partial<SetupStateMongo>) {
         super(other);
 
@@ -51,6 +56,7 @@ export class SetupStateMongo extends BaseMongoEntity implements SetupState {
             this.startedAt = "startedAt" in other ? other.startedAt : this.startedAt;
             this.completedAt = "completedAt" in other ? other.completedAt : this.completedAt;
             this.currentStep = "currentStep" in other ? other.currentStep : this.currentStep;
+            this.seededDomains = "seededDomains" in other ? other.seededDomains : this.seededDomains;
         }
     }
 }

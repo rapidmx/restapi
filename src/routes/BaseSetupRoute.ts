@@ -5,16 +5,10 @@
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrors, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { AuditLogUtils } from "../util/AuditLogUtils.js";
-import { findOrCreateSingleton } from "../util/MailboxPolicyUtils.js";
+import { SETUP_STATE_UID, updateSetupState } from "../util/SetupStateUtils.js";
 import { AuditAction, Domain, SetupState } from "../models/types.js";
 const { Init } = ObjectDecorators;
 const { Get, Post, Put, RequiresTrustedRole, User: AuthUser } = RouteDecorators;
-
-/** The fixed identifier of the one `SetupState` row. */
-const SETUP_STATE_UID = "setup-state";
-
-/** How many times a step save that lost a concurrent save's optimistic-lock race is re-read and retried. */
-const SAVE_STEP_ATTEMPTS = 5;
 
 /** The wire shape of `GET /setup`. */
 export interface SetupStatus {
@@ -27,9 +21,10 @@ export interface SetupStatus {
 
 /**
  * The admin console's first-run setup wizard state. Setup is `required` until an administrator finishes it, on a
- * deployment that has either started the wizard or has no domains at all - so an existing deployment that already
- * has domains is never pulled into the wizard just by upgrading, while a fresh one is sent there straight away and
- * resumes it if the administrator leaves midway. Trusted roles only: a non-admin's `403` is how the web clients
+ * deployment that has either started the wizard or has no domains other than the ones seeded from its configuration
+ * (`Domain.origin: "seed"`, see `DomainSeeder`) - so an existing deployment that already has domains is never pulled
+ * into the wizard just by upgrading, while a fresh one, whose install seeded its domains, is sent there straight away
+ * and resumes it if the administrator leaves midway. Trusted roles only: a non-admin's `403` is how the web clients
  * know not to redirect them.
  *
  * @author Jean-Philippe Steinmetz
@@ -77,17 +72,6 @@ export abstract class BaseSetupRoute<T extends SetupState> {
         return (await this.repo!.findOne(SETUP_STATE_UID, { ignoreACL: true })) ?? undefined;
     }
 
-    private async findOrCreate(): Promise<T> {
-        return findOrCreateSingleton(this.repo!, SETUP_STATE_UID);
-    }
-
-    private async save(existing: T, patch: Partial<SetupState>, user?: JWTUser): Promise<T> {
-        return await this.repo!.update({ uid: existing.uid, version: (existing as any).version, ...patch } as any, existing, {
-            user,
-            ignoreACL: true,
-        });
-    }
-
     private async toStatus(state: T | undefined): Promise<SetupStatus> {
         let required: boolean;
         if (state?.completedAt) {
@@ -95,8 +79,12 @@ export abstract class BaseSetupRoute<T extends SetupState> {
         } else if (state?.startedAt) {
             required = true;
         } else {
-            const domains: Domain[] = await this.domainRepo!.find({ limit: 1 } as any, { ignoreACL: true, limit: 1 });
-            required = domains.length === 0;
+            // Any domain not seeded from the configuration, a row from before seeding (no origin) included, means the deployment has domains of its own.
+            // Counted on both sides rather than filtered on `origin !== "seed"`, which SQL would read as excluding the rows without an origin. `>=`: a
+            // domain seeded between the two reads makes the second count the larger, and still means no domain of the deployment's own.
+            const all: number = await this.domainRepo!.count({}, { ignoreACL: true });
+            const seeded: number = all > 0 ? await this.domainRepo!.count({ origin: "seed" } as any, { ignoreACL: true }) : 0;
+            required = seeded >= all;
         }
         // `?? undefined`: the SQL backend reports an unset nullable column as `null`.
         return {
@@ -124,7 +112,8 @@ export abstract class BaseSetupRoute<T extends SetupState> {
      * Records the step the administrator is on, marking setup as started - but only while setup is `required`. A step
      * saved on a deployment that doesn't need setup (completed, or with domains and never started) is recorded without
      * starting it, so it can't send every administrator back into the wizard; only `POST /reopen` does that. Two
-     * administrators saving at once both succeed: a save that loses the optimistic-lock race re-reads and tries again.
+     * administrators saving at once both succeed: a save that loses the optimistic-lock race re-reads and tries again,
+     * as `complete()` and `reopen()` do, and as `DomainSeeder` does when it records the domains it seeded.
      */
     @RequiresTrustedRole()
     @Put()
@@ -133,32 +122,25 @@ export abstract class BaseSetupRoute<T extends SetupState> {
         if (typeof step !== "string" || step.trim() === "" || step.length > 64) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'currentStep' must be a step name.");
         }
-        for (let attempt = 1; ; attempt++) {
-            const existing: T = await this.findOrCreate();
-            const patch: Partial<SetupState> = { currentStep: step };
-            if (!existing.startedAt && (await this.toStatus(existing)).required) {
-                patch.startedAt = new Date();
-            }
-            let saved: T;
-            try {
-                saved = await this.save(existing, patch, user);
-            } catch (err: any) {
-                // A lost race is a 409. `RepoUtils.update()` also reports a 500 when its own write landed but a concurrent
-                // write moved the row on before it read the result back. Saving a step is idempotent, so both are retried.
-                if (err instanceof ApiError && (err.status === 409 || err.code === ApiErrors.INTERNAL_ERROR) && attempt < SAVE_STEP_ATTEMPTS) {
-                    continue;
+        // Saving a step is idempotent, so a save that lost the race is simply retried (`updateSetupState()`).
+        const saved: T = await updateSetupState(
+            this.repo!,
+            async (existing: T) => {
+                const patch: Partial<SetupState> = { currentStep: step };
+                if (!existing.startedAt && (await this.toStatus(existing)).required) {
+                    patch.startedAt = new Date();
                 }
-                throw err;
-            }
-            return this.toStatus(saved);
-        }
+                return patch;
+            },
+            user,
+        );
+        return this.toStatus(saved);
     }
 
     @RequiresTrustedRole()
     @Post("/complete")
     public async complete(@AuthUser user?: JWTUser): Promise<SetupStatus> {
-        const existing: T = await this.findOrCreate();
-        const updated: T = await this.save(existing, { completedAt: new Date(), startedAt: existing.startedAt ?? new Date() }, user);
+        const updated: T = await updateSetupState(this.repo!, async (existing: T) => ({ completedAt: new Date(), startedAt: existing.startedAt ?? new Date() }), user);
         await this.audit(AuditAction.SETUP_COMPLETE, user);
         return this.toStatus(updated);
     }
@@ -167,8 +149,7 @@ export abstract class BaseSetupRoute<T extends SetupState> {
     @RequiresTrustedRole()
     @Post("/reopen")
     public async reopen(@AuthUser user?: JWTUser): Promise<SetupStatus> {
-        const existing: T = await this.findOrCreate();
-        const updated: T = await this.save(existing, { completedAt: null as any, startedAt: new Date(), currentStep: null as any }, user);
+        const updated: T = await updateSetupState(this.repo!, async () => ({ completedAt: null as any, startedAt: new Date(), currentStep: null as any }), user);
         await this.audit(AuditAction.SETUP_REOPEN, user);
         return this.toStatus(updated);
     }

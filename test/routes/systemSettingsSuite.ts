@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 // HTTP behaviour of the mailbox policy and setup routes, identical on both backends.
+import { ApiErrors, RepoUtils } from "@rapidrest/service-core";
 import { request } from "@rapidrest/service-core/test";
-import { JWTUtils } from "@rapidrest/core";
+import { ApiError, JWTUtils } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { AuditAction } from "../../src/models/types.js";
 import { DEFAULT_MAILBOX_QUOTA_BYTES } from "../../src/routes/BaseMailboxPolicyRoute.js";
@@ -14,10 +15,19 @@ export interface SystemSettingsSuiteContext {
     app: () => any;
     prefix: string;
     clear: () => Promise<void>;
-    addDomain: () => Promise<void>;
+    /** Saves a domain row with a random name and these fields. */
+    addDomain: (fields?: Record<string, unknown>) => Promise<void>;
+    /** The stored domain row, as the database holds it. */
+    domainRow: (uid: string) => Promise<any>;
     /** Saves a mailbox policy row with only the given fields set. */
     savePolicy: (fields: Record<string, unknown>) => Promise<void>;
     auditActions: () => Promise<string[]>;
+    /** Saves a new setup state row with these fields. */
+    saveSetupState: (fields: Record<string, unknown>) => Promise<void>;
+    /** Sets the stored setup state row's `seededDomains`, as a replica recording a seeded domain does. */
+    setSeededDomains: (names: string[]) => Promise<void>;
+    /** The stored setup state row, as the database holds it. */
+    setupRow: () => Promise<any>;
 }
 
 export function systemSettingsSuite(ctx: SystemSettingsSuiteContext): void {
@@ -116,6 +126,44 @@ export function systemSettingsSuite(ctx: SystemSettingsSuiteContext): void {
             expect((await as(adminToken, request(ctx.app()).get(url()))).body).toEqual({ required: false });
         });
 
+        it("is required on a fresh install whose only domains were seeded from its configuration, and not once another exists", async () => {
+            await ctx.addDomain({ origin: "seed" });
+            await ctx.addDomain({ origin: "seed" });
+            expect((await as(adminToken, request(ctx.app()).get(url()))).body).toEqual({ required: true });
+
+            // Saving a step there starts setup, as on a deployment without domains.
+            const step = await as(adminToken, request(ctx.app()).put(url())).send({ currentStep: "domain" });
+            expect(step.body).toEqual(expect.objectContaining({ required: true, startedAt: expect.any(String) }));
+
+            await ctx.clear();
+            await ctx.addDomain({ origin: "seed" });
+            await ctx.addDomain({ origin: "console" });
+            expect((await as(adminToken, request(ctx.app()).get(url()))).body).toEqual({ required: false });
+
+            // A domain from before seeding existed (no origin) counts as made in the console, so an existing deployment is never pulled into setup.
+            await ctx.clear();
+            await ctx.addDomain({ origin: "seed" });
+            await ctx.addDomain();
+            expect((await as(adminToken, request(ctx.app()).get(url()))).body).toEqual({ required: false });
+        });
+
+        it("marks a domain added in the console as such, and never lets a client claim it was seeded", async () => {
+            const domains = (suffix = "") => `${ctx.prefix}/domains${suffix}`;
+            const created = await as(adminToken, request(ctx.app()).post(domains())).send({ name: "console.example.com", origin: "seed" });
+            expect(created.status).toBe(200);
+            expect(created.body.origin).toBe("console");
+            expect((await ctx.domainRow("console.example.com")).origin).toBe("console");
+            expect((await as(adminToken, request(ctx.app()).get(url()))).body.required).toBe(false);
+
+            // A plain PUT drops it; `PUT /:id/:property` refuses it.
+            const put = await as(adminToken, request(ctx.app()).put(domains("/console.example.com"))).send({ ...created.body, origin: "seed", enabled: false });
+            expect(put.status).toBe(200);
+            expect(put.body.enabled).toBe(false);
+            expect((await ctx.domainRow("console.example.com")).origin).toBe("console");
+            expect((await as(adminToken, request(ctx.app()).put(domains("/console.example.com/origin"))).send({ value: "seed" })).status).toBe(403);
+            expect((await ctx.domainRow("console.example.com")).origin).toBe("console");
+        });
+
         it("records progress, stays required once started even after a domain exists, and completes", async () => {
             const step = await as(adminToken, request(ctx.app()).put(url())).send({ currentStep: "domain" });
             expect(step.status).toBe(200);
@@ -156,6 +204,44 @@ export function systemSettingsSuite(ctx: SystemSettingsSuiteContext): void {
             );
             expect(results.map((result) => result.status)).toEqual([200, 200, 200]);
             expect(["a", "b", "c"]).toContain((await as(adminToken, request(ctx.app()).get(url()))).body.currentStep);
+        });
+
+        it("completes and reopens setup when a replica records a seeded domain at the same time, keeping that name", async () => {
+            await ctx.saveSetupState({ startedAt: new Date("2026-10-01T00:00:00Z"), currentStep: "domain", seededDomains: ["example.com"] });
+            // The seeder records a name between the route's read and its write: a lost race (409), then a write reported as moved on (500).
+            const lostRace = (names: string[]) => async () => {
+                await ctx.setSeededDomains(names);
+                throw new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, "stale");
+            };
+            const update = vi
+                .spyOn(RepoUtils.prototype, "update")
+                .mockImplementationOnce(lostRace(["example.com", "example.org"]))
+                .mockRejectedValueOnce(new ApiError(ApiErrors.INTERNAL_ERROR, 500, "moved on"));
+            try {
+                const done = await as(adminToken, request(ctx.app()).post(url("/complete")));
+                expect(done.status).toBe(200);
+                expect(done.body).toEqual(expect.objectContaining({ required: false, completedAt: expect.any(String) }));
+                expect(update).toHaveBeenCalledTimes(3);
+                const completed = await ctx.setupRow();
+                expect(completed.completedAt).toBeTruthy();
+                expect(new Date(completed.startedAt).toISOString()).toBe("2026-10-01T00:00:00.000Z");
+                expect(completed.seededDomains).toEqual(["example.com", "example.org"]);
+
+                update.mockClear();
+                update.mockImplementationOnce(lostRace(["example.com", "example.org", "example.net"])).mockRejectedValueOnce(
+                    new ApiError(ApiErrors.INTERNAL_ERROR, 500, "moved on"),
+                );
+                const reopened = await as(adminToken, request(ctx.app()).post(url("/reopen")));
+                expect(reopened.status).toBe(200);
+                expect(reopened.body).toEqual(expect.objectContaining({ required: true, startedAt: expect.any(String) }));
+                expect(update).toHaveBeenCalledTimes(3);
+                const open = await ctx.setupRow();
+                expect(open.completedAt ?? undefined).toBeUndefined();
+                expect(open.currentStep ?? undefined).toBeUndefined();
+                expect(open.seededDomains).toEqual(["example.com", "example.org", "example.net"]);
+            } finally {
+                update.mockRestore();
+            }
         });
 
         it("completes setup that was never started", async () => {

@@ -612,6 +612,10 @@ export interface SetupState extends BaseEntity {
 
     /** The wizard step the administrator was last on, so leaving and coming back resumes there. */
     currentStep?: string;
+
+    /** Every domain name `DomainSeeder` has seeded from `mail:domains` (or found already there), append-only: a name on it is never created again, so a
+     * seeded domain the admin deleted stays deleted while the configuration still lists it. Server-managed. */
+    seededDomains?: string[];
 }
 
 export type DataExportFormat = "json" | "mbox";
@@ -2043,7 +2047,8 @@ export interface TransportRuleConditions {
      * (case-insensitive). */
     recipientContains?: string[];
 
-    /** Matches if any envelope recipient's domain is not one of this server's configured `mail:domains`. */
+    /** Matches if any envelope recipient's domain is not one of this server's domains: the enabled and verified `Domain` rows
+     * (`DomainUtils.getVerifiedDomainNames()`). */
     anyRecipientExternal?: boolean;
 
     hasAttachment?: boolean;
@@ -2596,7 +2601,14 @@ export interface Domain extends BaseEntity {
      * `dkimPublicKey` by hand (never rotated). Unset on rows from before rotation, until the rotation job or a rotate request asks the provider whether
      * it holds that key. Server-managed. */
     dkimManaged?: boolean | null;
+
+    /** Where the domain came from: `"seed"` for one `DomainSeeder` created from the deployment's `mail:domains`, `"console"` for one added through the
+     * API. Unset on rows from before seeding, which count as console-made. Server-managed. */
+    origin?: DomainOrigin | null;
 }
+
+/** Where a `Domain` came from (`Domain.origin`). */
+export type DomainOrigin = "seed" | "console";
 
 /**
  * A single, admin-managed, publicly-readable record of this deployment's custom branding (logo, product
