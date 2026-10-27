@@ -4,4 +4,4 @@
 ///////////////////////////////////////////////////////////////////////////////
 export * from "./sql/ConfigCipherSQL.js";
 export * from "./sql/DomainSeederSQL.js";
-export * from "./sql/PluginSecretMigratorSQL.js";
+export * from "./sql/PluginSecretEncryptorSQL.js";

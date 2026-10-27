@@ -2,17 +2,19 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import * as crypto from "crypto";
 import { Readable } from "stream";
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, HttpRequest, HttpResponse, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
 import { createClient } from "redis";
 import { BlobStore } from "../blob/BlobStore.js";
-import { NullSecretStore } from "../secrets/NullSecretStore.js";
+import { noConfigCipher } from "../dns/DnsProviderCredentials.js";
+import { ConfigCipher, isConfigEnvelope } from "../secrets/ConfigCipher.js";
+import { CONFIG_KEY_STATE_UID } from "../secrets/ConfigKeyring.js";
 import { isSecretMask, secretMask } from "../secrets/SecretMask.js";
-import type { SecretStore } from "../secrets/SecretStore.js";
 import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
-import { AuditAction, Plugin, PluginManifest, PluginSecretSettingRef, PluginSettingValue, PluginSource, SecretRef } from "../models/types.js";
+import { AuditAction, ConfigEnvelope, ConfigKeyState, Plugin, PluginManifest, PluginSettingValue, PluginSource } from "../models/types.js";
 import { inspectPack, PackInspection, PackInspectionError } from "../plugins/PackInspector.js";
 import { discardSmallBody, parseContentLength } from "./BaseMailboxImportRoute.js";
 import {
@@ -33,14 +35,7 @@ import {
     PlannedPluginInstall,
 } from "../plugins/PluginDependencies.js";
 import { findPluginUiMountConflicts } from "../plugins/PluginUiUtils.js";
-import {
-    checkKeptPluginSecrets,
-    pluginSecretRefs,
-    PluginSecretUnreadableError,
-    releasedPluginSecretRefs,
-    storePluginSecretSettings,
-    withoutSecretSettings,
-} from "../plugins/PluginSecretUtils.js";
+import { checkKeptPluginSecrets, isPlaintextSecretValue, PluginSecretUnreadableError, sealPluginSecretSettings, withoutSecretSettings } from "../plugins/PluginSecretUtils.js";
 import {
     computePluginStateHash,
     configuredPluginSettings,
@@ -50,7 +45,6 @@ import {
     findPluginNamespace,
     isExactVersion,
     isNewerVersion,
-    isPluginSecretRef,
     isPluginSettingKeyAllowed,
     isPrereleaseVersion,
     isSecretSetting,
@@ -245,20 +239,20 @@ class RegistrySession {
     }
 }
 
-// Kept here under its old home too; it lives with the other setting rules in `plugins/PluginUtils.ts` now, where the secret-store helpers use it.
+// Kept here under its old home too; it lives with the other setting rules in `plugins/PluginUtils.ts` now, where the secret settings' helpers use it.
 export { isSecretSetting };
 
 /**
  * What a response says of a saved setting that is a secret (`isSecretSetting()`: a key naming a secret, password, credential, token or api key, or
- * one the manifest marks secret): the mask `{ "secret": true }` (`secretMask()`, the same one the secret store's credentials are shown as) in place of its
- * value, so a stored API key or shared secret is never sent back to the console. A reference to the secret store (`$secretRef`, spec 5.4) is shown as the
- * mask whatever the setting is called, so where a secret is stored never leaves the server either. A setting with no saved value has no entry. A form
+ * one the manifest marks secret): the mask `{ "secret": true }` (`secretMask()`, the same one every secret field is shown as) in place of its
+ * value, so a stored API key or shared secret is never sent back to the console. An encrypted envelope (spec 5.7) is shown as the
+ * mask whatever the setting is called, so ciphertext never leaves the server either. A setting with no saved value has no entry. A form
  * that left the setting alone sends the mask back (`isSecretMask()`).
  */
 export function maskSecretSettings(settings: Record<string, unknown> | undefined, manifest?: Pick<PluginManifest, "settings">): Record<string, unknown> {
     const masked: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(settings ?? {})) {
-        masked[key] = isPluginSecretRef(value) || (isSecretSetting(key, manifest) && value !== undefined && value !== null) ? secretMask() : value;
+        masked[key] = isConfigEnvelope(value) || (isSecretSetting(key, manifest) && value !== undefined && value !== null) ? secretMask() : value;
     }
     return masked;
 }
@@ -302,7 +296,12 @@ export abstract class BasePluginRoute<T extends Plugin> {
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
+    /** Supplied by the Mongo/SQL concrete subclasses so this route can read whether the plugin secret settings are encrypted yet (`ConfigKeyState`). */
+    protected abstract configKeyStateClass: any;
+
     private pluginRepo?: RepoUtils<T>;
+
+    private stateRepo?: RepoUtils<ConfigKeyState>;
 
     /** The roles that may manage plugins - with an elevated token (`assertAdminScope()`): a plugin is code every replica of the server loads. */
     @Config("trusted_roles", ["admin"])
@@ -336,13 +335,9 @@ export abstract class BasePluginRoute<T extends Plugin> {
     @Inject("BlobStore")
     private blobStore?: BlobStore;
 
-    /** Where secret settings are kept (spec 5.4): the server registers OpenBao or Kubernetes Secrets. Without one (`NullSecretStore`, or none registered)
-     * a secret setting stays on the row as it always has, until a store is registered and `PluginSecretMigrator` moves it there. */
-    @Inject("SecretStore")
-    private secretStore?: SecretStore;
-
-    /** What stands in for a store on a server that registers none. */
-    private readonly noSecretStore: SecretStore = new NullSecretStore();
+    /** Encrypts and decrypts secret settings (spec 5.7). A server that registers none keeps them in plaintext, as before the encryption existed. */
+    @Inject("ConfigCipher")
+    private cipher?: ConfigCipher;
 
     @Config("datastores:events", null)
     private eventsConfig: any;
@@ -375,6 +370,9 @@ export abstract class BasePluginRoute<T extends Plugin> {
         if (!this.pluginRepo && this.pluginClass) {
             this.pluginRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.pluginClass.name, args: [this.pluginClass] });
         }
+        if (!this.stateRepo && this.configKeyStateClass) {
+            this.stateRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.configKeyStateClass.name, args: [this.configKeyStateClass] });
+        }
         if (!this.auditLogRepo && this.auditLogClass) {
             this.auditLogRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.auditLogClass.name, args: [this.auditLogClass] });
         }
@@ -383,46 +381,39 @@ export abstract class BasePluginRoute<T extends Plugin> {
         }
     }
 
-    private store(): SecretStore {
-        return this.secretStore ?? this.noSecretStore;
+    /**
+     * Whether the first encryption run has completed (`ConfigKeyState.pluginSecrets.encryptedAt`, spec 5.7): only from then on is a secret setting saved as an
+     * envelope, since until then a pod of the previous release may still be running and would hand a plugin an envelope as a setting's value. Read for every
+     * save that holds a secret rather than remembered, so a restored database that lost the mark saves plaintext again.
+     */
+    private async secretsAreEncrypted(): Promise<boolean> {
+        const state: ConfigKeyState | undefined = (await this.stateRepo?.findOne(CONFIG_KEY_STATE_UID, { ignoreACL: true, skipCache: true })) ?? undefined;
+        return !!state?.pluginSecrets?.encryptedAt;
     }
 
     /**
-     * `settings` with the plaintext value of each secret setting (`isSecretSetting()`) moved into the secret store (spec 5.4), the row keeping its
-     * reference: a new value, one an older row still holds, or a manifest's default. Each is written to a new path (`pluginSecretPath()`), never over the
-     * secret in use, and the removal of what was written is recorded in `undo`, so a change that fails (the row's write losing the optimistic lock
-     * included) leaves the secrets in use as they were and nothing behind. Without a store the settings are saved as they are.
-     *
-     * The removal runs after the row is put back (undo runs newest first), and only takes what the row, read again, doesn't name: when putting it back
-     * failed because another change saved the row meanwhile keeping a secret written here (the mask sent back), that secret stays, rather than leaving
-     * the row naming a secret that is gone. When the row can't be read to check, all of them are left (logged): a secret no row names costs only space.
+     * `settings` with the plaintext value of each secret setting (`isSecretSetting()`) of the plugin row `uid` encrypted for that row and setting
+     * (`sealPluginSecretSettings()`): a new value, one an older row still holds, or a manifest's default. Nothing changes until the first encryption run has
+     * completed (`secretsAreEncrypted()`). A 503 when a secret has to be sealed and the server has no cipher or no keyring: nothing was written yet.
      */
-    private async storeSecretSettings(
-        name: string,
-        manifest: PluginManifest,
-        settings: Record<string, PluginSettingValue>,
-        undo: PluginUndo[],
-    ): Promise<Record<string, PluginSettingValue>> {
-        const written: SecretRef[] = [];
-        undo.push(async () => {
-            if (written.length === 0) {
-                return;
-            }
-            // A read that fails fails this step, which `rollback()` logs: the secrets are left.
-            const [row]: T[] = await this.pluginRepo!.find({ name } as any, { ignoreACL: true, limit: 1, skipCache: true });
-            const stillNamed: Set<string> = new Set(pluginSecretRefs(row?.settings).map((ref) => `${ref.backend}:${ref.path}`));
-            await this.releaseSecrets(written.filter((ref) => !stillNamed.has(`${ref.backend}:${ref.path}`)));
-        });
-        return await storePluginSecretSettings(this.store(), name, manifest, settings, written);
+    private async sealSecretSettings(uid: string, manifest: PluginManifest, settings: Record<string, PluginSettingValue>): Promise<Record<string, PluginSettingValue>> {
+        const hasSecret: boolean = Object.entries(settings).some(([key, value]) => isPlaintextSecretValue(value) && isSecretSetting(key, manifest));
+        if (!hasSecret || !(await this.secretsAreEncrypted())) {
+            return settings;
+        }
+        if (!this.cipher) {
+            throw noConfigCipher("plugin secret settings");
+        }
+        return sealPluginSecretSettings(this.cipher, uid, manifest, settings);
     }
 
     /**
      * Refuses a change of version whose manifest no longer takes the value of a secret it keeps (`checkKeptPluginSecrets()`): a `400` naming the setting,
-     * as for a value held on the row, or a `503` when the value couldn't be read back to check it.
+     * as for a value held on the row, or a `503` when the value couldn't be decrypted to check it.
      */
-    private async checkKeptSecrets(previous: PluginManifest | undefined, manifest: PluginManifest, kept: Record<string, PluginSecretSettingRef>): Promise<void> {
+    private async checkKeptSecrets(uid: string, previous: PluginManifest | undefined, manifest: PluginManifest, kept: Record<string, ConfigEnvelope>): Promise<void> {
         try {
-            await checkKeptPluginSecrets(this.store(), previous, manifest, kept);
+            checkKeptPluginSecrets(this.cipher, uid, previous, manifest, kept);
         } catch (err: any) {
             if (err instanceof PluginSecretUnreadableError) {
                 throw new ApiError(ApiErrors.INTERNAL_ERROR, 503, err.message);
@@ -431,31 +422,11 @@ export abstract class BasePluginRoute<T extends Plugin> {
         }
     }
 
-    /**
-     * Removes secrets no row names any more (replaced, cleared, dropped by a new version, or the plugin uninstalled), after the change that released them
-     * is saved. Never fails the change: a secret the store can't remove is logged and left behind (no row names it, so nothing reads it), and one in a
-     * backend the deployment doesn't use (a restored database) is never sent to the store.
-     */
-    private async releaseSecrets(refs: SecretRef[]): Promise<void> {
-        const store: SecretStore = this.store();
-        for (const ref of refs) {
-            if (ref.backend !== store.backend) {
-                this.logger?.warn(`A plugin secret was left in the ${ref.backend} secret store, which this deployment doesn't use.`);
-                continue;
-            }
-            try {
-                await store.delete(ref);
-            } catch (err: any) {
-                this.logger?.warn(`A plugin secret the plugin no longer uses could not be removed from the secret store and was left there: ${err.message}`);
-            }
-        }
-    }
-
-    /** Takes the secret references out of `candidate` and returns them: what `validatePluginSettings()` keeps as they are. */
-    private splitKeptSecrets(candidate: Record<string, unknown>): Record<string, PluginSecretSettingRef> {
-        const kept: Record<string, PluginSecretSettingRef> = {};
+    /** Takes the envelopes out of `candidate` and returns them: what `validatePluginSettings()` keeps as they are. */
+    private splitKeptSecrets(candidate: Record<string, unknown>): Record<string, ConfigEnvelope> {
+        const kept: Record<string, ConfigEnvelope> = {};
         for (const [key, value] of Object.entries(candidate)) {
-            if (isPluginSecretRef(value)) {
+            if (isConfigEnvelope(value)) {
                 kept[key] = value;
                 delete candidate[key];
             }
@@ -658,7 +629,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
     private async announce(): Promise<void> {
         try {
             const all: T[] = await this.pluginRepo!.find({} as any, { ignoreACL: true });
-            await this.publishChange(computePluginStateHash(all));
+            await this.publishChange(computePluginStateHash(all, this.cipher));
         } catch (err: any) {
             this.logger?.error(`Could not announce a plugin change: ${err.message}`);
         }
@@ -814,13 +785,15 @@ export abstract class BasePluginRoute<T extends Plugin> {
             // Installed by someone else since this change was planned - never overwrite their version and settings.
             throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, `'${install.name}' changed while this change was being planned. Try again.`);
         }
+        const uid: string = existing?.uid ?? crypto.randomUUID();
         const fields: Partial<Plugin> = {
+            uid,
             name: install.name,
             packageVersion: install.version,
             integrity: install.integrity,
             enabled: true,
             removed: false,
-            settings: await this.storeSecretSettings(install.name, install.manifest, defaultPluginSettings(install.manifest, host), undo),
+            settings: await this.sealSecretSettings(uid, install.manifest, defaultPluginSettings(install.manifest, host)),
             manifest: install.manifest,
             ...(upload ?? {}),
         };
@@ -914,7 +887,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
         const instances: PluginInstanceStatus[] = (await this.readInstanceStatuses())
             .filter((instance) => Date.parse(instance.updatedAt) >= cutoff)
             .sort((a, b) => a.instance.localeCompare(b.instance));
-        return { hash: computePluginStateHash(plugins), instances, uploads: { enabled: this.uploadsEnabled, maxBytes: this.uploadMaxBytes } };
+        return { hash: computePluginStateHash(plugins, this.cipher), instances, uploads: { enabled: this.uploadsEnabled, maxBytes: this.uploadMaxBytes } };
     }
 
     /** The configured plugin namespaces, without their registry tokens. */
@@ -1187,6 +1160,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
     /** The saved settings of a plugin that is moving from `previous` to `manifest`'s version: the ones it still declares, with a new host-named default
      * filled in where there is no value, checked against it - as `update()` does for a new version. */
     private async carriedSettings(
+        uid: string,
         previous: PluginManifest | undefined,
         manifest: PluginManifest,
         saved: Record<string, unknown> | undefined,
@@ -1194,9 +1168,9 @@ export abstract class BasePluginRoute<T extends Plugin> {
     ): Promise<Record<string, PluginSettingValue>> {
         const known: Set<string> = new Set(manifest.settings!.map((setting) => setting.key).filter(isPluginSettingKeyAllowed));
         const candidate: Record<string, unknown> = Object.fromEntries(Object.entries(saved ?? {}).filter(([key]) => known.has(key)));
-        // A secret's reference is carried as it is: the value stays where it is in the store, checked against the new version's manifest.
-        const kept: Record<string, PluginSecretSettingRef> = this.splitKeptSecrets(candidate);
-        await this.checkKeptSecrets(previous, manifest, kept);
+        // A secret's envelope is carried as it is, checked against the new version's manifest.
+        const kept: Record<string, ConfigEnvelope> = this.splitKeptSecrets(candidate);
+        await this.checkKeptSecrets(uid, previous, manifest, kept);
         for (const setting of manifest.settings!) {
             const suggested: string | undefined = resolveHostDefault(setting, host);
             if (suggested !== undefined && kept[setting.key] === undefined && (candidate[setting.key] === undefined || candidate[setting.key] === "")) {
@@ -1300,7 +1274,8 @@ export abstract class BasePluginRoute<T extends Plugin> {
             throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, `'${name}@${version}' can't be installed: ${problems.join(" ")}`);
         }
         const host: string | undefined = pluginHostOfRequest(req.headers);
-        const settings: Record<string, PluginSettingValue> | undefined = live ? await this.carriedSettings(live.manifest, manifest, live.settings, host) : undefined;
+        const carried: Record<string, PluginSettingValue> | undefined = live ? await this.carriedSettings(live.uid, live.manifest, manifest, live.settings, host) : undefined;
+        const settings: Record<string, PluginSettingValue> | undefined = live ? await this.sealSecretSettings(live.uid, manifest, carried!) : undefined;
 
         // The pack is stored before the row names it, so a row never points at a pack that isn't there.
         await this.blobStore.put(blobKey, bytes, { contentType: "application/gzip" });
@@ -1311,8 +1286,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
                 const options = { user, ignoreACL: true };
                 let written: T;
                 if (live) {
-                    const stored: Record<string, PluginSettingValue> = await this.storeSecretSettings(name, manifest, settings!, undo);
-                    const patch: Partial<Plugin> = { packageVersion: version, integrity, manifest, settings: stored, removed: false, ...upload };
+                    const patch: Partial<Plugin> = { packageVersion: version, integrity, manifest, settings: settings!, removed: false, ...upload };
                     written = await this.pluginRepo!.update({ uid: live.uid, version: live.version, ...patch } as any, live, options);
                     const previous: Partial<Plugin> = {
                         packageVersion: live.packageVersion,
@@ -1344,8 +1318,6 @@ export abstract class BasePluginRoute<T extends Plugin> {
         if (live?.uploadBlobKey !== blobKey) {
             await this.dropUnreferencedBlob(live?.uploadBlobKey);
         }
-        // The secrets of settings the new version no longer declares.
-        await this.releaseSecrets(releasedPluginSecretRefs(live?.settings, row.settings));
         res.status(live ? 200 : 201);
         res.json(this.withConfigured(row));
     }
@@ -1414,23 +1386,23 @@ export abstract class BasePluginRoute<T extends Plugin> {
             const candidate: Record<string, unknown> = {
                 ...(obj?.settings ?? Object.fromEntries(Object.entries(existing.settings).filter(([key]) => known.has(key)))),
             };
-            // The secret references the row holds for settings carried to a new version are kept as they are: the values stay where they are in the store.
-            // A reference sent in `obj.settings` is never taken: only the row's own are kept, the ones the mask below stands for.
-            const kept: Record<string, PluginSecretSettingRef> = obj?.settings === undefined ? this.splitKeptSecrets(candidate) : {};
+            // The envelopes the row holds for secret settings carried to a new version are kept as they are.
+            // An envelope sent in `obj.settings` is never taken: only the row's own are kept, the ones the mask below stands for.
+            const kept: Record<string, ConfigEnvelope> = obj?.settings === undefined ? this.splitKeptSecrets(candidate) : {};
             if (obj?.settings !== undefined) {
                 for (const key of Object.keys(candidate)) {
                     if (!isPluginSettingKeyAllowed(key)) {
                         throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `'${key}' is part of the server's own configuration and can't be set as a plugin setting.`);
                     }
                 }
-                // The placeholder a secret setting was shown as means "left alone": the saved value (or its reference in the store) stays.
+                // The placeholder a secret setting was shown as means "left alone": the saved value (or its envelope) stays.
                 for (const [key, value] of Object.entries(candidate)) {
                     if (isSecretMask(value)) {
                         const saved: PluginSettingValue | undefined = existing.settings?.[key];
-                        if (isPluginSecretRef(saved)) {
+                        if (isConfigEnvelope(saved)) {
                             kept[key] = saved;
                         }
-                        if (saved === undefined || isPluginSecretRef(saved)) {
+                        if (saved === undefined || isConfigEnvelope(saved)) {
                             delete candidate[key];
                         } else {
                             candidate[key] = saved;
@@ -1450,13 +1422,15 @@ export abstract class BasePluginRoute<T extends Plugin> {
             }
             if (patch.manifest) {
                 // A kept secret is checked against the new version as a value on the row is below.
-                await this.checkKeptSecrets(existing.manifest, manifest, kept);
+                await this.checkKeptSecrets(existing.uid, existing.manifest, manifest, kept);
             }
             try {
                 patch.settings = validatePluginSettings(manifest, candidate, kept);
             } catch (err: any) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, err.message);
             }
+            // Sealed before anything is written, so a server that can't seal answers 503 with nothing changed.
+            patch.settings = await this.sealSecretSettings(existing.uid, manifest, patch.settings);
         }
         if (dependencyPlan) {
             // A change that plans nothing (the plugin stays or becomes disabled) has no preview to compare against.
@@ -1472,9 +1446,6 @@ export abstract class BasePluginRoute<T extends Plugin> {
                 await this.applyPlan(dependencyPlan, installed, req, user, undo);
             }
             const options = { user, ignoreACL: true };
-            if (patch.settings) {
-                patch.settings = await this.storeSecretSettings(existing.name, manifest, patch.settings, undo);
-            }
             const updated: T = await this.pluginRepo!.update({ uid: existing.uid, version: obj?.version ?? existing.version, ...patch } as any, existing, {
                 ...options,
                 version: obj?.version,
@@ -1500,10 +1471,6 @@ export abstract class BasePluginRoute<T extends Plugin> {
         if (fromUpload && changingVersion) {
             await this.dropUnreferencedBlob(existing.uploadBlobKey);
         }
-        if (patch.settings) {
-            // The secrets replaced, cleared, or of settings the new version no longer declares.
-            await this.releaseSecrets(releasedPluginSecretRefs(existing.settings, patch.settings));
-        }
         return result;
     }
 
@@ -1516,7 +1483,7 @@ export abstract class BasePluginRoute<T extends Plugin> {
         this.assertNoDependents(installed, existing, "uninstalled");
         await this.applyChange(installed, [existing.name], async (undo) => {
             const options = { user, ignoreACL: true };
-            // Uninstalling takes the plugin's secrets with it (spec 5.4): the row keeps none, and adding the plugin again starts from its defaults.
+            // Uninstalling takes the plugin's secrets with it (spec 5.7): the row keeps none, and adding the plugin again starts from its defaults.
             const settings: Record<string, PluginSettingValue> = withoutSecretSettings(existing.settings, existing.manifest);
             const removed: T = await this.pluginRepo!.update(
                 { uid: existing.uid, version: existing.version, enabled: false, removed: true, settings } as any,
@@ -1532,7 +1499,6 @@ export abstract class BasePluginRoute<T extends Plugin> {
             });
             await this.audit(req, user, AuditAction.PLUGIN_REMOVE, existing, { packageVersion: existing.packageVersion });
         });
-        await this.releaseSecrets(releasedPluginSecretRefs(existing.settings, {}));
         await this.dropUnreferencedBlob(existing.uploadBlobKey);
     }
 }

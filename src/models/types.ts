@@ -2241,8 +2241,7 @@ export enum AuditAction {
     /** `PUT /system/dns-providers/:id` - `details` carries the `fields` that changed, the changed `optionKeys` and `credentialsChanged` (whether any
      * credential was set or cleared); never a value of a credential. */
     DNS_PROVIDER_UPDATE = "dns_provider.update",
-    /** `DELETE /system/dns-providers/:id` - `details` carries its `name`, `type` and `secretLeftBehind` when its credentials could not be removed from the
-     * secret store (no store, another backend, or the store failed). */
+    /** `DELETE /system/dns-providers/:id` - `details` carries its `name` and `type`; its encrypted credentials go with the row. */
     DNS_PROVIDER_DELETE = "dns_provider.delete",
     /** `PUT /mail/domains/:id/dns-provider` - a domain was assigned to a DNS provider config or set back to manual. `details` carries `from` and `to` (provider
      * uids, `null` for manual). */
@@ -2268,13 +2267,12 @@ export enum AuditAction {
     /** `PUT /mail/domains/:id/dkim/rotation` - scheduled DKIM rotation was paused or resumed for a domain. `details` carries the domain `name` and
      * `paused`. */
     DKIM_ROTATION_PAUSED = "dkim_rotation.paused",
-    /** An Integrations section was changed. `details` carries the `section`, the changed `keys` and `secretChanged` (and `secretLeftBehind` when a secret
-     * stayed in the store); never a secret. */
+    /** An Integrations section was changed. `details` carries the `section`, the changed `keys` and `secretChanged`; never a secret. */
     INTEGRATION_UPDATE = "integration.update",
-    /** An Integrations section's admin values were reset to the deployment's. `details` carries the `section` and the `keys` that were set (and
-     * `secretLeftBehind` when a secret stayed in the store). */
+    /** An Integrations section's admin values were reset to the deployment's. `details` carries the `section` and the `keys` that were set. */
     INTEGRATION_RESET = "integration.reset",
-    /** A plugin's plaintext secret setting was moved into the secret store. `details` carries the plugin and the setting's key; never its value. */
+    /** A plugin's plaintext secret setting was encrypted in place (`PluginSecretEncryptor`, spec 5.7), or, with `dropped: true`, removed from an uninstalled
+     * plugin's row. `details` carries the plugin and the setting's key; never its value. */
     PLUGIN_SECRET_MIGRATED = "plugin.secret_migrated",
     /** `POST /system/config-keys/rotate` - an elevated administrator started a configuration-key rotation, or marked the running one compromised. `details`
      * carries `compromised`. */
@@ -3623,8 +3621,9 @@ export interface Plugin extends BaseEntity {
     /** The uid of the administrator who uploaded the pack. */
     uploadedByUserUid?: string;
 
-    /** Saved setting values, keyed by `PluginSettingDefinition.key`. A secret setting's value is in the `SecretStore` while the deployment has one, and the
-     * row holds only its reference (`PluginSecretSettingRef`, spec 5.4), which the server's plugin host resolves before loading the settings. */
+    /** Saved setting values, keyed by `PluginSettingDefinition.key`. A secret setting's value is a `ConfigEnvelope` bound to this row and the setting
+     * once the first encryption run has completed (`ConfigKeyState.pluginSecrets.encryptedAt`, spec 5.7) and plaintext before, which the server's plugin host
+     * decrypts before loading the settings. */
     settings: Record<string, PluginSettingValue>;
 
     /** A snapshot of the package's `rapidmx.plugin` block for `version`. */
@@ -3711,36 +3710,8 @@ export interface PublicAppearancePreferences {
     updatedAt: string;
 }
 
-/** Where a secret store keeps credentials: OpenBao KV when the deployment has OpenBao, else Kubernetes Secrets in the release namespace. */
-export type SecretBackend = "openbao" | "kubernetes";
-
-/**
- * Where a secret is, never what it is: the only form in which a credential an administrator saved (a DNS provider's API token, the Giphy key, the plugin
- * registry token, a plugin's secret setting) appears on a row. The value lives in the deployment's `SecretStore`, never in the database, an audit entry or a
- * response - a response shows each of `keys` as the mask (`maskSecretRef()`).
- */
-export interface SecretRef {
-    backend: SecretBackend;
-    /** OpenBao: the KV path under the deployment's integrations prefix. Kubernetes: the key prefix inside the Secret. Namespaced by consumer:
-     * `dns/<provider uid>`, `server/<name>` or `plugins/<package>/<key>`. */
-    path: string;
-    /** The keys present (never their values), so the console can show "set" per field. */
-    keys: string[];
-    /** Bumped on every credentials write: the external-dns Deployment's pod-template annotation and the plugin config-change hash, so a new credential is
-     * picked up without the value ever being compared. */
-    generation: number;
-}
-
-/**
- * What a plugin row holds in place of a secret setting's value once it is in the `SecretStore` (spec 5.4): the reference, never the value. The store keeps the
- * value under `value` (as text), with `type` (`"number"` or `"boolean"`) when the setting isn't text.
- */
-export interface PluginSecretSettingRef {
-    $secretRef: SecretRef;
-}
-
-/** A saved plugin setting: a value the plugin reads as it is, or the reference to a secret setting's value in the `SecretStore`. */
-export type PluginSettingValue = string | number | boolean | PluginSecretSettingRef;
+/** A saved plugin setting: a value the plugin reads as it is, or a secret setting's encrypted value (`ConfigEnvelope`, spec 5.7). */
+export type PluginSettingValue = string | number | boolean | ConfigEnvelope;
 
 /** The sections of the admin console's Integrations (`BaseIntegrationsRoute`, `system/integrations`), each overriding some of the deployment's config keys. */
 export type IntegrationSectionName = "giphy" | "stun" | "signingCa" | "dnsResolver" | "pluginRegistry";

@@ -79,7 +79,7 @@ export class PluginSQL extends BaseEntity implements Plugin {
     public uploadedByUserUid?: string;
 
     @Column({ type: "simple-json" })
-    @Description("Saved setting values, keyed by config key; a secret setting as its secret store reference ({ \"$secretRef\": ... }) while the deployment has a store.")
+    @Description("Saved setting values, keyed by config key; a secret setting as an encrypted envelope once the deployment has encrypted them.")
     public settings: Record<string, PluginSettingValue> = {};
 
     @Column({ type: "simple-json" })

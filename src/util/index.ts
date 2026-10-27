@@ -63,7 +63,7 @@ export * from "./MessageListUtils.js";
 export * from "./MessagePurgeUtils.js";
 export * from "./MimeHeaderUtils.js";
 export * from "./OofUtils.js";
-export * from "./PluginSecretMigrator.js";
+export * from "./PluginSecretEncryptor.js";
 export * from "./RecipientUtils.js";
 export * from "./RecoverableRepoUtils.js";
 export * from "./RequestBodyUtils.js";

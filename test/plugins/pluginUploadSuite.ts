@@ -15,8 +15,10 @@ import {
     computePluginStateHash,
     packIntegrity,
     PLUGIN_API_VERSION,
+    pluginSecretContext,
     pluginUploadBlobKey,
 } from "../../src/plugins/PluginUtils.js";
+import { isConfigEnvelope } from "../../src/secrets/ConfigCipher.js";
 import { InMemoryBlobStore } from "../testDoubles.js";
 import { publishedHashes, publishFakePackage, registryReads, resetPluginTestDoubles } from "./pluginTestDoubles.js";
 import { PluginRouteSuiteContext } from "./pluginRouteSuite.js";
@@ -86,7 +88,6 @@ export function pluginUploadSuite(ctx: PluginUploadSuiteContext): void {
 
         beforeEach(async () => {
             await ctx.clear();
-            ctx.store().reset();
             resetPluginTestDoubles();
             publishFakePackage("@rapidmx/activesync", "1.0.0", { plugin: EAS_MANIFEST });
             user = { uid: uuid.v4(), roles: [], elevated: Date.now() };
@@ -193,6 +194,8 @@ export function pluginUploadSuite(ctx: PluginUploadSuiteContext): void {
             });
 
             it("replaces an uploaded plugin keeping its settings and enabled flag, and deletes the old pack", async () => {
+                // Once the encryption run has completed, the secret setting is an envelope in the row.
+                await ctx.setEncrypted(true);
                 const v1 = pack("1.0.0");
                 const created = await upload(v1);
                 const saved = await asAdmin(request(ctx.app()).put(`${ctx.baseUrl}/${created.body.uid}`)).send({
@@ -201,7 +204,8 @@ export function pluginUploadSuite(ctx: PluginUploadSuiteContext): void {
                 });
                 expect(saved.status).toBe(200);
                 const savedSecret = (await ctx.rows())[0].settings["mail:crm:api_key"];
-                expect(savedSecret.$secretRef.path).toMatch(/^plugins\/acme\/crm-plugin\/mail_crm_api_key-[0-9a-f]{16}$/);
+                expect(isConfigEnvelope(savedSecret)).toBe(true);
+                expect(ctx.cipher().decrypt(savedSecret, pluginSecretContext(created.body.uid, "mail:crm:api_key"))).toBe("hunter2");
                 publishedHashes.length = 0;
 
                 const v2 = pack("1.1.0", {
@@ -224,10 +228,10 @@ export function pluginUploadSuite(ctx: PluginUploadSuiteContext): void {
                 });
                 expect(JSON.stringify(replaced.body)).not.toContain("hunter2");
 
-                // The secret's reference is carried over as it is (spec 5.4): the value stays in the store, at the same path.
+                // The secret's envelope is carried over as it is (spec 5.7): it is bound to the row's uid, which a replacement keeps.
                 const [row] = await ctx.rows();
                 expect(row.settings["mail:crm:api_key"]).toEqual(savedSecret);
-                expect(ctx.store().secrets.get(savedSecret.$secretRef.path)).toEqual({ value: "hunter2" });
+                expect(ctx.cipher().decrypt(savedSecret, pluginSecretContext(created.body.uid, "mail:crm:api_key"))).toBe("hunter2");
                 expect(row.uploadBlobKey).toBe(pluginUploadBlobKey(v2));
                 expect(await ctx.blobStore().exists(pluginUploadBlobKey(v1))).toBe(false);
                 expect(await ctx.blobStore().exists(pluginUploadBlobKey(v2))).toBe(true);
@@ -239,6 +243,7 @@ export function pluginUploadSuite(ctx: PluginUploadSuiteContext): void {
             });
 
             it("checks a carried secret against the replacement's manifest, keeping it over a host-named default and refusing a value it no longer takes", async () => {
+                await ctx.setEncrypted(true);
                 const created = await upload(pack("1.0.0"));
                 expect((await asAdmin(request(ctx.app()).put(`${ctx.baseUrl}/${created.body.uid}`)).send({ settings: { "mail:crm:api_key": "hunter2" } })).status).toBe(200);
                 const savedSecret = (await ctx.rows())[0].settings["mail:crm:api_key"];
@@ -260,7 +265,7 @@ export function pluginUploadSuite(ctx: PluginUploadSuiteContext): void {
                 const [row] = await ctx.rows();
                 expect(row.packageVersion).toBe("1.1.0");
                 expect(row.settings["mail:crm:api_key"]).toEqual(savedSecret);
-                expect(ctx.store().secrets.get(savedSecret.$secretRef.path)).toEqual({ value: "hunter2" });
+                expect(ctx.cipher().decrypt(savedSecret, pluginSecretContext(created.body.uid, "mail:crm:api_key"))).toBe("hunter2");
                 expect(await ctx.blobStore().exists(pluginUploadBlobKey(retyped))).toBe(false);
             });
 

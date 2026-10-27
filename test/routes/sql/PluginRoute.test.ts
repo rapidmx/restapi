@@ -11,8 +11,11 @@ import { ConnectionManager, isSqlDataSource, ObjectFactory, Server } from "@rapi
 import { Logger } from "@rapidrest/core";
 import { Repository } from "typeorm";
 import { AuditLogEntrySQL } from "../../../src/models/sql/AuditLogEntrySQL.js";
+import { ConfigKeyStateSQL } from "../../../src/models/sql/ConfigKeyStateSQL.js";
 import { PluginSQL } from "../../../src/models/sql/PluginSQL.js";
-import { InMemoryBlobStore, InMemorySecretStore, registerTestDoubles } from "../../testDoubles.js";
+import type { ConfigCipher } from "../../../src/secrets/ConfigCipher.js";
+import { CONFIG_KEY_STATE_UID } from "../../../src/secrets/ConfigKeyring.js";
+import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
 import { pluginRouteSuite } from "../../plugins/pluginRouteSuite.js";
 import { pluginUploadSuite, UPLOAD_TEST_MAX_BYTES } from "../../plugins/pluginUploadSuite.js";
 
@@ -22,6 +25,7 @@ describe("Route:PluginSQL Tests", () => {
     const server: Server = new Server({ config, basePath: "./test/server-sql", logger, objectFactory });
     let pluginRepo: Repository<PluginSQL>;
     let auditLogRepo: Repository<AuditLogEntrySQL>;
+    let stateRepo: Repository<ConfigKeyStateSQL>;
 
     beforeAll(async () => {
         registerTestDoubles(objectFactory);
@@ -32,6 +36,7 @@ describe("Route:PluginSQL Tests", () => {
         }
         pluginRepo = conn.getRepository(PluginSQL);
         auditLogRepo = conn.getRepository(AuditLogEntrySQL);
+        stateRepo = conn.getRepository(ConfigKeyStateSQL);
     });
 
     afterAll(async () => {
@@ -39,13 +44,14 @@ describe("Route:PluginSQL Tests", () => {
         await objectFactory.destroy();
     });
 
-    const context = {
+    const context: any = {
         config,
         app: () => server.getApplication(),
         baseUrl: "/sql/plugins",
         clear: async () => {
             await pluginRepo.clear();
             await auditLogRepo.clear();
+            await stateRepo.clear();
         },
         auditActions: async () => (await auditLogRepo.find()).map((entry) => entry.action),
         insertPlugin: async (fields) => {
@@ -58,7 +64,13 @@ describe("Route:PluginSQL Tests", () => {
         updatePlugin: async (uid, fields) => {
             await pluginRepo.update({ uid }, fields);
         },
-        store: () => objectFactory.getInstance<InMemorySecretStore>("SecretStore")!,
+        cipher: () => objectFactory.getInstance<ConfigCipher>("ConfigCipher")!,
+        setEncrypted: async (encrypted: boolean) => {
+            await stateRepo.delete({ uid: CONFIG_KEY_STATE_UID });
+            if (encrypted) {
+                await stateRepo.save(new ConfigKeyStateSQL({ uid: CONFIG_KEY_STATE_UID, pluginSecrets: { encryptedAt: new Date(), waitingForRollout: false } } as any));
+            }
+        },
     };
 
     pluginRouteSuite(context);

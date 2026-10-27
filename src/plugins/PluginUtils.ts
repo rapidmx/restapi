@@ -5,14 +5,15 @@
 import crypto from "crypto";
 import semver from "semver";
 import {
+    ConfigEnvelope,
     Plugin,
     PluginConfiguredSetting,
     PluginManifest,
-    PluginSecretSettingRef,
     PluginSettingDefinition,
     PluginSettingValue,
     PluginUi,
 } from "../models/types.js";
+import { ConfigSecretUnavailableError, isConfigEnvelope, type ConfigCipher, type ConfigCipherContext } from "../secrets/ConfigCipher.js";
 import { parsePluginUi } from "./PluginUiUtils.js";
 
 /** The plugin contract version this library implements. A plugin whose manifest declares any other
@@ -523,7 +524,7 @@ export function isSecretSettingKey(key: string): boolean {
     return words.some((word, i) => SECRET_WORD.test(word) || (SECRET_PAIRS[word]?.has(words[i + 1]) ?? false));
 }
 
-/** Whether a setting is a secret, whose saved value is never sent to the browser and is kept in the `SecretStore` while the deployment has one: its key
+/** Whether a setting is a secret, whose saved value is never sent to the browser and is encrypted in the plugin's row (spec 5.7): its key
  * names one (`isSecretSettingKey()`), or the plugin's manifest says so (`secret: true`, or a `password` type) - the manifest is the plugin's own word for
  * it, which a key like `private_key` or `dsn` can't give. */
 export function isSecretSetting(key: string, manifest?: Pick<PluginManifest, "settings">): boolean {
@@ -534,26 +535,53 @@ export function isSecretSetting(key: string, manifest?: Pick<PluginManifest, "se
     return definition?.secret === true || (definition?.type as string | undefined) === "password";
 }
 
-/** The one key of what a plugin row holds in place of a secret setting's value (`PluginSecretSettingRef`, spec 5.4). */
-export const PLUGIN_SECRET_REF_KEY = "$secretRef";
+/** The record type every envelope of a plugin row names in its associated data (spec 5.2). */
+export const PLUGIN_SECRET_RECORD = "Plugin";
 
-/** Whether `value` is exactly a secret setting's reference: an object whose only key is `$secretRef`, holding a whole `SecretRef`. Nothing a client sends
- * is ever taken as one (`validatePluginSettings()` refuses an object), so no setting can be pointed at another secret. */
-export function isPluginSecretRef(value: unknown): value is PluginSecretSettingRef {
-    if (typeof value !== "object" || value === null || Array.isArray(value) || Object.keys(value).length !== 1) {
-        return false;
+/** The field path a plugin secret setting's envelope is bound to: `settings.<key>`. */
+export function pluginSecretField(key: string): string {
+    return `settings.${key}`;
+}
+
+/** What an envelope of setting `key` of the plugin row `uid` is bound to, so an envelope copied to another plugin or setting (or another record) doesn't open. */
+export function pluginSecretContext(uid: string, key: string): ConfigCipherContext {
+    return { record: PLUGIN_SECRET_RECORD, uid, field: pluginSecretField(key) };
+}
+
+/** The settings the plugin host puts into the server's `plugins` config layer, and the keys whose secret couldn't be read. */
+export interface ResolvedPluginSettings {
+    /** Every setting as the plugin reads it, envelopes decrypted: never persisted, logged or answered. */
+    values: Record<string, string | number | boolean>;
+    /** The settings whose envelope couldn't be decrypted (a key that isn't in the ring, an envelope from another row, no cipher): left out, so the
+     * deployment's value or the plugin's default applies, for the caller to warn about (the key, never the value). */
+    unresolved: string[];
+}
+
+/**
+ * A plugin row's settings as its plugin reads them (spec 5.7): what the server's plugin host loads into the `plugins` config layer, so plugins see no change.
+ * Each envelope is decrypted for its row and setting; a plaintext value (before the encryption run) is used as it is; an envelope that can't be decrypted - or
+ * any, without a `cipher` - is left out and named in `unresolved`. No value ever appears in an error.
+ */
+export function resolvePluginSettings(plugin: Pick<Plugin, "uid" | "settings">, cipher?: Pick<ConfigCipher, "decrypt">): ResolvedPluginSettings {
+    const result: ResolvedPluginSettings = { values: {}, unresolved: [] };
+    for (const [key, value] of Object.entries(plugin.settings ?? {})) {
+        if (!isConfigEnvelope(value)) {
+            result.values[key] = value;
+            continue;
+        }
+        try {
+            if (cipher) {
+                result.values[key] = cipher.decrypt(value, pluginSecretContext(plugin.uid, key));
+                continue;
+            }
+        } catch (err) {
+            if (!(err instanceof ConfigSecretUnavailableError)) {
+                throw err;
+            }
+        }
+        result.unresolved.push(key);
     }
-    const ref: any = (value as any)[PLUGIN_SECRET_REF_KEY];
-    return (
-        typeof ref === "object" &&
-        ref !== null &&
-        (ref.backend === "openbao" || ref.backend === "kubernetes") &&
-        typeof ref.path === "string" &&
-        ref.path !== "" &&
-        Array.isArray(ref.keys) &&
-        ref.keys.every((key: unknown) => typeof key === "string") &&
-        typeof ref.generation === "number"
-    );
+    return result;
 }
 
 /** What a config store holds for `key`: nothing for an unset value, an empty one (which nothing treats as set) or one that
@@ -599,13 +627,13 @@ export function configuredPluginSettings(config: any, manifest: PluginManifest):
  * `Error` whose message names the first invalid setting. A `null` value removes a saved value so the
  * plugin's own default applies.
  *
- * `kept` are the secret references the row already holds for settings the caller keeps (sent back as the mask, or carried to a new version): they are
- * kept as they are and count as values. Only the caller can name them - a reference sent in `values` is an object, which no setting takes.
+ * `kept` are the envelopes the row already holds for secret settings the caller keeps (sent back as the mask, or carried to a new version): they are
+ * kept as they are and count as values. Only the caller can name them - an envelope sent in `values` is an object, which no setting takes.
  */
 export function validatePluginSettings(
     manifest: PluginManifest,
     values: Record<string, unknown>,
-    kept: Record<string, PluginSecretSettingRef> = {},
+    kept: Record<string, ConfigEnvelope> = {},
 ): Record<string, PluginSettingValue> {
     const definitions: Map<string, PluginSettingDefinition> = new Map((manifest.settings ?? []).map((s) => [s.key, s]));
     const result: Record<string, PluginSettingValue> = {};
@@ -668,30 +696,39 @@ function checkSettingValue(definition: PluginSettingDefinition, value: unknown):
     }
 }
 
+/** `plugin`'s settings as its plugin reads them (each secret's envelope decrypted), as sorted `[key, value]` pairs. */
+function settingPairs(plugin: { uid?: string; settings: Record<string, PluginSettingValue> }, cipher?: Pick<ConfigCipher, "decrypt">): unknown[][] {
+    const settings: Record<string, PluginSettingValue> = plugin.settings ?? {};
+    const values: Record<string, unknown> = Object.values(settings).some(isConfigEnvelope) ? resolvePluginSettings({ uid: plugin.uid ?? "", settings }, cipher).values : settings;
+    return Object.keys(values)
+        .sort()
+        .map((key) => [key, values[key]]);
+}
+
 /**
  * A stable fingerprint of what a server copy should have loaded: every enabled plugin's name, version, recorded
  * integrity and settings, independent of row order and key order. Two copies with the same hash loaded the same
  * plugins with the same settings, so a change message whose hash matches a copy's own is a no-op for it. An unset
  * integrity (`undefined`, or `null` as SQL reads it back) hashes the same. An uploaded plugin (`source: "upload"`, whose
  * integrity is the hash of the pack) also counts that it was uploaded; a registry plugin's entry is exactly what it was before
- * uploads existed, so the hash of a deployment without them doesn't change. A secret setting held in the `SecretStore` counts by its reference (backend,
- * path and generation, spec 5.4), never its value: a new value is written to a new path, so the plugins reload with it, and a kept one changes nothing.
+ * uploads existed, so the hash of a deployment without them doesn't change. A secret setting counts by its decrypted value (`resolvePluginSettings()`, spec
+ * 5.7, decided by JP), as every setting did before secrets were encrypted: a new value reloads the plugins, while the encryption run and the rotation's
+ * re-encryption, which leave the plaintext unchanged, don't. A secret that can't be decrypted (or any envelope, without a `cipher`) is left out, as the
+ * plugin host leaves it out of the settings it loads, so every server copy hashes what it loads.
+ *
+ * @param cipher Decrypts the envelopes of the rows' secret settings.
  */
 export function computePluginStateHash(
-    plugins: (Pick<Plugin, "name" | "packageVersion" | "enabled" | "settings"> & { integrity?: string | null; source?: string | null })[],
+    plugins: (Pick<Plugin, "name" | "packageVersion" | "enabled" | "settings"> & { uid?: string; integrity?: string | null; source?: string | null })[],
+    cipher?: Pick<ConfigCipher, "decrypt">,
 ): string {
-    // Listed rather than hashed as stored, so the order a database gives the reference's fields in can't change the hash.
-    const settingForHash = (value: unknown): unknown =>
-        isPluginSecretRef(value) ? [PLUGIN_SECRET_REF_KEY, value.$secretRef.backend, value.$secretRef.path, value.$secretRef.generation] : value;
     const normalized = plugins
         .filter((plugin) => plugin.enabled)
         .map((plugin) => [
             plugin.name,
             plugin.packageVersion,
             plugin.integrity ?? null,
-            Object.keys(plugin.settings ?? {})
-                .sort()
-                .map((key) => [key, settingForHash(plugin.settings[key])]),
+            settingPairs(plugin, cipher),
             ...(plugin.source === "upload" ? ["upload"] : []),
         ])
         .sort((a, b) => String(a[0]).localeCompare(String(b[0])));

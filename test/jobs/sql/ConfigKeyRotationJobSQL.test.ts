@@ -85,6 +85,7 @@ describe("ConfigKeyRotationJobSQL Tests (real DB + DI)", () => {
         expect(job.sources.list().map((source: any) => [source.record, source.modelClass])).toEqual([
             ["DnsProvider", DnsProviderSQL],
             ["IntegrationSettings", IntegrationSettingsSQL],
+            ["Plugin", PluginSQL],
         ]);
         await job.dispose();
     });

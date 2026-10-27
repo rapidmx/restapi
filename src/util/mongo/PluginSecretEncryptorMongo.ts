@@ -3,10 +3,13 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { AuditLogEntryMongo } from "../../models/mongo/AuditLogEntryMongo.js";
+import { ConfigKeyStateMongo } from "../../models/mongo/ConfigKeyStateMongo.js";
 import { PluginMongo } from "../../models/mongo/PluginMongo.js";
-import { PluginSecretMigrator } from "../PluginSecretMigrator.js";
+import { PluginSecretEncryptor } from "../PluginSecretEncryptor.js";
 
-export class PluginSecretMigratorMongo extends PluginSecretMigrator<PluginMongo> {
+/** The `PluginSecretEncryptor` for a MongoDB deployment. */
+export class PluginSecretEncryptorMongo extends PluginSecretEncryptor<PluginMongo, ConfigKeyStateMongo> {
     protected pluginClass: any = PluginMongo;
     protected auditLogClass: any = AuditLogEntryMongo;
+    protected configKeyStateClass: any = ConfigKeyStateMongo;
 }

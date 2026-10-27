@@ -5,13 +5,14 @@
 // The Plugin route's HTTP behaviour, identical on both backends - `test/routes/{mongo,sql}/PluginRoute.test.ts`
 // each supply a started server and a way to read audit log rows.
 import { request } from "@rapidrest/service-core/test";
-import { JWTUtils } from "@rapidrest/core";
+import { ApiError, JWTUtils } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { AuditAction } from "../../src/models/types.js";
 import { BasePluginRoute } from "../../src/routes/BasePluginRoute.js";
-import { computePluginStateHash, isPluginSecretRef, PLUGIN_API_VERSION } from "../../src/plugins/PluginUtils.js";
+import { computePluginStateHash, PLUGIN_API_VERSION, pluginSecretContext } from "../../src/plugins/PluginUtils.js";
+import { ApiErrors } from "@rapidrest/service-core";
+import { type ConfigCipher, isConfigEnvelope } from "../../src/secrets/ConfigCipher.js";
 import { RegistryRequestError } from "../../src/plugins/NpmRegistryClient.js";
-import { InMemorySecretStore } from "../testDoubles.js";
 import {
     brokenPackages,
     extraSearchResults,
@@ -40,8 +41,10 @@ export interface PluginRouteSuiteContext {
     bumpVersion: (uid: string) => Promise<void>;
     /** Changes a row's fields directly, as a concurrent request would. */
     updatePlugin: (uid: string, fields: Record<string, unknown>) => Promise<void>;
-    /** The `SecretStore` the server registered (the test double), reset before each test. */
-    store: () => InMemorySecretStore;
+    /** The `ConfigCipher` the server registered, which opens the envelopes the route saved. */
+    cipher: () => ConfigCipher;
+    /** Sets or clears `ConfigKeyState.pluginSecrets.encryptedAt`: whether the first encryption run has completed, so saves encrypt (spec 5.7). `clear` removes it. */
+    setEncrypted: (encrypted: boolean) => Promise<void>;
 }
 
 const EAS_MANIFEST = {
@@ -76,7 +79,6 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
 
     beforeEach(async () => {
         await ctx.clear();
-        ctx.store().reset();
         resetPluginTestDoubles();
         publishFakePackage("@rapidmx/activesync", "1.0.0", { plugin: EAS_MANIFEST });
         publishFakePackage("@rapidmx/activesync", "1.1.0", {
@@ -589,10 +591,9 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             ],
         };
 
-        it("never returns the value of a secret-named setting, and keeps the stored one when the placeholder is sent back (no secret store: on the row, as before)", async () => {
-            // A deployment without a secret store keeps a secret setting on the row, as it always has, until a store is registered and the migration
-            // moves it (spec 5.4).
-            ctx.store().backend = "none";
+        it("never returns the value of a secret-named setting, and keeps the stored one when the placeholder is sent back (before the first encryption run it is on the row, as before)", async () => {
+            // Until the encryption run has completed, a pod of the previous release may still be running and would hand a plugin an envelope as a setting's
+            // value, so a secret setting is saved in plaintext as it always was (spec 5.7).
             publishFakePackage("@rapidmx/secretive", "1.0.0", { plugin: SECRET_MANIFEST });
             const added = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name: "@rapidmx/secretive" });
             expect(added.status).toBe(200);
@@ -623,7 +624,6 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             expect(cleared.status).toBe(200);
             expect(cleared.body.settings["mail:x:api_key"]).toBeUndefined();
             expect(await storedKey()).toBeUndefined();
-            expect(ctx.store().secrets.size).toBe(0);
         });
 
         it("refuses a manifest that declares a setting in the server's own configuration, and a saved setting named in it, whichever way the namespace is spelled", async () => {
@@ -1218,6 +1218,7 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
         });
 
         it("a setting the manifest marks secret is masked whatever its key is called", async () => {
+            await ctx.setEncrypted(true);
             publishFakePackage("@rapidmx/vaulted", "1.0.0", {
                 plugin: {
                     apiVersion: PLUGIN_API_VERSION,
@@ -1235,10 +1236,10 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             expect(saved.body.settings["mail:v:private_key"]).toEqual({ secret: true });
             const list = await asAdmin(request(ctx.app()).get(ctx.baseUrl));
             expect(JSON.stringify(list.body)).not.toContain("hunter2");
-            // The value is in the secret store; the row holds its reference.
+            // Once the encryption run has completed the row holds an envelope, bound to the row and the setting.
             const stored = (await ctx.rows())[0].settings["mail:v:private_key"];
-            expect(isPluginSecretRef(stored)).toBe(true);
-            expect(ctx.store().secrets.get(stored.$secretRef.path)).toEqual({ value: "hunter2" });
+            expect(isConfigEnvelope(stored)).toBe(true);
+            expect(ctx.cipher().decrypt(stored, pluginSecretContext(added.body.plugin.uid, "mail:v:private_key"))).toBe("hunter2");
             // The placeholder the console sends back keeps the saved value.
             const kept = await asAdmin(request(ctx.app()).put(`${ctx.baseUrl}/${added.body.plugin.uid}`)).send({ settings: { "mail:v:private_key": { secret: true }, "mail:v:note": "changed" } });
             expect(kept.status).toBe(200);
@@ -1246,7 +1247,7 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
         });
     });
 
-    describe("secret settings in the secret store (spec 5.4)", () => {
+    describe("secret settings encrypted in the plugin's row (spec 5.7)", () => {
         const VAULT_MANIFEST = {
             apiVersion: PLUGIN_API_VERSION,
             displayName: "Vault",
@@ -1260,7 +1261,12 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
         const NAME = "@rapidmx/vault";
         const row = async (): Promise<any> => (await ctx.rows()).find((plugin) => plugin.name === NAME);
         const put = (uid: string, body: any) => asAdmin(request(ctx.app()).put(`${ctx.baseUrl}/${uid}`)).send(body);
-        const valueAt = (ref: any): Record<string, string> | undefined => ctx.store().secrets.get(ref.$secretRef.path);
+        /** What the envelope of `key` on the row `uid` holds. */
+        const open = (uid: string, key: string, envelope: any) => ctx.cipher().decrypt(envelope, pluginSecretContext(uid, key));
+
+        beforeEach(async () => {
+            await ctx.setEncrypted(true);
+        });
 
         async function addVault(): Promise<string> {
             publishFakePackage(NAME, "1.0.0", { plugin: VAULT_MANIFEST });
@@ -1269,15 +1275,15 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             return added.body.plugin.uid;
         }
 
-        /** What no response may carry: a value, or where it is stored. */
+        /** What no response may carry: a value, or ciphertext. */
         function expectNothingSecret(body: unknown): void {
             const text: string = JSON.stringify(body);
-            for (const leak of ["s3cr3t", "hunter2", "4321", "$secretRef", "plugins/"]) {
+            for (const leak of ["s3cr3t", "hunter2", "4321", "$enc", '"ct"', '"tag"']) {
                 expect(text).not.toContain(leak);
             }
         }
 
-        it("saves a secret setting's value in the store and only its reference on the row; responses show the mask", async () => {
+        it("saves a secret setting's value as an envelope in the row, bound to the row and setting; responses show the mask", async () => {
             const uid: string = await addVault();
             const saved = await put(uid, { settings: { "mail:v:api_key": "  s3cr3t\n", "mail:v:pin": 4321, "mail:v:note": "hi" } });
             expect(saved.status).toBe(200);
@@ -1286,22 +1292,19 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             expectNothingSecret((await asAdmin(request(ctx.app()).get(ctx.baseUrl))).body);
 
             const settings = (await row()).settings;
-            expect(isPluginSecretRef(settings["mail:v:api_key"])).toBe(true);
-            expect(settings["mail:v:api_key"].$secretRef).toEqual({
-                backend: "openbao",
-                path: expect.stringMatching(/^plugins\/rapidmx\/vault\/mail_v_api_key-[0-9a-f]{16}$/),
-                keys: ["value"],
-                generation: 1,
-            });
-            // The value is stored exactly as saved: a plugin setting is the plugin's to read, so nothing is trimmed.
-            expect(valueAt(settings["mail:v:api_key"])).toEqual({ value: "  s3cr3t\n" });
-            expect(valueAt(settings["mail:v:pin"])).toEqual({ value: "4321", type: "number" });
+            expect(isConfigEnvelope(settings["mail:v:api_key"])).toBe(true);
+            expect(isConfigEnvelope(settings["mail:v:pin"])).toBe(true);
+            // The value is sealed exactly as saved: a plugin setting is the plugin's to read, so nothing is trimmed, and a number stays a number.
+            expect(open(uid, "mail:v:api_key", settings["mail:v:api_key"])).toBe("  s3cr3t\n");
+            expect(open(uid, "mail:v:pin", settings["mail:v:pin"])).toBe(4321);
             expect(settings["mail:v:note"]).toBe("hi");
-            expect(ctx.store().secrets.size).toBe(2);
-            expect(JSON.stringify(settings)).not.toContain("s3cr3t");
+            // Moved to another plugin's row or another setting, an envelope no longer opens.
+            expect(() => open("another-row", "mail:v:api_key", settings["mail:v:api_key"])).toThrow();
+            expect(() => open(uid, "mail:v:pin", settings["mail:v:api_key"])).toThrow();
+            expect(JSON.stringify(await ctx.rows())).not.toContain("s3cr3t");
         });
 
-        it("keeps the reference when the mask is sent back, writes a replaced value to a new path and removes the old one, and removes a cleared one", async () => {
+        it("keeps the envelope when the mask is sent back, seals a replaced value anew, and removes a cleared one", async () => {
             const uid: string = await addVault();
             expect((await put(uid, { settings: { "mail:v:api_key": "s3cr3t", "mail:v:note": "hi" } })).status).toBe(200);
             const first = (await row()).settings["mail:v:api_key"];
@@ -1309,61 +1312,90 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
 
             expect((await put(uid, { settings: { "mail:v:api_key": { secret: true }, "mail:v:note": "hi" } })).status).toBe(200);
             expect((await row()).settings["mail:v:api_key"]).toEqual(first);
-            // A kept reference is the same plugin state: nothing restarts for it.
+            // A kept envelope is the same plugin state: nothing restarts for it.
             expect(publishedHashes[publishedHashes.length - 1]).toBe(hash);
 
             expect((await put(uid, { settings: { "mail:v:api_key": "hunter2", "mail:v:note": "hi" } })).status).toBe(200);
             const second = (await row()).settings["mail:v:api_key"];
-            expect(second.$secretRef.path).not.toBe(first.$secretRef.path);
-            expect(valueAt(second)).toEqual({ value: "hunter2" });
-            expect(valueAt(first)).toBeUndefined();
-            // A new value is a new plugin state (by its reference, never its value), so the plugins reload with it.
+            expect(second).not.toEqual(first);
+            expect(open(uid, "mail:v:api_key", second)).toBe("hunter2");
+            // A new value is a new plugin state (by its decrypted value), so the plugins reload with it.
             expect(publishedHashes[publishedHashes.length - 1]).not.toBe(hash);
+
+            // The same value saved again is a new envelope and the same plugin state: nothing restarts for it.
+            const sameHash: string = publishedHashes[publishedHashes.length - 1];
+            expect((await put(uid, { settings: { "mail:v:api_key": "hunter2", "mail:v:note": "hi" } })).status).toBe(200);
+            expect((await row()).settings["mail:v:api_key"]).not.toEqual(second);
+            expect(publishedHashes[publishedHashes.length - 1]).toBe(sameHash);
 
             const cleared = await put(uid, { settings: { "mail:v:api_key": null, "mail:v:note": "hi" } });
             expect(cleared.status).toBe(200);
             expect(cleared.body.settings).toEqual({ "mail:v:note": "hi" });
             expect((await row()).settings["mail:v:api_key"]).toBeUndefined();
-            expect(ctx.store().secrets.size).toBe(0);
         });
 
-        it("a change that can't be saved leaves the secret in use untouched and removes the one it wrote", async () => {
+        it("counts a secret by its decrypted value in the hash it publishes and reports", async () => {
+            const uid: string = await addVault();
+            expect((await put(uid, { settings: { "mail:v:api_key": "s3cr3t" } })).status).toBe(200);
+            const rows = await ctx.rows();
+            expect(publishedHashes[publishedHashes.length - 1]).toBe(computePluginStateHash(rows, ctx.cipher()));
+            // Not the hash of the ciphertext.
+            expect(publishedHashes[publishedHashes.length - 1]).not.toBe(computePluginStateHash(rows));
+            const status = await asAdmin(request(ctx.app()).get(`${ctx.baseUrl}/status`));
+            expect(status.body.hash).toBe(computePluginStateHash(rows, ctx.cipher()));
+        });
+
+        it("saves in plaintext until the first encryption run has completed, then encrypts, and the next save encrypts what an older row still holds", async () => {
+            await ctx.setEncrypted(false);
+            const uid: string = await addVault();
+            expect((await put(uid, { settings: { "mail:v:api_key": "s3cr3t", "mail:v:pin": 4321 } })).status).toBe(200);
+            expect((await row()).settings).toEqual({ "mail:v:api_key": "s3cr3t", "mail:v:pin": 4321 });
+
+            await ctx.setEncrypted(true);
+            // The mask stands for the saved plaintext value, which is sealed now.
+            const saved = await put(uid, { settings: { "mail:v:api_key": { secret: true }, "mail:v:pin": { secret: true }, "mail:v:note": "changed" } });
+            expect(saved.status).toBe(200);
+            expectNothingSecret(saved.body);
+            const settings = (await row()).settings;
+            expect(open(uid, "mail:v:api_key", settings["mail:v:api_key"])).toBe("s3cr3t");
+            expect(open(uid, "mail:v:pin", settings["mail:v:pin"])).toBe(4321);
+        });
+
+        it("a change that can't be saved leaves the row as it was", async () => {
             const uid: string = await addVault();
             expect((await put(uid, { settings: { "mail:v:api_key": "s3cr3t" } })).status).toBe(200);
             const before = await row();
-            const inUse = before.settings["mail:v:api_key"];
 
-            // Another change lands while the new value is being stored: this one loses the optimistic lock.
-            ctx.store().duringChange = async () => {
-                await ctx.bumpVersion(uid);
-            };
-            const lost = await put(uid, { settings: { "mail:v:api_key": "hunter2" } });
-            expect(lost.status).toBe(409);
-            expect((await row()).settings).toEqual(before.settings);
-            expect([...ctx.store().secrets.keys()]).toEqual([inUse.$secretRef.path]);
-            expect(valueAt(inUse)).toEqual({ value: "s3cr3t" });
-
-            // A stale version is refused the same way.
-            const stale = await put(uid, { version: 0, settings: { "mail:v:api_key": "hunter2" } });
+            // Another change lands first: this one loses the optimistic lock.
+            await ctx.bumpVersion(uid);
+            const stale = await put(uid, { version: before.version, settings: { "mail:v:api_key": "hunter2" } });
             expect(stale.status).toBe(409);
-            expect([...ctx.store().secrets.keys()]).toEqual([inUse.$secretRef.path]);
-        });
-
-        it("a store that can't save refuses the change and changes nothing", async () => {
-            const uid: string = await addVault();
-            const before = await row();
-            ctx.store().refuse = true;
-            const refused = await put(uid, { settings: { "mail:v:api_key": "s3cr3t", "mail:v:pin": 1 } });
-            expect(refused.status).toBe(400);
-            expectNothingSecret(refused.body);
+            expectNothingSecret(stale.body);
             expect((await row()).settings).toEqual(before.settings);
-            expect(ctx.store().secrets.size).toBe(0);
         });
 
-        it("refuses a reference sent as a setting's value, so no setting can be pointed at another secret", async () => {
+        it("answers 503 without changing anything when a secret can't be sealed because the server has no keyring", async () => {
             const uid: string = await addVault();
-            ctx.store().secrets.set("dns/cloudflare-1", { apiToken: "dns-token" });
-            const forged = { $secretRef: { backend: "openbao", path: "dns/cloudflare-1", keys: ["apiToken"], generation: 1 } };
+            const encrypt = vi.spyOn(ctx.cipher(), "encrypt").mockImplementation(() => {
+                throw new ApiError(ApiErrors.INTERNAL_ERROR, 503, "No configuration keyring is loaded, so secrets can't be saved.");
+            });
+            try {
+                const refused = await put(uid, { settings: { "mail:v:api_key": "s3cr3t", "mail:v:note": "hi" } });
+                expect(refused.status).toBe(503);
+                expectNothingSecret(refused.body);
+                expect((await row()).settings).toEqual({});
+                // A change with no secret in it needs no keyring.
+                expect((await put(uid, { settings: { "mail:v:note": "hi" } })).status).toBe(200);
+            } finally {
+                encrypt.mockRestore();
+            }
+            expect((await row()).settings).toEqual({ "mail:v:note": "hi" });
+        });
+
+        it("refuses an envelope sent as a setting's value, so no setting can be pointed at another secret", async () => {
+            const uid: string = await addVault();
+            // A genuine envelope of another record: a DNS credential, say, copied out of the database.
+            const forged = ctx.cipher().encrypt("dns-token", { record: "DnsProvider", uid: "cloudflare-1", field: "credentials.apiToken" });
             for (const settings of [{ "mail:v:api_key": forged }, { "mail:v:pin": forged }, { "mail:v:note": forged }]) {
                 const refused = await put(uid, { settings });
                 expect(refused.status, JSON.stringify(settings)).toBe(400);
@@ -1371,24 +1403,7 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             expect((await row()).settings).toEqual({});
         });
 
-        it("moves a secret an older row still holds in plaintext into the store on the next save of its settings", async () => {
-            await ctx.insertPlugin({
-                name: NAME,
-                packageVersion: "1.0.0",
-                enabled: true,
-                removed: false,
-                settings: { "mail:v:api_key": "s3cr3t", "mail:v:note": "hi" },
-                manifest: VAULT_MANIFEST,
-            });
-            const uid: string = (await row()).uid;
-            const saved = await put(uid, { settings: { "mail:v:api_key": { secret: true }, "mail:v:note": "changed" } });
-            expect(saved.status).toBe(200);
-            const stored = (await row()).settings["mail:v:api_key"];
-            expect(isPluginSecretRef(stored)).toBe(true);
-            expect(valueAt(stored)).toEqual({ value: "s3cr3t" });
-        });
-
-        it("a version change keeps the references of the settings it still declares and removes the secret of one it drops", async () => {
+        it("a version change keeps the envelopes of the settings it still declares and drops the secret of one it doesn't", async () => {
             const uid: string = await addVault();
             expect((await put(uid, { settings: { "mail:v:api_key": "s3cr3t", "mail:v:old_token": "hunter2" } })).status).toBe(200);
             const before = (await row()).settings;
@@ -1398,11 +1413,10 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             expect(upgraded.status).toBe(200);
             expect(upgraded.body.settings).toEqual({ "mail:v:api_key": { secret: true } });
             expect((await row()).settings).toEqual({ "mail:v:api_key": before["mail:v:api_key"] });
-            expect(valueAt(before["mail:v:api_key"])).toEqual({ value: "s3cr3t" });
-            expect(valueAt(before["mail:v:old_token"])).toBeUndefined();
+            expect(open(uid, "mail:v:api_key", before["mail:v:api_key"])).toBe("s3cr3t");
         });
 
-        it("a version change checks a kept secret against the new version's setting, refusing a value it no longer takes as it would one on the row", async () => {
+        it("a version change decrypts a kept secret to check it against the new version's setting, refusing a value it no longer takes as it would one on the row", async () => {
             const uid: string = await addVault();
             expect((await put(uid, { settings: { "mail:v:api_key": "s3cr3t", "mail:v:pin": 4321 } })).status).toBe(200);
             const before = await row();
@@ -1414,7 +1428,6 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
                 const now = await row();
                 expect(now.packageVersion).toBe("1.0.0");
                 expect(now.settings).toEqual(before.settings);
-                expect(ctx.store().secrets.size).toBe(2);
             };
 
             // 2.0.0 makes the API key a choice its saved value isn't one of: refused, whether the value is carried or sent back as the mask.
@@ -1429,56 +1442,32 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             expect(masked.body.message).toBe("'API key' must be one of: a.");
             await unchanged();
 
-            // 3.0.0 makes the PIN text: the stored number isn't, as the same value on the row wouldn't be.
+            // 3.0.0 makes the PIN text: the sealed number isn't, as the same value on the row wouldn't be.
             publishFakePackage(NAME, "3.0.0", { plugin: withSetting("mail:v:pin", { type: "string" }) });
             const toText = await put(uid, { packageVersion: "3.0.0" });
             expect(toText.status).toBe(400);
             expect(toText.body.message).toBe("'PIN' must be text.");
             await unchanged();
 
-            // 4.0.0 bounds the PIN in a way the stored value meets: kept as it is, at the same path.
+            // 4.0.0 bounds the PIN in a way the sealed value meets: kept as it is.
             publishFakePackage(NAME, "4.0.0", { plugin: withSetting("mail:v:pin", { min: 1000, max: 9999 }) });
             expect((await put(uid, { packageVersion: "4.0.0" })).status).toBe(200);
             expect((await row()).settings).toEqual(before.settings);
-            expect(valueAt(before.settings["mail:v:pin"])).toEqual({ value: "4321", type: "number" });
 
-            // A value that can't be read back to check is refused rather than carried unchecked.
-            ctx.store().secrets.delete(before.settings["mail:v:pin"].$secretRef.path);
+            // A value that can't be decrypted is refused with a 503 asking for a new one, rather than carried unchecked.
+            await ctx.updatePlugin(uid, { settings: { ...before.settings, "mail:v:pin": ctx.cipher().encrypt(4321, pluginSecretContext("another-row", "mail:v:pin")) } });
             publishFakePackage(NAME, "5.0.0", { plugin: withSetting("mail:v:pin", { min: 1000, max: 5000 }) });
             const unreadable = await put(uid, { packageVersion: "5.0.0" });
             expect(unreadable.status).toBe(503);
-            expect(unreadable.body.message).toMatch(/^The saved value of 'PIN' couldn't be read from the secret store/);
+            expect(unreadable.body.message).toBe("The saved value of 'PIN' can't be read to check it against this version. Save a new value for it.");
             expect((await row()).packageVersion).toBe("4.0.0");
         });
 
-        it("a failed change whose row couldn't be put back keeps the secret it wrote when another change saved the row naming it", async () => {
-            const uid: string = await addVault();
-            expect((await put(uid, { settings: { "mail:v:api_key": "s3cr3t" } })).status).toBe(200);
-            const first = (await row()).settings["mail:v:api_key"];
-            // The change is saved, then fails; meanwhile another change saves the row as it is (the mask sent back), so putting it back loses the lock.
-            const audit = vi.spyOn(BasePluginRoute.prototype as any, "audit").mockImplementationOnce(async () => {
-                await ctx.bumpVersion(uid);
-                throw new Error("audit log unavailable");
-            });
-            try {
-                expect((await put(uid, { settings: { "mail:v:api_key": "hunter2" } })).status).toBe(500);
-            } finally {
-                audit.mockRestore();
-            }
-            // The row still names the new secret, so it stays; nothing that names it is left pointing at a removed secret.
-            const named = (await row()).settings["mail:v:api_key"];
-            expect(named.$secretRef.path).not.toBe(first.$secretRef.path);
-            expect(valueAt(named)).toEqual({ value: "hunter2" });
-            expect(valueAt(first)).toEqual({ value: "s3cr3t" });
-        });
-
-        it("uninstalling deletes the plugin's secrets and leaves no secret on its row; adding it again starts without them", async () => {
+        it("uninstalling leaves no secret on the plugin's row; adding it again starts without them", async () => {
             const uid: string = await addVault();
             expect((await put(uid, { settings: { "mail:v:api_key": "s3cr3t", "mail:v:pin": 4321, "mail:v:note": "hi" } })).status).toBe(200);
-            expect(ctx.store().secrets.size).toBe(2);
 
             expect((await asAdmin(request(ctx.app()).delete(`${ctx.baseUrl}/${uid}`))).status).toBe(204);
-            expect(ctx.store().secrets.size).toBe(0);
             const removed = await row();
             expect(removed.removed).toBe(true);
             expect(removed.settings).toEqual({ "mail:v:note": "hi" });
@@ -1488,41 +1477,37 @@ export function pluginRouteSuite(ctx: PluginRouteSuiteContext): void {
             expect(again.body.plugin.settings).toEqual({});
         });
 
-        it("a secret the store can't remove is left there and logged; the change itself is saved", async () => {
-            const uid: string = await addVault();
-            expect((await put(uid, { settings: { "mail:v:api_key": "s3cr3t" } })).status).toBe(200);
-            const first = (await row()).settings["mail:v:api_key"];
-            ctx.store().failDelete = true;
-            expect((await put(uid, { settings: { "mail:v:api_key": "hunter2" } })).status).toBe(200);
-            expect(valueAt((await row()).settings["mail:v:api_key"])).toEqual({ value: "hunter2" });
-            expect(valueAt(first)).toEqual({ value: "s3cr3t" });
-        });
-
-        it("never sends the store a reference from a backend the deployment doesn't use: kept when masked, left there when cleared", async () => {
-            const foreign = { $secretRef: { backend: "kubernetes", path: "plugins/rapidmx/vault/mail_v_api_key-0123456789abcdef", keys: ["value"], generation: 3 } };
-            ctx.store().secrets.set(foreign.$secretRef.path, { value: "from-elsewhere" });
-            await ctx.insertPlugin({ name: NAME, packageVersion: "1.0.0", enabled: true, removed: false, settings: { "mail:v:api_key": foreign }, manifest: VAULT_MANIFEST });
-            const uid: string = (await row()).uid;
-
-            const kept = await put(uid, { settings: { "mail:v:api_key": { secret: true }, "mail:v:note": "hi" } });
-            expect(kept.status).toBe(200);
-            expect(kept.body.settings["mail:v:api_key"]).toEqual({ secret: true });
-            expect((await row()).settings["mail:v:api_key"]).toEqual(foreign);
-
-            expect((await put(uid, { settings: { "mail:v:api_key": null } })).status).toBe(200);
-            expect((await row()).settings["mail:v:api_key"]).toBeUndefined();
-            expect(ctx.store().secrets.get(foreign.$secretRef.path)).toEqual({ value: "from-elsewhere" });
-        });
-
-        it("a secret setting's manifest default is stored like a saved value", async () => {
+        it("a secret setting's manifest default is sealed like a saved value, for a new row and for a revived one", async () => {
             publishFakePackage("@rapidmx/defaulted", "1.0.0", {
                 plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "Defaulted", settings: [{ key: "mail:d:shared_secret", label: "Shared secret", type: "string", default: "changeme" }] },
             });
             const added = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name: "@rapidmx/defaulted" });
             expect(added.status).toBe(200);
             expect(added.body.plugin.settings).toEqual({ "mail:d:shared_secret": { secret: true } });
+            const uid: string = added.body.plugin.uid;
             const stored = (await ctx.rows()).find((plugin) => plugin.name === "@rapidmx/defaulted").settings["mail:d:shared_secret"];
-            expect(valueAt(stored)).toEqual({ value: "changeme" });
+            expect(isConfigEnvelope(stored)).toBe(true);
+            expect(open(uid, "mail:d:shared_secret", stored)).toBe("changeme");
+            // The manifest snapshot still names the default; the saved settings do not.
+            expect(JSON.stringify((await ctx.rows()).map((plugin) => plugin.settings))).not.toContain("changeme");
+
+            // Uninstalled and added again, the row is revived under the same uid with a freshly sealed default.
+            expect((await asAdmin(request(ctx.app()).delete(`${ctx.baseUrl}/${uid}`))).status).toBe(204);
+            const again = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name: "@rapidmx/defaulted" });
+            expect(again.status).toBe(200);
+            expect(again.body.plugin.uid).toBe(uid);
+            const revived = (await ctx.rows()).find((plugin) => plugin.name === "@rapidmx/defaulted").settings["mail:d:shared_secret"];
+            expect(open(uid, "mail:d:shared_secret", revived)).toBe("changeme");
+        });
+
+        it("a manifest default is stored in plaintext before the first encryption run", async () => {
+            await ctx.setEncrypted(false);
+            publishFakePackage("@rapidmx/defaulted", "1.0.0", {
+                plugin: { apiVersion: PLUGIN_API_VERSION, displayName: "Defaulted", settings: [{ key: "mail:d:shared_secret", label: "Shared secret", type: "string", default: "changeme" }] },
+            });
+            const added = await asAdmin(request(ctx.app()).post(ctx.baseUrl)).send({ name: "@rapidmx/defaulted" });
+            expect(added.status).toBe(200);
+            expect((await ctx.rows()).find((plugin) => plugin.name === "@rapidmx/defaulted").settings["mail:d:shared_secret"]).toBe("changeme");
         });
     });
 }

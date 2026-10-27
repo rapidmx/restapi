@@ -11,8 +11,11 @@ import { ConnectionManager, MongoConnection, MongoRepository, ObjectFactory, Ser
 import { Logger } from "@rapidrest/core";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { AuditLogEntryMongo } from "../../../src/models/mongo/AuditLogEntryMongo.js";
+import { ConfigKeyStateMongo } from "../../../src/models/mongo/ConfigKeyStateMongo.js";
 import { PluginMongo } from "../../../src/models/mongo/PluginMongo.js";
-import { InMemoryBlobStore, InMemorySecretStore, registerTestDoubles } from "../../testDoubles.js";
+import type { ConfigCipher } from "../../../src/secrets/ConfigCipher.js";
+import { CONFIG_KEY_STATE_UID } from "../../../src/secrets/ConfigKeyring.js";
+import { InMemoryBlobStore, registerTestDoubles } from "../../testDoubles.js";
 import { pluginRouteSuite } from "../../plugins/pluginRouteSuite.js";
 import { pluginUploadSuite, UPLOAD_TEST_MAX_BYTES } from "../../plugins/pluginUploadSuite.js";
 
@@ -26,6 +29,7 @@ describe("Route:PluginMongo Tests", () => {
     const server: Server = new Server({ config, basePath: "./test/server-mongo", logger, objectFactory });
     let pluginRepo: MongoRepository<PluginMongo>;
     let auditLogRepo: MongoRepository<AuditLogEntryMongo>;
+    let stateRepo: MongoRepository<ConfigKeyStateMongo>;
 
     beforeAll(async () => {
         await mongod.start();
@@ -37,6 +41,7 @@ describe("Route:PluginMongo Tests", () => {
         }
         pluginRepo = conn.getMongoRepository("PluginMongo");
         auditLogRepo = conn.getMongoRepository("AuditLogEntryMongo");
+        stateRepo = conn.getMongoRepository("ConfigKeyStateMongo");
     });
 
     afterAll(async () => {
@@ -45,13 +50,14 @@ describe("Route:PluginMongo Tests", () => {
         await objectFactory.destroy();
     });
 
-    const context = {
+    const context: any = {
         config,
         app: () => server.getApplication(),
         baseUrl: "/mongo/plugins",
         clear: async () => {
             await pluginRepo.clear();
             await auditLogRepo.clear();
+            await context.setEncrypted(false);
         },
         auditActions: async () => (await auditLogRepo.find({}).toArray()).map((entry) => entry.action),
         insertPlugin: async (fields) => {
@@ -64,7 +70,13 @@ describe("Route:PluginMongo Tests", () => {
         updatePlugin: async (uid, fields) => {
             await pluginRepo.updateOne({ uid }, { $set: fields });
         },
-        store: () => objectFactory.getInstance<InMemorySecretStore>("SecretStore")!,
+        cipher: () => objectFactory.getInstance<ConfigCipher>("ConfigCipher")!,
+        setEncrypted: async (encrypted: boolean) => {
+            await stateRepo.deleteMany({ uid: CONFIG_KEY_STATE_UID });
+            if (encrypted) {
+                await stateRepo.save(new ConfigKeyStateMongo({ uid: CONFIG_KEY_STATE_UID, pluginSecrets: { encryptedAt: new Date(), waitingForRollout: false } }));
+            }
+        },
     };
 
     pluginRouteSuite(context);

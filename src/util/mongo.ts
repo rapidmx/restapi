@@ -4,4 +4,4 @@
 ///////////////////////////////////////////////////////////////////////////////
 export * from "./mongo/ConfigCipherMongo.js";
 export * from "./mongo/DomainSeederMongo.js";
-export * from "./mongo/PluginSecretMigratorMongo.js";
+export * from "./mongo/PluginSecretEncryptorMongo.js";

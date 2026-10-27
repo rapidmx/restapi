@@ -15,3 +15,5 @@ export * from "./PluginUiUtils.js";
 export * from "./PluginDependencies.js";
 export * from "./PackInspector.js";
 export * from "./PluginSecretUtils.js";
+export * from "./PluginEnvelopeSource.js";
+export * from "./ServerRolloutCheck.js";

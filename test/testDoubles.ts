@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 // Lightweight, deterministic test-double implementations of this library's pluggable interfaces
 // (`BlobStore`, `SearchProvider`, `SpamScanProvider`, `AvScanProvider`, `MailTransport`, `DnsResolver`,
-// `DkimKeyProvider`, `EncryptionCertificateAuthority`, `SigningCertificateEnrollment`, `SecretStore`, `ConfigCipher`, `ConfigKeyChannel`, `ConfigKeyringStore`, `DnsPublisher`,
+// `DkimKeyProvider`, `EncryptionCertificateAuthority`, `SigningCertificateEnrollment`, `ConfigCipher`, `ConfigKeyChannel`, `ConfigKeyringStore`, `ServerRolloutCheck`, `DnsPublisher`,
 // `DnsControllerTokenVerifier`), registered with an
 // `ObjectFactory` under the same string names the library's `@Inject("...")` decorators resolve against. Every
 // integration test that boots the shared `test/server-mongo`/`test/server-sql` fixture app needs these
@@ -39,10 +39,9 @@ import { LocalConfigKeyChannel } from "../src/secrets/ConfigKeyChannel.js";
 import { type ConfigKeyring } from "../src/secrets/ConfigKeyring.js";
 import { ConfigKeyringConflictError, type ConfigKeyringSnapshot, type ConfigKeyringStore } from "../src/secrets/ConfigKeyringStore.js";
 import { TEST_CONFIG_KEYRING } from "./config-defaults.js";
-import { NullSecretStore } from "../src/secrets/NullSecretStore.js";
-import type { SecretStore } from "../src/secrets/SecretStore.js";
+import type { RolloutStatus, ServerRolloutCheck } from "../src/plugins/ServerRolloutCheck.js";
 import type { EncryptionCertificateAuthority, IssuedCertificate } from "../src/pki/EncryptionCertificateAuthority.js";
-import { AvVerdict, SecretBackend, SecretRef, SpamVerdict } from "../src/models/types.js";
+import { AvVerdict, SpamVerdict } from "../src/models/types.js";
 import type { ObjectFactory } from "@rapidrest/service-core";
 
 x509.cryptoProvider.set(crypto);
@@ -337,78 +336,38 @@ export class InMemoryConfigKeyringStore implements ConfigKeyringStore {
 }
 
 /**
- * A `SecretStore` that keeps secrets in a `Map` by path, so a test can see exactly what was saved (and that nothing reached the database). `refuse` makes
- * every call behave as `NullSecretStore` (the deployment without a store), and `failDelete` makes `delete()` reject, as a store that is down does.
- * `duringChange`, when set, runs once inside the next `write()`/`patch()`/`delete()` before it applies: what lands there is another write racing the one
- * that called the store.
+ * A `ServerRolloutCheck` that answers what a test sets: rolled out by default, as the default check does outside Kubernetes. `fail` makes `check()` reject,
+ * as a server whose pods can't be listed might.
  */
-export class InMemorySecretStore implements SecretStore {
-    public backend: SecretBackend | "none" = "openbao";
-    public secrets: Map<string, Record<string, string>> = new Map();
-    public refuse: boolean = false;
-    public failDelete: boolean = false;
-    public duringChange?: () => Promise<void>;
-    private readonly none: NullSecretStore = new NullSecretStore();
+export class InMemoryServerRolloutCheck implements ServerRolloutCheck {
+    public answer: RolloutStatus = { rolledOut: true };
+    public fail?: Error;
+    public checks: number = 0;
 
-    /** Back to an empty, working store. */
+    /** Back to a rollout that has finished. */
     public reset(): void {
-        this.backend = "openbao";
-        this.secrets.clear();
-        this.refuse = false;
-        this.failDelete = false;
-        this.duringChange = undefined;
+        this.answer = { rolledOut: true };
+        this.fail = undefined;
+        this.checks = 0;
     }
 
-    /** Runs `duringChange` once, if set. */
-    private async race(): Promise<void> {
-        const hook: (() => Promise<void>) | undefined = this.duringChange;
-        this.duringChange = undefined;
-        await hook?.();
-    }
-
-    public async write(path: string, values: Record<string, string>): Promise<SecretRef> {
-        if (this.refuse) {
-            return await this.none.write(path, values);
+    public async check(): Promise<RolloutStatus> {
+        this.checks++;
+        if (this.fail) {
+            throw this.fail;
         }
-        await this.race();
-        const generation: number = (this.generations.get(path) ?? 0) + 1;
-        this.generations.set(path, generation);
-        this.secrets.set(path, { ...values });
-        return { backend: this.backend as SecretBackend, path, keys: Object.keys(values).sort(), generation };
+        return { ...this.answer };
     }
+}
 
-    public async patch(ref: SecretRef, values: Record<string, string | null>): Promise<SecretRef> {
-        if (this.refuse) {
-            return await this.none.patch(ref, values);
-        }
-        await this.race();
-        const merged: Record<string, string> = { ...(this.secrets.get(ref.path) ?? {}) };
-        for (const [key, value] of Object.entries(values)) {
-            if (value === null) {
-                delete merged[key];
-            } else {
-                merged[key] = value;
-            }
-        }
-        return await this.write(ref.path, merged);
-    }
-
-    public async read(ref: SecretRef): Promise<Record<string, string>> {
-        if (this.refuse) {
-            return await this.none.read(ref);
-        }
-        return { ...(this.secrets.get(ref.path) ?? {}) };
-    }
-
-    public async delete(ref: SecretRef): Promise<void> {
-        await this.race();
-        if (this.failDelete) {
-            throw new Error("secret store unavailable");
-        }
-        this.secrets.delete(ref.path);
-    }
-
-    private readonly generations: Map<string, number> = new Map();
+/** A `ConfigCipher` holding the test keyring (`TEST_CONFIG_KEYRING`) and no datastore, so the oldest (only) key encrypts: for a unit test that needs real envelopes. */
+export async function newTestConfigCipher(): Promise<ConfigCipher> {
+    const cipher: any = new ConfigCipher();
+    cipher.keyringFile = "";
+    cipher.keyring = TEST_CONFIG_KEYRING;
+    cipher.logger = { warn: () => undefined, error: () => undefined, info: () => undefined, debug: () => undefined };
+    await cipher.init();
+    return cipher;
 }
 
 /**
@@ -564,11 +523,11 @@ export function registerTestDoubles(objectFactory: ObjectFactory): void {
     objectFactory.register(NullDkimKeyProvider, "DkimKeyProvider");
     objectFactory.register(NullEncryptionCertificateAuthority, "EncryptionCertificateAuthority");
     objectFactory.register(NullSigningCertificateEnrollment, "SigningCertificateEnrollment");
-    objectFactory.register(InMemorySecretStore, "SecretStore");
     // The test keyring (`config_encryption:keyring`); the base class has no datastore, so the oldest key encrypts.
     objectFactory.register(ConfigCipher, "ConfigCipher");
     objectFactory.register(LocalConfigKeyChannel, "ConfigKeyChannel");
     objectFactory.register(InMemoryConfigKeyringStore, "ConfigKeyringStore");
+    objectFactory.register(InMemoryServerRolloutCheck, "ServerRolloutCheck");
     objectFactory.register(InMemoryDnsPublisher, "DnsPublisher");
     objectFactory.register(StaticDnsControllerTokenVerifier, "DnsControllerTokenVerifier");
 }

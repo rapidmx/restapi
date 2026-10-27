@@ -43,7 +43,7 @@ const CONTROL_CHARACTER: RegExp = /[\u0000-\u001f\u007f-\u009f]/;
 const MULTI_LINE_CONTROL_CHARACTER: RegExp = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/;
 
 /**
- * Turns the credentials a write-only form sent into what `SecretStore.patch()` takes: a field sent as a string is the new value (surrounding whitespace,
+ * Turns the credentials a write-only form sent into the change to apply to the credentials a row holds: a field sent as a string is the new value (surrounding whitespace,
  * such as the newline a pasted token carries, trimmed), `null` clears it, and a field sent back as the mask, or not sent, is left alone (so it isn't in the
  * result). Refuses (400) a field not in `fields`, a value that is empty or only whitespace, a control character inside a value (tabs and line breaks are
  * allowed in `multiLineFields` only), and any other value. The error names the field, or for an unknown one lists `fields`, and never repeats what was sent:

@@ -18,7 +18,8 @@ vi.mock("redis", () => ({ createClient: redis.createClient }));
 
 import { PluginRouteMongo } from "../../src/routes/mongo/PluginRouteMongo.js";
 import { NpmRegistryClient } from "../../src/plugins/NpmRegistryClient.js";
-import { PLUGIN_CHANGED_EVENT, PLUGIN_EVENTS_CHANNEL, PLUGIN_STATUS_KEY } from "../../src/plugins/PluginUtils.js";
+import { computePluginStateHash, PLUGIN_CHANGED_EVENT, PLUGIN_EVENTS_CHANNEL, PLUGIN_STATUS_KEY } from "../../src/plugins/PluginUtils.js";
+import { newTestConfigCipher } from "../testDoubles.js";
 
 /** A route with the given injected fields set directly - `initialize: false` skips config injection. */
 async function newRoute(fields: Record<string, any>): Promise<any> {
@@ -215,22 +216,83 @@ describe("BasePluginRoute uploads", () => {
     });
 });
 
-describe("BasePluginRoute secret settings without a secret store", () => {
-    const MANIFEST: any = { apiVersion: 1, displayName: "Vault", settings: [{ key: "mail:v:api_key", label: "API key", type: "string" }] };
+describe("BasePluginRoute secret settings (spec 5.7)", () => {
+    const MANIFEST: any = {
+        apiVersion: 1,
+        displayName: "Vault",
+        settings: [
+            { key: "mail:v:api_key", label: "API key", type: "string" },
+            { key: "mail:v:note", label: "Note", type: "string" },
+        ],
+    };
+    const stateWith = (state: any) => ({ findOne: vi.fn(async () => state) });
 
-    it("keeps a secret setting on the row on a server that registers no store, as it did before the store existed", async () => {
-        const route = await newRoute({});
-        const undo: any[] = [];
-        expect(await route.storeSecretSettings("@rapidmx/vault", MANIFEST, { "mail:v:api_key": "s3cr3t" }, undo)).toEqual({ "mail:v:api_key": "s3cr3t" });
-        // Its undo step has nothing to remove, so it reads nothing either (this route has no repository to read).
-        expect(undo).toHaveLength(1);
-        await expect(undo[0]()).resolves.toBeUndefined();
+    it("keeps a secret setting in plaintext until the first encryption run has completed: no state row, no pluginSecrets, or an encryptedAt that is null", async () => {
+        const cipher = await newTestConfigCipher();
+        for (const state of [undefined, null, {}, { pluginSecrets: null }, { pluginSecrets: { waitingForRollout: true, reason: "Old pods." } }, { pluginSecrets: { encryptedAt: null } }]) {
+            const route = await newRoute({ cipher, stateRepo: stateWith(state) });
+            expect(await route.sealSecretSettings("p1", MANIFEST, { "mail:v:api_key": "s3cr3t", "mail:v:note": "hi" }), JSON.stringify(state)).toEqual({
+                "mail:v:api_key": "s3cr3t",
+                "mail:v:note": "hi",
+            });
+        }
     });
 
-    it("never sends the missing store a reference to remove, only logs that it was left where it is", async () => {
-        const logger = { warn: vi.fn() };
-        const route = await newRoute({ logger });
-        await route.releaseSecrets([{ backend: "openbao", path: "plugins/rapidmx/vault/mail_v_api_key-0123456789abcdef", keys: ["value"], generation: 1 }]);
-        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("openbao"));
+    it("seals each secret setting for its row once encryptedAt is set, as a date or as the text SQL reads back, reading the state row fresh each time", async () => {
+        const cipher = await newTestConfigCipher();
+        const stateRepo = stateWith({ pluginSecrets: { encryptedAt: new Date() } });
+        const route = await newRoute({ cipher, stateRepo });
+        const sealed = await route.sealSecretSettings("p1", MANIFEST, { "mail:v:api_key": "s3cr3t", "mail:v:note": "hi" });
+        expect(sealed["mail:v:note"]).toBe("hi");
+        expect(cipher.decrypt(sealed["mail:v:api_key"], { record: "Plugin", uid: "p1", field: "settings.mail:v:api_key" })).toBe("s3cr3t");
+        expect(stateRepo.findOne).toHaveBeenCalledWith("config-keys", { ignoreACL: true, skipCache: true });
+
+        stateRepo.findOne.mockResolvedValueOnce({ pluginSecrets: { encryptedAt: "2026-10-28T00:00:00.000Z" } });
+        expect(typeof (await route.sealSecretSettings("p1", MANIFEST, { "mail:v:api_key": "x" }))["mail:v:api_key"]).toBe("object");
+        // Cleared again (a restored database, say): plaintext again.
+        stateRepo.findOne.mockResolvedValueOnce(undefined);
+        expect(await route.sealSecretSettings("p1", MANIFEST, { "mail:v:api_key": "x" })).toEqual({ "mail:v:api_key": "x" });
+    });
+
+    it("answers 503 for a secret it can't seal on a server with no cipher, and not at all for settings without one", async () => {
+        const route = await newRoute({ cipher: undefined, stateRepo: stateWith({ pluginSecrets: { encryptedAt: new Date() } }) });
+        await expect(route.sealSecretSettings("p1", MANIFEST, { "mail:v:api_key": "s3cr3t" })).rejects.toMatchObject({
+            status: 503,
+            message: "Configuration encryption isn't available on this server, so plugin secret settings can't be handled.",
+        });
+        expect(await route.sealSecretSettings("p1", MANIFEST, { "mail:v:note": "hi" })).toEqual({ "mail:v:note": "hi" });
+    });
+
+    it("never reads the state row for settings that hold no secret", async () => {
+        const stateRepo = stateWith(undefined);
+        const route = await newRoute({ cipher: await newTestConfigCipher(), stateRepo });
+        expect(await route.sealSecretSettings("p1", MANIFEST, { "mail:v:note": "hi" })).toEqual({ "mail:v:note": "hi" });
+        expect(stateRepo.findOne).not.toHaveBeenCalled();
+    });
+
+    it("fails the save, rather than saving a secret in plaintext, when the state row can't be read", async () => {
+        const route = await newRoute({ cipher: await newTestConfigCipher(), stateRepo: { findOne: vi.fn().mockRejectedValue(new Error("database unavailable")) } });
+        await expect(route.sealSecretSettings("p1", MANIFEST, { "mail:v:api_key": "s3cr3t" })).rejects.toThrow("database unavailable");
+    });
+
+    it("refuses a kept secret it has to check against a new version when it has no cipher: a 503 asking for a new value; a value the version no longer takes is a 400", async () => {
+        const cipher = await newTestConfigCipher();
+        const v2: any = { ...MANIFEST, settings: [{ key: "mail:v:api_key", label: "API key", type: "select", options: [{ value: "a", label: "A" }] }] };
+        const envelope = cipher.encrypt("s3cr3t", { record: "Plugin", uid: "p1", field: "settings.mail:v:api_key" });
+        const without = await newRoute({ cipher: undefined });
+        await expect(without.checkKeptSecrets("p1", MANIFEST, v2, { "mail:v:api_key": envelope })).rejects.toMatchObject({ status: 503, message: expect.stringMatching(/Save a new value/) });
+        const route = await newRoute({ cipher });
+        await expect(route.checkKeptSecrets("p1", MANIFEST, v2, { "mail:v:api_key": envelope })).rejects.toMatchObject({ status: 400, message: "'API key' must be one of: a." });
+        await expect(route.checkKeptSecrets("p1", MANIFEST, MANIFEST, { "mail:v:api_key": envelope })).resolves.toBeUndefined();
+    });
+
+    it("hashes the plugin state by decrypted value when announcing", async () => {
+        const cipher = await newTestConfigCipher();
+        const envelope = cipher.encrypt("s3cr3t", { record: "Plugin", uid: "p1", field: "settings.mail:v:api_key" });
+        const row = { uid: "p1", name: "a", packageVersion: "1.0.0", enabled: true, settings: { "mail:v:api_key": envelope } };
+        const route = await newRoute({ cipher, pluginRepo: { find: vi.fn().mockResolvedValue([row]) } });
+        const publish = vi.spyOn(route, "publishChange").mockResolvedValue(undefined);
+        await route.announce();
+        expect(publish).toHaveBeenCalledWith(computePluginStateHash([{ ...row, settings: { "mail:v:api_key": "s3cr3t" } }]));
     });
 });

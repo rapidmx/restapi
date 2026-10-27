@@ -88,10 +88,11 @@ describe("ConfigKeyRotationJobMongo Tests (real DB + DI)", () => {
         expect(job.channel).toBeInstanceOf(LocalConfigKeyChannel);
         expect(job.stateRepo).toBeDefined();
         expect(job.auditLogUtils).toBeDefined();
-        // The record types that hold envelopes: a DNS provider's credentials and the Integrations settings' secrets.
+        // The record types that hold envelopes: a DNS provider's credentials, the Integrations settings' secrets and a plugin's secret settings.
         expect(job.sources.list().map((source: any) => [source.record, source.modelClass])).toEqual([
             ["DnsProvider", DnsProviderMongo],
             ["IntegrationSettings", IntegrationSettingsMongo],
+            ["Plugin", PluginMongo],
         ]);
         await job.dispose();
     });
