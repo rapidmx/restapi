@@ -54,6 +54,9 @@ describe("DkimRotationJobSQL Tests (real DB + DI)", () => {
     });
 
     afterAll(async () => {
+        // The database file is shared with later SQL suites, which must not find these (verified) domains.
+        await domainRepo.clear();
+        await auditLogRepo.clear();
         await objectFactory.destroy();
     });
 

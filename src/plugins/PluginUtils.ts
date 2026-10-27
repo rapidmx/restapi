@@ -331,6 +331,7 @@ export const CORE_CONFIG_NAMESPACES: readonly string[] = [
     "mail:jobs:attachment_extraction",
     "mail:jobs:calendar_reminder",
     "mail:jobs:data_export",
+    "mail:jobs:dkim_rotation",
     "mail:jobs:domain_verification",
     "mail:jobs:erasure_execution",
     "mail:jobs:external_share_expiration",

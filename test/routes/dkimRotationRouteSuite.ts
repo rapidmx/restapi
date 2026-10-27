@@ -82,6 +82,11 @@ export function dkimRotationRouteSuite(ctx: DkimRotationRouteSuiteContext): void
         unelevatedToken = JWTUtils.createTokenSync(ctx.config.get("auth"), { uid: uuid.v4(), roles: ["admin"] });
     });
 
+    // The SQL backend's database file is shared with later suites, which must not find these verified domains.
+    afterAll(async () => {
+        await ctx.clear();
+    });
+
     beforeEach(async () => {
         await ctx.clear();
         ctx.publisher().reset();
