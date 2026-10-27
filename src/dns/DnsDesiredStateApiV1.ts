@@ -12,8 +12,8 @@
 // - The handshake (`Handshake`/`HandshakeResult`) is unversioned and its shape never changes: it is what lets two mismatched versions find out that
 //   they are.
 //
-// `DnsProviderV1.options` values may be lists (Cloudflare's `zoneIds`, rfc2136's `hosts`), in both copies and in the shared desired-state fixture. Additive
-// to the controller's copy, which gains it with its reconcile phase (C3): `PUT /v1/status` answers a `StatusReportResult`.
+// `DnsProviderV1.options` values may be lists (Cloudflare's `zoneIds`, rfc2136's `hosts`), in both copies and in the shared desired-state fixture.
+// `PUT /v1/status` answers a `StatusReportResult`, in both copies (the controller's since its phase C2, which refuses any other answer).
 
 /** The API version this server speaks. */
 export const API_VERSION_V1 = "dns.rapidmx.io/v1";
