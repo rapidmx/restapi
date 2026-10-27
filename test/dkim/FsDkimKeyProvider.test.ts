@@ -106,4 +106,134 @@ describe("FsDkimKeyProvider Tests", () => {
 
         await expect(fs.access(path.join(nestedDir, "nested.example.com.mail.key"))).resolves.toBeUndefined();
     });
+    describe("rotation", () => {
+        const publicKeyOf = (pem: string): string => crypto.createPublicKey(pem).export({ type: "spki", format: "der" }).toString("base64");
+
+        it("Supports rotation.", () => {
+            expect(provider.supportsRotation).toBe(true);
+        });
+
+        it("generateKeyPair() creates a key for a new selector without changing the one ensureKeyPair() signs with.", async () => {
+            const active: DkimKeyPair = await provider.ensureKeyPair("rotate.example.com");
+            const next: DkimKeyPair = await provider.generateKeyPair("rotate.example.com", "rmx20261027");
+
+            expect(next.selector).toBe("rmx20261027");
+            expect(next.publicKey).not.toBe(active.publicKey);
+            const pem: string = await fs.readFile(path.join(tmpDir, "rotate.example.com.rmx20261027.key"), "utf-8");
+            expect(publicKeyOf(pem)).toBe(next.publicKey);
+            expect(await provider.ensureKeyPair("rotate.example.com")).toEqual(active);
+            // Idempotent: the same selector again returns the same key.
+            expect(await provider.generateKeyPair("rotate.example.com", "rmx20261027")).toEqual(next);
+        });
+
+        const modulusLength = (pair: DkimKeyPair): number | undefined =>
+            crypto.createPublicKey({ key: Buffer.from(pair.publicKey, "base64"), format: "der", type: "spki" }).asymmetricKeyDetails?.modulusLength;
+
+        it("Generates a key of the configured size (mail:dkim:rotation:key_bits), also given as text.", async () => {
+            (provider as any).keyBits = 3072;
+            expect(modulusLength(await provider.generateKeyPair("bits.example.com", "rmx20261027"))).toBe(3072);
+            (provider as any).keyBits = "3072";
+            expect(modulusLength(await provider.ensureKeyPair("bits-text.example.com"))).toBe(3072);
+        });
+
+        it("Uses 2048 bits, with a warning, for a key size that is too weak, too large for a TXT record or not a number.", async () => {
+            const warn = vi.fn();
+            (provider as any).logger = { warn, info: vi.fn() };
+            for (const [i, keyBits] of [1024, 8192, "big", 2048.5].entries()) {
+                (provider as any).keyBits = keyBits;
+                expect(modulusLength(await provider.generateKeyPair("weak.example.com", `rmx2026102${i}`))).toBe(2048);
+            }
+            expect(warn).toHaveBeenCalledTimes(4);
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("mail:dkim:rotation:key_bits"));
+        });
+
+        it("Generates keys off the event loop, so the server keeps answering while a large key is made.", async () => {
+            (provider as any).keyBits = 4096;
+            let last: number = Date.now();
+            let longestGap: number = 0;
+            const timer = setInterval(() => {
+                const now: number = Date.now();
+                longestGap = Math.max(longestGap, now - last);
+                last = now;
+            }, 2);
+            const started: number = Date.now();
+            try {
+                await provider.generateKeyPair("async.example.com", "rmx20261027");
+            } finally {
+                clearInterval(timer);
+            }
+            // A synchronous generation blocks the timer for the whole of it.
+            expect(longestGap).toBeLessThan((Date.now() - started) / 2);
+        });
+
+        it("Refuses a selector that isn't one lowercase DNS label.", async () => {
+            for (const selector of ["", "Upper", "a.b", "../x", "-x", "x".repeat(64), 5 as any]) {
+                await expect(provider.generateKeyPair("bad.example.com", selector)).rejects.toThrow("one DNS label");
+                await expect(provider.findKeyPair("bad.example.com", selector)).rejects.toThrow("one DNS label");
+                await expect(provider.activate("bad.example.com", selector)).rejects.toThrow("one DNS label");
+                await expect(provider.deleteKeyPair("bad.example.com", selector)).rejects.toThrow("one DNS label");
+            }
+        });
+
+        it("findKeyPair() reads a selector's key without creating one.", async () => {
+            expect(await provider.findKeyPair("find.example.com", "mail")).toBeUndefined();
+            await expect(fs.access(path.join(tmpDir, "find.example.com.mail.key"))).rejects.toThrow();
+
+            const created: DkimKeyPair = await provider.ensureKeyPair("find.example.com");
+            expect(await provider.findKeyPair("find.example.com", "mail")).toEqual(created);
+        });
+
+        it("activate() writes <domain>.selector atomically, after which ensureKeyPair() returns that selector's key.", async () => {
+            await provider.ensureKeyPair("activate.example.com");
+            const next: DkimKeyPair = await provider.generateKeyPair("activate.example.com", "rmx20261027");
+
+            await provider.activate("activate.example.com", "rmx20261027");
+
+            expect(await fs.readFile(path.join(tmpDir, "activate.example.com.selector"), "utf-8")).toBe("rmx20261027\n");
+            expect(await provider.ensureKeyPair("activate.example.com")).toEqual(next);
+            expect((await fs.readdir(tmpDir)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+            // Idempotent.
+            await provider.activate("activate.example.com", "rmx20261027");
+            expect(await fs.readFile(path.join(tmpDir, "activate.example.com.selector"), "utf-8")).toBe("rmx20261027\n");
+        });
+
+        it("activate() refuses a selector that has no key, leaving the signing selector alone.", async () => {
+            await expect(provider.activate("nokey.example.com", "rmx20261027")).rejects.toThrow("no DKIM key");
+            await expect(fs.access(path.join(tmpDir, "nokey.example.com.selector"))).rejects.toThrow();
+        });
+
+        it("Ignores a <domain>.selector that isn't a valid selector, signing with the global one.", async () => {
+            await fs.writeFile(path.join(tmpDir, "garbled.example.com.selector"), "../../etc/passwd\n");
+            expect((await provider.ensureKeyPair("garbled.example.com")).selector).toBe("mail");
+            await fs.writeFile(path.join(tmpDir, "empty.example.com.selector"), "\n");
+            expect((await provider.ensureKeyPair("empty.example.com")).selector).toBe("mail");
+        });
+
+        it("signingSelector() reads what the MTA wrote to <domain>.signing, and nothing when it wrote nothing valid.", async () => {
+            expect(await provider.signingSelector("ack.example.com")).toBeUndefined();
+            await fs.writeFile(path.join(tmpDir, "ack.example.com.signing"), "rmx20261027\n");
+            expect(await provider.signingSelector("ack.example.com")).toBe("rmx20261027");
+            await fs.writeFile(path.join(tmpDir, "ack.example.com.signing"), "not a selector");
+            expect(await provider.signingSelector("ack.example.com")).toBeUndefined();
+            await fs.writeFile(path.join(tmpDir, "ack.example.com.signing"), "");
+            expect(await provider.signingSelector("ack.example.com")).toBeUndefined();
+        });
+
+        it("deleteKeyPair() deletes a retired selector's key, resolves when it is already gone, and refuses the selector signing uses.", async () => {
+            await provider.ensureKeyPair("retire.example.com");
+            await provider.generateKeyPair("retire.example.com", "rmx20261027");
+            await provider.activate("retire.example.com", "rmx20261027");
+
+            await expect(provider.deleteKeyPair("retire.example.com", "rmx20261027")).rejects.toThrow("signed with");
+            await provider.deleteKeyPair("retire.example.com", "mail");
+            await expect(fs.access(path.join(tmpDir, "retire.example.com.mail.key"))).rejects.toThrow();
+            await expect(provider.deleteKeyPair("retire.example.com", "mail")).resolves.toBeUndefined();
+            expect(await provider.findKeyPair("retire.example.com", "rmx20261027")).toBeDefined();
+        });
+
+        it("deleteKeyPair() refuses the global selector while no rotation has activated another.", async () => {
+            await provider.ensureKeyPair("global.example.com");
+            await expect(provider.deleteKeyPair("global.example.com", "mail")).rejects.toThrow("signed with");
+        });
+    });
 });

@@ -16,6 +16,9 @@ import { DkimKeyPair, DkimKeyProvider } from "./DkimKeyProvider.js";
  * @author Jean-Philippe Steinmetz
  */
 export class NullDkimKeyProvider implements DkimKeyProvider {
+    /** Holds no keys, so none is ever rotated. */
+    public readonly supportsRotation: boolean = false;
+
     public async ensureKeyPair(_domain: string): Promise<DkimKeyPair | undefined> {
         return undefined;
     }

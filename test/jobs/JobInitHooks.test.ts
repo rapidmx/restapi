@@ -19,6 +19,7 @@ import {
     AttachmentExtractionJobMongo,
     CalendarReminderJobMongo,
     DataExportJobMongo,
+    DkimRotationJobMongo,
     DomainVerificationJobMongo,
     ErasureExecutionJobMongo,
     ExternalShareExpirationJobMongo,
@@ -66,6 +67,14 @@ const JOBS: [name: string, ctor: new () => any, repos: Repo[]][] = [
             ["dataExportRequestRepo", "dataExportRequestClass", "RepoUtils"],
             ["messageRepo", "messageClass", "RepoUtils"],
             ["mailboxRepo", "mailboxClass", "RepoUtils"],
+            ["auditLogRepo", "auditLogClass", "RepoUtils"],
+        ],
+    ],
+    [
+        "DkimRotationJob",
+        DkimRotationJobMongo,
+        [
+            ["domainRepo", "domainClass", "RepoUtils"],
             ["auditLogRepo", "auditLogClass", "RepoUtils"],
         ],
     ],
@@ -207,6 +216,7 @@ type Service = [serviceField: string, serviceType: any, classField: string, argF
 const SERVICES: [name: string, ctor: new () => any, services: Service[]][] = [
     ["AcmeEnrollmentDriverJob", AcmeEnrollmentDriverJobMongo, [["auditLogUtils", AuditLogUtils, "auditLogClass", ["auditLogRepo"]]]],
     ["DataExportJob", DataExportJobMongo, [["auditLogUtils", AuditLogUtils, "auditLogClass", ["auditLogRepo"]]]],
+    ["DkimRotationJob", DkimRotationJobMongo, [["auditLogUtils", AuditLogUtils, "auditLogClass", ["auditLogRepo"]]]],
     ["DomainVerificationJob", DomainVerificationJobMongo, [["auditLogUtils", AuditLogUtils, "auditLogClass", ["auditLogRepo"]]]],
     ["ErasureExecutionJob", ErasureExecutionJobMongo, [["auditLogUtils", AuditLogUtils, "auditLogClass", ["auditLogRepo"]]]],
     ["MailboxImportJob", MailboxImportJobMongo, [["auditLogUtils", AuditLogUtils, "auditLogClass", ["auditLogRepo"]]]],

@@ -26,6 +26,7 @@ export * from "./SuggestedContactUtils.js";
 export * from "./DateCoercionUtils.js";
 export * from "./DeliveryFailureNoticeUtils.js";
 export * from "./DistributionListUtils.js";
+export * from "./DkimRotationUtils.js";
 export * from "./DraftBodyRetentionUtils.js";
 export * from "./DnsSetupUtils.js";
 export * from "./DnsPublishingUtils.js";

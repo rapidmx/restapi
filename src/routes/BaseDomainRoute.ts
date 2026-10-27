@@ -23,13 +23,28 @@ import { normalizeAddress } from "../util/AddressUtils.js";
 import { chooseApexSpf, normalizeApexTxtKeep, suggestApexTxtKeep } from "../util/ApexTxtUtils.js";
 import { AuditLogUtils } from "../util/AuditLogUtils.js";
 import { autodiscoverHostnameFor, findDnsOwnerId, isDomainEndpointObserved, queueDnsOperation } from "../util/DnsPublishingUtils.js";
+import {
+    configNumber,
+    DEFAULT_DKIM_ROTATION_INTERVAL_DAYS,
+    dkimRotationBlocker,
+    isConfigFlagOn,
+    keptDkimRotationState,
+    nextScheduledDkimRotation,
+    resolveDkimManaged,
+    retireDkimRotation,
+    saveDkimRotation,
+    startDkimRotation,
+    type DkimRotationBlocker,
+    type DkimRotationCaller,
+    type DkimRotationContext,
+} from "../util/DkimRotationUtils.js";
 import { checkDnsSetup, type DnsRecordCheck } from "../util/DnsSetupUtils.js";
 import { DEFAULT_ACCEPT_LEGACY_APEX, findDomainVerification, type DomainVerificationResult } from "../util/DomainVerificationUtils.js";
 import { isReservedDomainName } from "../util/DomainUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
 import { assertNoPathKeys, assertPlainPropertyName, stripClientCreateFields } from "../util/RequestBodyUtils.js";
-import { ApexTxtSettings, AuditAction, DeploymentIdentity, DnsOperation, DnsProvider, Domain } from "../models/types.js";
+import { ApexTxtSettings, AuditAction, DeploymentIdentity, DkimRotationReason, DkimRotationState, DnsOperation, DnsProvider, Domain } from "../models/types.js";
 const { Get, Param, Post, Put, Query, Request, RequiresTrustedRole, Response, User: AuthUser } = RouteDecorators;
 /** A host name in lowercase: dot-separated labels of letters, digits and hyphens (a label neither starts nor ends with one, at most 63 characters), at most 253 in all. */
 const DOMAIN_NAME_PATTERN: RegExp = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
@@ -40,7 +55,8 @@ const DMARC_POLICIES = new Set(["none", "quarantine", "reject"]);
 
 /** The fields only this class (and `DomainVerificationJob`, the DNS controller's status reports and the DKIM rotation job) ever set: dropped from a plain
  * `PUT` (so a client round-tripping a domain still works), refused by `PUT /:id/:property`, and never taken from a create. `dnsProviderUid` changes only
- * through `PUT /:id/dns-provider`, `apexTxt` only through `PUT /:id/apex-txt`. */
+ * through `PUT /:id/dns-provider`, `apexTxt` only through `PUT /:id/apex-txt`, `dkimRotation` only through the rotation job and the `dkim/...` routes,
+ * `dkimManaged` only when the server sets or imports a key. */
 const SERVER_MANAGED_DOMAIN_FIELDS: string[] = [
     "uid",
     "verified",
@@ -51,6 +67,7 @@ const SERVER_MANAGED_DOMAIN_FIELDS: string[] = [
     "dnsPublication",
     "apexTxt",
     "dkimRotation",
+    "dkimManaged",
 ];
 
 /** The fields whose change moves a domain's published records: an update touching any of them is announced to the DNS controller. */
@@ -69,6 +86,24 @@ export interface ApexTxtView {
      * must not offer the opt-in on them (`PUT /:id/apex-txt` refuses it with a 503 meanwhile). */
     lookupFailed?: true;
 }
+
+/** What `GET /:id/dkim/rotation` answers: the rotation, whether the domain's key can rotate (and why not), and when the next scheduled rotation starts. */
+export interface DkimRotationView {
+    rotation: DkimRotationState | null;
+    rotatable: boolean;
+    blocker?: DkimRotationBlocker;
+    /** While a rotation is scheduled: the key can rotate, none is in progress, the domain isn't paused and scheduled rotation is on. */
+    nextScheduledAt?: Date;
+}
+
+/** Why "Rotate now" is refused, per `DkimRotationBlocker`. */
+const DKIM_ROTATION_REFUSALS: Record<DkimRotationBlocker, string> = {
+    unsupported: "This deployment's DKIM key provider doesn't rotate keys.",
+    ses: "Outbound mail is signed by Amazon SES's Easy DKIM, which rotates its own keys.",
+    no_key: "This domain has no DKIM key yet.",
+    imported: "This domain's DKIM key was imported by hand, so RapidMX can't rotate it.",
+    unknown_key: "The DKIM key provider can't tell whether it holds this domain's key, so it isn't rotated.",
+};
 
 /** Rejects an explicitly-provided `dmarcPolicy` that isn't one of the three real DMARC policy values -
  * `undefined` (not provided at all) is left alone, matching every other optional field's semantics. */
@@ -216,6 +251,17 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
     @Config("mail:autodiscover:public_url", "")
     private autodiscoverPublicUrl: string = "";
 
+    /** Whether DKIM keys rotate on schedule (`mail:dkim:rotation:enabled`): only what `GET /:id/dkim/rotation` says is scheduled depends on it here. */
+    @Config("mail:dkim:rotation:enabled", true)
+    protected dkimRotationEnabled: unknown = true;
+
+    @Config("mail:dkim:rotation:interval_days", DEFAULT_DKIM_ROTATION_INTERVAL_DAYS)
+    protected dkimRotationIntervalDays: unknown = DEFAULT_DKIM_ROTATION_INTERVAL_DAYS;
+
+    /** `mail:transport:provider`: with `ses`, SES signs with its own Easy DKIM and the domain keys don't rotate. */
+    @Config("mail:transport:provider", "postfix")
+    protected transportProvider: string = "postfix";
+
     private newVerificationToken(): string {
         return crypto.randomBytes(32).toString("base64url");
     }
@@ -224,9 +270,11 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
      * supplied both fields itself (an explicit caller-supplied pair - an admin importing their own
      * externally-managed OpenDKIM key - always wins) or the registered provider doesn't manage key
      * material at all (`NullDkimKeyProvider`, the default - see `DkimKeyProvider`'s own doc comment). A
-     * no-op (leaves whatever the caller sent, including nothing) in either of those cases. */
+     * no-op (leaves whatever the caller sent, including nothing) in either of those cases. `dkimManaged` says
+     * which: `false` for an imported pair (never rotated), `true` for the provider's. */
     private async ensureDkimFields(o: Partial<T>): Promise<void> {
         if (o.dkimSelector && o.dkimPublicKey) {
+            (o as any).dkimManaged = false;
             return;
         }
         const keyPair = await this.dkimKeyProvider!.ensureKeyPair(o.name!);
@@ -235,6 +283,7 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         }
         (o as any).dkimSelector = keyPair.selector;
         (o as any).dkimPublicKey = keyPair.publicKey;
+        (o as any).dkimManaged = true;
     }
 
     /** Validates a candidate `aliasOf` (already normalized to lowercase): it must name an existing `Domain`
@@ -329,9 +378,11 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
             // A provider is assigned only through `PUT /:id/dns-provider` (elevation, zone check, audit); publication status only the controller writes.
             delete (o as any).dnsProviderUid;
             delete (o as any).dnsPublication;
-            // The apex TXT set is managed only through `PUT /:id/apex-txt`; a rotation only the rotation job starts.
+            // The apex TXT set is managed only through `PUT /:id/apex-txt`; a rotation only the rotation job and the `dkim/...` routes start; whether the
+            // key is the provider's is the server's to say.
             delete (o as any).apexTxt;
             delete (o as any).dkimRotation;
+            delete (o as any).dkimManaged;
             await this.assignUidAndCheckCollision(o);
             if (seenUids.has((o as any).uid)) {
                 throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "Duplicate domain within the same request.");
@@ -388,6 +439,13 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "A domain's name cannot be changed - delete and re-create it instead.");
         }
         validateDmarcPolicy(patch.dmarcPolicy);
+        if (["dkimSelector", "dkimPublicKey"].some((field) => patch[field] !== undefined && patch[field] !== (existing as any)[field])) {
+            // Another key imported by hand: never rotated. Not in the middle of a rotation, whose records and switch are built on the key it replaces.
+            if ((existing.dkimRotation?.phase ?? "idle") !== "idle") {
+                throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "A DKIM key rotation is in progress; cancel it or let it finish before importing another key.");
+            }
+            patch.dkimManaged = false;
+        }
         if (patch.aliasOf !== undefined) {
             patch.aliasOf = normalizeAddress(String(patch.aliasOf)) || undefined;
             if (patch.aliasOf && patch.aliasOf !== existing.aliasOf) {
@@ -795,6 +853,218 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         });
     }
 
+    /** What the rotation writes with: this route's repository, key provider, audit log and DNS publisher. */
+    private dkimRotationContext(): DkimRotationContext {
+        return { repo: this.repoUtils!, keyProvider: this.dkimKeyProvider!, auditLogUtils: this.auditLogUtils, dnsPublisher: this.dnsPublisher, logger: this.logger };
+    }
+
+    private async findDomainOr404(id: string): Promise<T> {
+        const domain: T | undefined = await this.repoUtils!.findOne(id, { ignoreACL: true });
+        if (!domain) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        return domain;
+    }
+
+    /**
+     * The domain's DKIM key rotation, for the console: its state, whether the key can rotate (and, when it can't, why: a provider that doesn't rotate,
+     * SES, no key, a key imported by hand), and when the next scheduled rotation starts. A trusted role. Writes nothing, even for a row from before
+     * rotation whose key the provider is asked about.
+     */
+    @RequiresTrustedRole()
+    @Get("/:id/dkim/rotation")
+    public async getDkimRotation(@Param("id") id: string): Promise<DkimRotationView> {
+        const domain: T = await this.findDomainOr404(id);
+        const blocker: DkimRotationBlocker | undefined = dkimRotationBlocker(
+            this.dkimKeyProvider,
+            domain,
+            await resolveDkimManaged(this.dkimKeyProvider, domain),
+            this.transportProvider,
+        );
+        const view: DkimRotationView = { rotation: domain.dkimRotation ?? null, rotatable: !blocker };
+        if (blocker) {
+            view.blocker = blocker;
+        } else if (
+            // The job's own conditions for a scheduled start (`DkimRotationJob.stepIdle()`).
+            (domain.dkimRotation?.phase ?? "idle") === "idle" &&
+            !domain.dkimRotation?.paused &&
+            domain.enabled &&
+            domain.verified &&
+            isConfigFlagOn(this.dkimRotationEnabled, true)
+        ) {
+            view.nextScheduledAt = nextScheduledDkimRotation(domain, configNumber(this.dkimRotationIntervalDays, DEFAULT_DKIM_ROTATION_INTERVAL_DAYS));
+        }
+        return view;
+    }
+
+    /**
+     * "Rotate now" (`{ compromised?: boolean }`): starts a rotation of the domain's DKIM key at once - a new selector and key, published (or shown for the
+     * admin to add) next to the active one; `DkimRotationJob` switches signing once the new record is live. With `compromised`, the publish grace and the
+     * overlap are skipped (the switch still waits for the live check: switching earlier would fail DKIM on every message), and a rotation in progress
+     * treats the key it replaces as compromised (`reportDkimKeyCompromised()`). A trusted role and an elevated token; audited `DKIM_ROTATION_STARTED`. 409
+     * for a key that can't rotate or, without `compromised`, a rotation already in progress. A row from before rotation whose key the provider holds is
+     * recorded as `dkimManaged` with the start.
+     */
+    @RequiresTrustedRole()
+    @Post("/:id/dkim/rotate")
+    public async rotateDkim(@Param("id") id: string, obj: any, @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T> {
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
+        const body: Record<string, unknown> = obj && typeof obj === "object" && !Array.isArray(obj) ? obj : {};
+        if (body.compromised !== undefined && typeof body.compromised !== "boolean") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'compromised' must be true or false.");
+        }
+        const reason: DkimRotationReason = body.compromised ? "compromised" : "manual";
+        const domain: T = await this.findDomainOr404(id);
+        const managed: boolean | undefined = await resolveDkimManaged(this.dkimKeyProvider, domain);
+        const blocker: DkimRotationBlocker | undefined = dkimRotationBlocker(this.dkimKeyProvider, domain, managed, this.transportProvider);
+        if (blocker) {
+            throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, DKIM_ROTATION_REFUSALS[blocker]);
+        }
+
+        const state: DkimRotationState | null | undefined = domain.dkimRotation;
+        if ((state?.phase ?? "idle") === "idle") {
+            return await startDkimRotation(this.dkimRotationContext(), domain, reason, new Date(), { req, user }, managed !== domain.dkimManaged ? { dkimManaged: managed } : {});
+        }
+        if (reason !== "compromised") {
+            throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "A DKIM key rotation is already in progress for this domain.");
+        }
+        return await this.reportDkimKeyCompromised(domain, state!, { req, user });
+    }
+
+    /**
+     * "Key compromised" during a rotation: the key the rotation replaces is the one reported, so it goes as soon as it can. Pending: the publish grace is
+     * skipped. Switching: the old record is retired as soon as the MTA confirms the switch (no overlap). Overlap: the old record and key are retired at
+     * once. Audited `DKIM_ROTATION_STARTED` with `reason: "compromised"`; a rotation that already treats the key as compromised is a 409.
+     */
+    private async reportDkimKeyCompromised(domain: T, state: DkimRotationState, caller: DkimRotationCaller): Promise<T> {
+        const ctx: DkimRotationContext = this.dkimRotationContext();
+        const audit = async (selector: string): Promise<void> =>
+            await this.auditLogUtils!.record(
+                { action: AuditAction.DKIM_ROTATION_STARTED, targetType: "Domain", targetUid: domain.uid, details: { name: domain.name, selector, reason: "compromised" } },
+                caller,
+            );
+        const next = state.next;
+        if (state.phase === "pending" && next?.selector && next.reason !== "compromised") {
+            const updated: T = await saveDkimRotation(ctx, domain, { ...state, next: { ...next, reason: "compromised" } }, {}, caller.user);
+            await audit(next.selector);
+            return updated;
+        }
+        if (state.phase === "switching" && state.reason !== "compromised") {
+            const updated: T = await saveDkimRotation(ctx, domain, { ...state, reason: "compromised" }, {}, caller.user);
+            await audit(domain.dkimSelector!);
+            return updated;
+        }
+        if (state.phase === "overlap") {
+            const retired: T = await retireDkimRotation(ctx, domain, new Date(), caller);
+            await audit(domain.dkimSelector!);
+            return retired;
+        }
+        throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "This DKIM key rotation already treats the key as compromised.");
+    }
+
+    /**
+     * Abandons a rotation whose switch the MTA hasn't confirmed: the new key is deleted and its record leaves the desired state. In `switching` the switch
+     * is reverted first (`revertDkimSwitch()`): the way out of a switch the MTA never acknowledges. The next scheduled rotation counts from now. A trusted
+     * role and an elevated token; audited `DKIM_ROTATION_CANCELLED` (with `reverted: true` for a reverted switch). Nothing to cancel changes nothing; a
+     * rotation in its overlap is a 409 (it finishes on its own).
+     */
+    @RequiresTrustedRole()
+    @Post("/:id/dkim/rotation/cancel")
+    public async cancelDkimRotation(@Param("id") id: string, @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T> {
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
+        const domain: T = await this.findDomainOr404(id);
+        const state: DkimRotationState | null | undefined = domain.dkimRotation;
+        if ((state?.phase ?? "idle") === "idle") {
+            return domain;
+        }
+        if (state!.phase !== "pending" && state!.phase !== "switching") {
+            throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "The mail server has confirmed it signs with the new DKIM key; the rotation finishes on its own.");
+        }
+        const reverted: boolean = state!.phase === "switching";
+        const selector: string | undefined = reverted ? domain.dkimSelector : state!.next?.selector;
+        const cancelled: DkimRotationState = { ...keptDkimRotationState(state), lastCancelledAt: new Date() };
+        const updated: T = reverted
+            ? await this.revertDkimSwitch(domain, state!, cancelled, user)
+            : await saveDkimRotation(this.dkimRotationContext(), domain, cancelled, {}, user);
+        if (selector) {
+            try {
+                await this.dkimKeyProvider?.deleteKeyPair?.(domain.name, selector);
+            } catch (err: any) {
+                this.logger?.warn(`BaseDomainRoute: the cancelled DKIM key '${selector}' of '${domain.name}' could not be deleted: ${err?.message}`);
+            }
+        }
+        await this.auditLogUtils!.record(
+            {
+                action: AuditAction.DKIM_ROTATION_CANCELLED,
+                targetType: "Domain",
+                targetUid: domain.uid,
+                details: reverted ? { name: domain.name, selector, reverted } : { name: domain.name, selector },
+            },
+            { req, user },
+        );
+        await this.announce(domain.uid);
+        return updated;
+    }
+
+    /**
+     * Puts a switched domain back on its old key (`previous`), saving `cancelled` with it. The provider is asked to sign with the old key first, so a
+     * provider that can't changes nothing (503). The row is then one versioned update: a job confirming the switch at the same time wins (409), and the
+     * provider is pointed back at the row's selector. After the write the old key is activated again, since a job run may have activated the new one in
+     * between; a run activating it later sees the reverted row and points the provider back itself (`DkimRotationJob.stepSwitching()`). 409 when the old
+     * key is gone: nothing to sign with.
+     */
+    private async revertDkimSwitch(domain: T, state: DkimRotationState, cancelled: DkimRotationState, user?: JWTUser): Promise<T> {
+        const provider: DkimKeyProvider = this.dkimKeyProvider!;
+        const previous = state.previous;
+        if (!previous?.selector || !previous.publicKey || (provider.findKeyPair && !(await provider.findKeyPair(domain.name, previous.selector)))) {
+            throw new ApiError(ApiErrors.IDENTIFIER_EXISTS, 409, "The previous DKIM key is gone, so signing can't go back to it; let the rotation finish.");
+        }
+        try {
+            await provider.activate!(domain.name, previous.selector);
+        } catch (err: any) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 503, `Signing could not be switched back to the previous DKIM key: ${err?.message}`);
+        }
+        let updated: T;
+        try {
+            updated = await saveDkimRotation(this.dkimRotationContext(), domain, cancelled, { dkimSelector: previous.selector, dkimPublicKey: previous.publicKey }, user);
+        } catch (err: any) {
+            const current: T | undefined = await this.repoUtils!.findOne(domain.uid, { ignoreACL: true });
+            await provider.activate!(domain.name, current?.dkimSelector ?? domain.dkimSelector!).catch((activateErr: any) =>
+                this.logger?.error(`BaseDomainRoute: '${domain.name}' could not be signed with its current DKIM key again: ${activateErr?.message}`),
+            );
+            throw err;
+        }
+        await provider.activate!(domain.name, previous.selector).catch((err: any) =>
+            this.logger?.error(`BaseDomainRoute: '${domain.name}' could not be signed with its previous DKIM key '${previous.selector}' again: ${err?.message}`),
+        );
+        return updated;
+    }
+
+    /**
+     * Pauses (`{ paused: true }`) or resumes scheduled DKIM rotation for this domain. "Rotate now" still works while paused, and a rotation in progress
+     * still finishes. A trusted role and an elevated token; audited `DKIM_ROTATION_PAUSED`. The setting it already has changes nothing.
+     */
+    @RequiresTrustedRole()
+    @Put("/:id/dkim/rotation")
+    public async updateDkimRotation(@Param("id") id: string, obj: any, @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<T> {
+        assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
+        const paused: unknown = obj && typeof obj === "object" && !Array.isArray(obj) ? obj.paused : undefined;
+        if (typeof paused !== "boolean") {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'paused' must be true or false.");
+        }
+        const domain: T = await this.findDomainOr404(id);
+        const state: DkimRotationState = domain.dkimRotation ?? { phase: "idle" };
+        if (!!state.paused === paused) {
+            return domain;
+        }
+        const updated: T = await saveDkimRotation(this.dkimRotationContext(), domain, { ...state, paused }, {}, user);
+        await this.auditLogUtils!.record(
+            { action: AuditAction.DKIM_ROTATION_PAUSED, targetType: "Domain", targetUid: domain.uid, details: { name: domain.name, paused } },
+            { req, user },
+        );
+        return updated;
+    }
+
     /**
      * Triggers an immediate DNS ownership check rather than waiting for `DomainVerificationJob`'s next
      * scheduled pass - looks for the `verificationToken` at `_rapidmx-verify.<domain>`, and at the apex while
@@ -862,7 +1132,7 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
             try {
                 const keyPair = await this.dkimKeyProvider!.ensureKeyPair(domain.name);
                 if (keyPair) {
-                    const patch: any = { uid: domain.uid, version: domain.version, dkimSelector: keyPair.selector, dkimPublicKey: keyPair.publicKey };
+                    const patch: any = { uid: domain.uid, version: domain.version, dkimSelector: keyPair.selector, dkimPublicKey: keyPair.publicKey, dkimManaged: true };
                     domain = await this.repoUtils!.update(patch, domain, { version: domain.version, ignoreACL: true });
                     await this.announce(domain.uid);
                 }

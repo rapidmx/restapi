@@ -2252,14 +2252,17 @@ export enum AuditAction {
      * into apex TXT management). `details` carries the `provider`, the `domain`, the `recordNames`, their `oldValues` as the live lookup saw them and the
      * queued `operation` uid. */
     DNS_TAKEOVER = "dns.takeover",
-    /** A DKIM key rotation began. `details` carries the new selector and `reason` (`scheduled`, `manual` or `compromised`). */
+    /** A DKIM key rotation began. `details` carries the domain `name`, the new `selector` and `reason` (`scheduled`, `manual` or `compromised`). */
     DKIM_ROTATION_STARTED = "dkim_rotation.started",
-    /** Signing switched to a rotation's new selector. */
+    /** Signing switched to a rotation's new selector. `details` carries the domain `name`, the new `selector` and the `previousSelector`. */
     DKIM_ROTATION_SWITCHED = "dkim_rotation.switched",
-    /** A rotation's old selector was retired and its private key deleted. */
+    /** A rotation's old selector was retired and its private key deleted. `details` carries the domain `name` and the retired `selector`. */
     DKIM_ROTATION_RETIRED = "dkim_rotation.retired",
-    /** A rotation that had not switched yet was abandoned. */
+    /** A rotation that had not switched yet was abandoned. `details` carries the domain `name` and the abandoned `selector`. */
     DKIM_ROTATION_CANCELLED = "dkim_rotation.cancelled",
+    /** `PUT /mail/domains/:id/dkim/rotation` - scheduled DKIM rotation was paused or resumed for a domain. `details` carries the domain `name` and
+     * `paused`. */
+    DKIM_ROTATION_PAUSED = "dkim_rotation.paused",
     /** An Integrations section was changed. `details` carries the `section`, the changed keys and `secretChanged`; never a secret. */
     INTEGRATION_UPDATE = "integration.update",
     /** An Integrations section's admin values were reset to the deployment's. `details` carries the `section` and `keys`. */
@@ -2384,14 +2387,40 @@ export interface ApexTxtSettings {
     spf?: string;
 }
 
-/** A domain's DKIM key rotation. Written by the rotation job (restapi step 4); read by the DNS checklist and the desired state, which publish `next`
- * and `previous` next to the active key while they exist. */
+/** Why a DKIM key rotation began: the schedule (`mail:dkim:rotation:interval_days`), an administrator's "Rotate now", or a key reported compromised,
+ * which skips the publish grace and the overlap. */
+export type DkimRotationReason = "scheduled" | "manual" | "compromised";
+
+/**
+ * A domain's DKIM key rotation (`DkimRotationJob`, `util/DkimRotationUtils.ts`). Read by the DNS checklist and the desired state, which publish `next` and
+ * `previous` next to the active key while they exist. Server-managed: written only by the rotation job and the `dkim/rotate`, `dkim/rotation/cancel` and
+ * `dkim/rotation` routes, each change one versioned update of the domain row. On SQL the dates come back as ISO strings (a JSON column).
+ *
+ * - `idle`: nothing in progress (also an unset state).
+ * - `pending`: `next` holds the new selector (recorded before its key is generated, so `publicKey` is `""` until then); signing is unchanged until the
+ * new record is live (`liveSince`) and, unless compromised, the publish grace has passed.
+ * - `switching`: signing was switched (`switchedAt`); the active key is the new one and `previous` the old, both published, until the MTA reports it
+ * signs with the new selector. A cancel now reverts the switch.
+ * - `overlap`: confirmed; the old record stays published until `previous.retireAt`, then its key is deleted and the state is idle again.
+ */
 export interface DkimRotationState {
     phase: "idle" | "pending" | "switching" | "overlap";
-    next?: { selector: string; publicKey: string; createdAt: Date; liveSince?: Date; reason: "scheduled" | "manual" | "compromised" };
+    next?: { selector: string; publicKey: string; createdAt: Date; liveSince?: Date; reason: DkimRotationReason };
     previous?: { selector: string; publicKey: string; retireAt?: Date };
+    /** The reason of the rotation that switched, kept until it is retired (a compromised key has no overlap). */
+    reason?: DkimRotationReason;
+    /** When signing switched to the new selector: the MTA's acknowledgement is awaited for an hour from it. */
+    switchedAt?: Date;
+    /** When the last rotation finished. The next scheduled one is due `interval_days` after it, or after the domain's creation. */
     lastRotatedAt?: Date;
+    /** When a rotation was last cancelled: the interval counts from it too, so a cancelled scheduled rotation isn't started again on the next run. */
+    lastCancelledAt?: Date;
+    /** Scheduled rotation is paused for this domain; "Rotate now" still works, and a rotation in progress still finishes. */
     paused?: boolean;
+    /** The selectors minted on the UTC day of the latest rotation start, cancelled or retired ones included: never minted again, since a receiver may
+     * still cache an earlier record at that name. */
+    mintedSelectors?: string[];
+    /** What is holding the rotation up, for the console: no acknowledgement from the MTA, a key that couldn't be generated. */
     lastError?: string;
 }
 
@@ -2560,6 +2589,11 @@ export interface Domain extends BaseEntity {
 
     /** The DKIM key rotation in progress, if any. Server-managed. */
     dkimRotation?: DkimRotationState | null;
+
+    /** `true` when the active DKIM key came from the `DkimKeyProvider` (it can rotate), `false` when an administrator imported `dkimSelector`/
+     * `dkimPublicKey` by hand (never rotated). Unset on rows from before rotation, until the rotation job or a rotate request asks the provider whether
+     * it holds that key. Server-managed. */
+    dkimManaged?: boolean | null;
 }
 
 /**

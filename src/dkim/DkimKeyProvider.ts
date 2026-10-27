@@ -39,11 +39,30 @@ export interface DkimKeyProvider {
      * default registration - a deployment that wants the original manual model, where an admin fills in
      * `dkimSelector`/`dkimPublicKey` by hand, registers that instead of `FsDkimKeyProvider`). Idempotent
      * and safe to call on every `Domain` create/verify/dns-setup pass when it DOES manage key material - an
-     * existing key pair is never regenerated or rotated by this call (a `Domain`'s DKIM key, once minted,
-     * is stable for that domain's lifetime; rotation, if ever needed, is a deliberately separate,
-     * not-yet-built operation).
+     * existing key pair is never regenerated or rotated by this call. Rotation is the separate, optional
+     * methods below, driven by `DkimRotationJob`: a provider that rotates returns the key of the selector it
+     * currently signs with.
      *
      * @param domain The verified domain name (`Domain.name`) to ensure a key pair for.
      */
     ensureKeyPair(domain: string): Promise<DkimKeyPair | undefined>;
+
+    /** Whether this provider implements the rotation methods below. Unset or `false` (`NullDkimKeyProvider`): keys are never rotated. */
+    readonly supportsRotation?: boolean;
+
+    /** Creates the key for `selector` without signing with it, or returns the one already there. Idempotent (an exclusive create, as `ensureKeyPair()`
+     * is), so two replicas generating the same selector end up with one key. */
+    generateKeyPair?(domain: string, selector: string): Promise<DkimKeyPair>;
+
+    /** The key `selector` has, without creating one: what tells a provider-made key from one an administrator imported by hand. */
+    findKeyPair?(domain: string, selector: string): Promise<DkimKeyPair | undefined>;
+
+    /** Makes `selector`, whose key must exist, the one the MTA signs `domain` with. Idempotent. */
+    activate?(domain: string, selector: string): Promise<void>;
+
+    /** The selector the MTA reports it is signing `domain` with, or `undefined` when it reports none (an MTA that doesn't acknowledge). */
+    signingSelector?(domain: string): Promise<string | undefined>;
+
+    /** Deletes the private key of a retired selector. Resolves when it is already gone; refuses the selector `domain` is signed with. */
+    deleteKeyPair?(domain: string, selector: string): Promise<void>;
 }

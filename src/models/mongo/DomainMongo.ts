@@ -101,6 +101,11 @@ export class DomainMongo extends BaseMongoEntity implements Domain {
     @Nullable
     public dkimRotation?: DkimRotationState | null;
 
+    @Column()
+    @Description("Whether the active DKIM key came from the key provider (it can rotate) rather than being imported by hand.")
+    @Nullable
+    public dkimManaged?: boolean | null;
+
     constructor(other?: Partial<DomainMongo>) {
         super(other);
 
@@ -120,6 +125,7 @@ export class DomainMongo extends BaseMongoEntity implements Domain {
             this.dnsPublication = "dnsPublication" in other ? other.dnsPublication : this.dnsPublication;
             this.apexTxt = "apexTxt" in other ? other.apexTxt : this.apexTxt;
             this.dkimRotation = "dkimRotation" in other ? other.dkimRotation : this.dkimRotation;
+            this.dkimManaged = "dkimManaged" in other ? other.dkimManaged : this.dkimManaged;
         }
     }
 }

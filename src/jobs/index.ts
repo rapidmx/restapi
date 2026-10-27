@@ -2,6 +2,7 @@ export * from "./AcmeEnrollmentDriverJob.js";
 export * from "./AttachmentExtractionJob.js";
 export * from "./CalendarReminderJob.js";
 export * from "./DataExportJob.js";
+export * from "./DkimRotationJob.js";
 export * from "./DomainVerificationJob.js";
 export * from "./ErasureExecutionJob.js";
 export * from "./ExternalShareExpirationJob.js";
