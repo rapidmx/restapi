@@ -49,6 +49,11 @@ export class SetupStateMongo extends BaseMongoEntity implements SetupState {
     @Nullable
     public seededDomains?: string[];
 
+    @Column()
+    @Description("The DNS provider config the server created for the installer, never created again once set.")
+    @Nullable
+    public bootstrapDnsProviderUid?: string;
+
     constructor(other?: Partial<SetupStateMongo>) {
         super(other);
 
@@ -57,6 +62,7 @@ export class SetupStateMongo extends BaseMongoEntity implements SetupState {
             this.completedAt = "completedAt" in other ? other.completedAt : this.completedAt;
             this.currentStep = "currentStep" in other ? other.currentStep : this.currentStep;
             this.seededDomains = "seededDomains" in other ? other.seededDomains : this.seededDomains;
+            this.bootstrapDnsProviderUid = "bootstrapDnsProviderUid" in other ? other.bootstrapDnsProviderUid : this.bootstrapDnsProviderUid;
         }
     }
 }

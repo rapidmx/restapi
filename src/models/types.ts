@@ -616,6 +616,11 @@ export interface SetupState extends BaseEntity {
     /** Every domain name `DomainSeeder` has seeded from `mail:domains` (or found already there), append-only: a name on it is never created again, so a
      * seeded domain the admin deleted stays deleted while the configuration still lists it. Server-managed. */
     seededDomains?: string[];
+
+    /** The `uid` of the DNS provider config the server created for the installer (`origin: "installer"`) from `mail:dns:bootstrap_provider`, set once it
+     * exists. While set the server never creates one again, so an administrator who deleted that config in the console doesn't get it back on the next
+     * start. Server-managed. */
+    bootstrapDnsProviderUid?: string;
 }
 
 export type DataExportFormat = "json" | "mbox";

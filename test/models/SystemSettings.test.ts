@@ -10,8 +10,8 @@ import { SetupStateSQL } from "../../src/models/sql/SetupStateSQL.js";
 describe.each([
     ["MailboxPolicyMongo", MailboxPolicyMongo, { defaultQuotaBytes: 1, autoProvisionEnabled: true, autoProvisionQuotaBytes: 2 }],
     ["MailboxPolicySQL", MailboxPolicySQL, { defaultQuotaBytes: 1, autoProvisionEnabled: true, autoProvisionQuotaBytes: 2 }],
-    ["SetupStateMongo", SetupStateMongo, { startedAt: new Date(1), completedAt: new Date(2), currentStep: "domain", seededDomains: ["example.com"] }],
-    ["SetupStateSQL", SetupStateSQL, { startedAt: new Date(1), completedAt: new Date(2), currentStep: "domain", seededDomains: ["example.com"] }],
+    ["SetupStateMongo", SetupStateMongo, { startedAt: new Date(1), completedAt: new Date(2), currentStep: "domain", seededDomains: ["example.com"], bootstrapDnsProviderUid: "installer-cloudflare" }],
+    ["SetupStateSQL", SetupStateSQL, { startedAt: new Date(1), completedAt: new Date(2), currentStep: "domain", seededDomains: ["example.com"], bootstrapDnsProviderUid: "installer-cloudflare" }],
 ])("%s", (_name, Model: any, values: Record<string, unknown>) => {
     it("leaves every field unset by default and applies provided values", () => {
         for (const obj of [new Model(), new Model({})]) {
