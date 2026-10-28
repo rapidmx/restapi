@@ -1063,6 +1063,20 @@ export function dnsPublishingSuite(ctx: DnsPublishingSuiteContext): void {
             const hosts = await takeover(provider.uid, { hosts: true });
             expect(hosts.status, JSON.stringify(hosts.body)).toBe(200);
             expect(hosts.body.records.map((r: any) => r.dnsName)).toEqual([MX_HOST]);
+
+            // Every host in the way: nothing to take over.
+            ctx.resolver().cnameRecords.set(MX_HOST, ["elsewhere.example.net"]);
+            const none = await takeover(provider.uid, { hosts: true });
+            expect(none.status).toBe(400);
+            expect(none.body.message).toContain("no host");
+
+            // A host that is live and this deployment's own is judged published, once its endpoint is observed, and is no obstacle to a takeover.
+            ctx.resolver().cnameRecords.delete(MX_HOST);
+            ctx.resolver().addressRecords.set(MX_HOST, ["203.0.114.7"]);
+            const { ownerId } = await desiredState();
+            ctx.resolver().records.set(`rmx-a.${MX_HOST}`, [[`heritage=external-dns,external-dns/owner=${ownerId},external-dns/resource=crd/mail/x`]]);
+            const again = await takeover(provider.uid, { hosts: true });
+            expect(again.status, JSON.stringify(again.body)).toBe(200);
         });
 
         it("queues the takeover of the hosts' records through the config that publishes them, audited with the live values", async () => {
