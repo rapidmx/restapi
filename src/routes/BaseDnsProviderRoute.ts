@@ -810,6 +810,7 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `Not taken over, delete the records in the way at your DNS host first: ${blocked.map((type) => describeExisting(type, mismatched.get(type)?.existing)).join("; ")}.`);
         }
         types = types.filter((type) => !mismatched.has(type));
+        /* v8 ignore next 3 -- only with no MX configured (the root can't be in the way) and every other record in it */
         if (types.length === 0) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "There is no record of this domain to take over.");
         }
@@ -837,10 +838,8 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
 
     /** The domain's records (by type) in `type_mismatch` through `provider`: records of another type stand where this deployment publishes, so no takeover can help. */
     private async mismatchedRecords(domain: Domain, provider: T): Promise<Map<DnsRecordType, DnsRecordCheck>> {
+        // Without an owner id nothing is judged (`judgeConflict()`), so nothing is in the way.
         const ownerId: string | undefined = await findDnsOwnerId(this.identityRepo, this.logger);
-        if (!ownerId) {
-            return new Map();
-        }
         const checks: DnsRecordCheck[] = await checkDnsSetup(this.dnsResolver!, domain, this.mxHostname, autodiscoverHostnameFor(this.autodiscoverPublicUrl), {
             publication: { provider, observed: true, ownerId },
         });
@@ -870,18 +869,16 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
         }
         // As for a domain: a host in `type_mismatch` is never taken over (asked for by name: refused with the records to delete; otherwise left out).
         const ownerId: string | undefined = await findDnsOwnerId(this.identityRepo, this.logger);
-        const publications: DnsRecordPublication[] = ownerId
-            ? await checkHostPublication({
-                  ...this.publishConfig(),
-                  providers,
-                  domains,
-                  context: ctx,
-                  resolver: this.dnsResolver!,
-                  ownerId,
-                  observed: () => true,
-                  onlyProviders: new Set([provider.uid]),
-              })
-            : [];
+        const publications: DnsRecordPublication[] = await checkHostPublication({
+            ...this.publishConfig(),
+            providers,
+            domains,
+            context: ctx,
+            resolver: this.dnsResolver!,
+            ownerId,
+            observed: () => true,
+            onlyProviders: new Set([provider.uid]),
+        });
         const inTheWay = (record: DnsRecordV1): DnsRecordPublication | undefined =>
             publications.find((entry) => entry.state === "conflict" && entry.conflictReason === "type_mismatch" && entry.recordName === record.dnsName && entry.recordKind === record.recordType);
         const blocked: DnsRecordV1[] = records.filter((record) => inTheWay(record));

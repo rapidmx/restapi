@@ -167,6 +167,14 @@ describe("planAutomaticTakeovers()", () => {
             expect(names(done.records)).toEqual(["TXT _dmarc.example.com"]);
         });
 
+        it("ignores operations that concern no endpoint set, such as a test", async () => {
+            conflictingMxAndDmarc();
+
+            const [plan] = await planAutomaticTakeovers(input({ operations: [operation({ type: "test", endpointSetId: undefined })] }));
+
+            expect(names(plan.records)).toEqual(["MX example.com", "TXT _dmarc.example.com"]);
+        });
+
         it("takes the record over again once its desired value changed, and leaves the other provider's and the other sets' history alone", async () => {
             conflictingMxAndDmarc();
             const before = { dnsName: "_dmarc.example.com", recordType: "TXT" as const, targets: ["v=DMARC1; p=none;"], ttl: 300 };

@@ -297,6 +297,7 @@ describe("BaseDnsProviderRoute operations", () => {
         expect(await liveRecordValues(resolver, { dnsName: "_dmarc.example.com", recordType: "TXT" })).toEqual(["v=DMARC1; p=none;"]);
         expect(await liveRecordValues(resolver, { dnsName: "openpgpkey.example.com", recordType: "CNAME" })).toEqual([]);
         // A resolver that can't look addresses up knows none; one that can gives each family its own.
+        expect(await liveRecordValues(resolver, { dnsName: "mail.example.com", recordType: "NS" as any })).toEqual([]);
         expect(await liveRecordValues(resolver, { dnsName: "mail.example.com", recordType: "A" })).toEqual([]);
         resolver.resolveAddresses = vi.fn(async () => ["198.51.100.9", "2001:db8::9"]);
         expect(await liveRecordValues(resolver, { dnsName: "mail.example.com", recordType: "A" })).toEqual(["198.51.100.9"]);
