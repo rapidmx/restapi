@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { JWTUser } from "@rapidrest/core";
-import { type AccessControlList, type ACLRecord, type ACLUtils, ModelUtils, type RepoUtils } from "@rapidrest/service-core";
+import { type AccessControlList, type ACLRecord, type ACLUtils, ApiErrors, ModelUtils, type RepoUtils } from "@rapidrest/service-core";
 import { Folder, FolderType } from "../models/types.js";
 import { nameBasedUuid } from "./UuidUtils.js";
 
@@ -129,6 +129,15 @@ export async function ensureWellKnownFolders<F extends Folder>(
     return ensured;
 }
 
+/** How many times, and how long (times the attempt number, in milliseconds), a create that lost the claim of its folder's ACL waits for the winner's row. */
+const LOST_CLAIM_POLLS: number = 6;
+const LOST_CLAIM_POLL_MS: number = 25;
+
+/** Whether `err` is the `IDENTIFIER_EXISTS` refusal `RepoUtils.create()` gives a record or ACL claim that something else holds. */
+function isIdentifierConflict(err: unknown): boolean {
+    return (err as { code?: unknown } | null | undefined)?.code === ApiErrors.IDENTIFIER_EXISTS;
+}
+
 /**
  * Finds the given mailbox's well-known folder of `type` (e.g. its Inbox, Junk, Sent Items), creating it — with
  * the platform's conventional display name — if it does not already exist. A mailbox gets every well-known folder
@@ -196,7 +205,22 @@ export async function findOrCreateWellKnownFolder<F extends Folder>(
         // uid: rethrown), or the winner's row only became visible now (used - a random-uid folder created here instead left
         // the mailbox with two of the same type, seen under concurrent first reads), or a soft-deleted folder already holds
         // the deterministic uid, in which case a random uid is used rather than failing delivery.
-        const holder: F | undefined = await folderRepo.findOne(deterministicUid, { ignoreACL: true, includeDeleted: true, skipCache: true });
+        let holder: F | undefined = await folderRepo.findOne(deterministicUid, { ignoreACL: true, includeDeleted: true, skipCache: true });
+        if (!holder && isIdentifierConflict(err)) {
+            // The create was refused at the claim of the folder's ACL (a concurrent create claimed it first, `createOnly`), before any row was
+            // written: the winner's insert is still to come. Waits for it instead of failing a read that only wanted the folder to exist.
+            for (let attempt = 1; !holder && attempt <= LOST_CLAIM_POLLS; attempt++) {
+                await new Promise((resolve) => setTimeout(resolve, LOST_CLAIM_POLL_MS * attempt));
+                const winner: F | undefined = await findExisting();
+                if (winner) {
+                    if (winner.uid === deterministicUid) {
+                        await ensureFolderACL(folderRepo, winner.uid, mailboxUid);
+                    }
+                    return winner;
+                }
+                holder = await folderRepo.findOne(deterministicUid, { ignoreACL: true, includeDeleted: true, skipCache: true });
+            }
+        }
         if (!holder) {
             throw err;
         }

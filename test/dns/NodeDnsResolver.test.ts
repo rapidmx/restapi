@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 // Isolated unit test for NodeDnsResolver - Node's own `dns` module is mocked so no real DNS lookup occurs.
 vi.mock("dns", () => ({
-    promises: { resolveTxt: vi.fn(), resolveMx: vi.fn(), resolveCname: vi.fn(), resolveSrv: vi.fn() },
+    promises: { resolveTxt: vi.fn(), resolveMx: vi.fn(), resolveCname: vi.fn(), resolveSrv: vi.fn(), resolve4: vi.fn(), resolve6: vi.fn() },
 }));
 
 import * as dns from "dns";
@@ -14,6 +14,8 @@ const mockResolveTxt = dns.promises.resolveTxt as any;
 const mockResolveMx = dns.promises.resolveMx as any;
 const mockResolveCname = dns.promises.resolveCname as any;
 const mockResolveSrv = dns.promises.resolveSrv as any;
+const mockResolve4 = dns.promises.resolve4 as any;
+const mockResolve6 = dns.promises.resolve6 as any;
 
 describe("NodeDnsResolver Tests", () => {
     it("Delegates to dns.promises.resolveTxt() and returns its result.", async () => {
@@ -82,5 +84,33 @@ describe("NodeDnsResolver Tests", () => {
         const resolver = new NodeDnsResolver();
 
         await expect(resolver.resolveSrv("_autodiscover._tcp.example.com")).rejects.toThrow(/ENOTFOUND/);
+    });
+
+    it("Resolves a name's A and AAAA records together.", async () => {
+        mockResolve4.mockResolvedValue(["203.0.113.7"]);
+        mockResolve6.mockResolvedValue(["2001:db8::7"]);
+
+        expect(await new NodeDnsResolver().resolveAddresses("mail.example.com")).toEqual(["203.0.113.7", "2001:db8::7"]);
+    });
+
+    it("Resolves the addresses of the family a name has when the other has none (NODATA).", async () => {
+        mockResolve4.mockResolvedValue(["203.0.113.7"]);
+        mockResolve6.mockRejectedValue(Object.assign(new Error("queryAaaa ENODATA mail.example.com"), { code: "ENODATA" }));
+
+        expect(await new NodeDnsResolver().resolveAddresses("mail.example.com")).toEqual(["203.0.113.7"]);
+    });
+
+    it("Rejects with the no-records error when the name has no address at all.", async () => {
+        mockResolve4.mockRejectedValue(Object.assign(new Error("queryA ENODATA x.example.com"), { code: "ENODATA" }));
+        mockResolve6.mockRejectedValue(Object.assign(new Error("queryAaaa ENOTFOUND x.example.com"), { code: "ENOTFOUND" }));
+
+        await expect(new NodeDnsResolver().resolveAddresses("x.example.com")).rejects.toMatchObject({ code: "ENODATA" });
+    });
+
+    it("Rejects with the unanswered lookup, not a no-records error, when one family could not be asked (nothing is known then).", async () => {
+        mockResolve4.mockRejectedValue(Object.assign(new Error("queryA ENODATA x.example.com"), { code: "ENODATA" }));
+        mockResolve6.mockRejectedValue(Object.assign(new Error("queryAaaa ETIMEOUT x.example.com"), { code: "ETIMEOUT" }));
+
+        await expect(new NodeDnsResolver().resolveAddresses("x.example.com")).rejects.toMatchObject({ code: "ETIMEOUT" });
     });
 });

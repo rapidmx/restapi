@@ -6,7 +6,18 @@
 // method here is defined relative to that.
 import { ApiError, ObjectDecorators, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, HttpRequest, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import { DEFAULT_PUBLISH_TTL, domainDnsRecordsV1, domainEndpointSetId, domainProvider, zoneCoverage } from "../dns/DnsDesiredState.js";
+import {
+    DEFAULT_PUBLISH_TTL,
+    domainDnsRecordsV1,
+    domainEndpointSetId,
+    domainProvider,
+    hostsEndpointSetId,
+    normalizePublicAddresses,
+    normalizePublishHosts,
+    zoneCoverage,
+    type PublishHost,
+} from "../dns/DnsDesiredState.js";
+import { checkHostPublication, hostEndpointSets } from "../dns/DnsHostPublication.js";
 import type { DnsRecordV1 } from "../dns/DnsDesiredStateApiV1.js";
 import { noConfigCipher, savedCredentialKeys, sealDnsCredentials } from "../dns/DnsProviderCredentials.js";
 import { notifyDnsPublisher, resolveDnsPublisher, type DnsPublisher } from "../dns/DnsPublisher.js";
@@ -31,11 +42,13 @@ import {
     autodiscoverHostnameFor,
     DNS_CONTROLLER_STATE_UID,
     findAllRows,
+    findDnsOwnerId,
+    liveRecordValues,
     queueDnsOperation,
     toPublicDnsOperation,
     type PublicDnsOperation,
 } from "../util/DnsPublishingUtils.js";
-import { buildDesiredDnsRecords, dnsManualReason } from "../util/DnsSetupUtils.js";
+import { buildDesiredDnsRecords, checkDnsSetup, dnsManualReason, type DnsRecordCheck } from "../util/DnsSetupUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { assertAdminScope, DEFAULT_ELEVATION_MAX_AGE_SECONDS } from "../util/MailAccessUtils.js";
 import { assertNoPathKeys, isDuplicateKeyError } from "../util/RequestBodyUtils.js";
@@ -43,12 +56,15 @@ import {
     AuditAction,
     ConfigEnvelope,
     DnsControllerState,
+    DnsExistingRecord,
     DnsOperation,
     DnsProvider,
     DnsProviderOptionValue,
     DnsProviderStatus,
     DnsProviderType,
+    DnsRecordPublication,
     DnsRecordType,
+    DeploymentIdentity,
     Domain,
 } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
@@ -59,6 +75,11 @@ export const MAX_DNS_PROVIDER_NAME_LENGTH = 100;
 
 /** The most operations `GET /:id/operations` lists: the latest. */
 const OPERATIONS_LISTED = 50;
+
+/** `name` with the records standing in its way, for the message of a refused takeover. */
+function describeExisting(name: string, existing: readonly DnsExistingRecord[] | undefined): string {
+    return `${name} (${(existing ?? []).map((record) => `${record.type} ${record.value}`).join(", ")})`;
+}
 
 /** What `GET /controller` answers: what the DNS controller last said about itself, `null` for what it never said. */
 export interface PublicDnsControllerState {
@@ -201,6 +222,10 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
     /** Supplied by the Mongo/SQL concrete subclasses: what the DNS controller last said about itself. */
     protected dnsControllerStateClass?: any;
 
+    /** Supplied by the Mongo/SQL concrete subclasses: the deployment's identity, whose installation id is the external-dns owner id (`GET /hosts` judges
+     * ownership by it). */
+    protected deploymentIdentityClass?: any;
+
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
@@ -232,12 +257,22 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
     @Config("mail:dns:publish:ttl", DEFAULT_PUBLISH_TTL)
     private publishTtlSeconds: number = DEFAULT_PUBLISH_TTL;
 
+    /** The deployment's own hosts and public addresses (`mail:dns:publish:hosts`, `mail:dns:publish:addresses`): what `GET /hosts` and a takeover of the hosts
+     * are built from, exactly as the desired state builds them. */
+    @Config("mail:dns:publish:hosts", [])
+    private publishHosts: unknown = [];
+
+    @Config("mail:dns:publish:addresses", [])
+    private publicAddresses: unknown = [];
+
     /** Announces changes to the DNS desired state; `NullDnsPublisher` on a server that registers none. */
     protected dnsPublisher?: DnsPublisher;
 
     protected operationRepo?: RepoUtils<DnsOperation>;
 
     protected controllerStateRepo?: RepoUtils<DnsControllerState>;
+
+    protected identityRepo?: RepoUtils<DeploymentIdentity>;
 
     protected repo?: RepoUtils<T>;
 
@@ -271,6 +306,9 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
         }
         if (!this.controllerStateRepo && this.dnsControllerStateClass) {
             this.controllerStateRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.dnsControllerStateClass.name, args: [this.dnsControllerStateClass] });
+        }
+        if (!this.identityRepo && this.deploymentIdentityClass) {
+            this.identityRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.deploymentIdentityClass.name, args: [this.deploymentIdentityClass] });
         }
         if (!this.dnsPublisher) {
             this.dnsPublisher = await resolveDnsPublisher(this._objectFactory, this.logger);
@@ -405,6 +443,37 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
     public async controller(): Promise<PublicDnsControllerState> {
         const state: DnsControllerState | undefined = this.controllerStateRepo ? await this.controllerStateRepo.findOne(DNS_CONTROLLER_STATE_UID, { ignoreACL: true, skipCache: true }) : undefined;
         return { handshake: state?.handshake ?? null, lastReport: state?.lastReport ?? null, lastStandbyReport: state?.lastStandbyReport ?? null };
+    }
+
+    /** The hosts and public addresses this deployment publishes (`mail:dns:publish:hosts`/`addresses`), normalized as the desired state does. */
+    private publishConfig(): { hosts: PublishHost[]; addresses: string[] } {
+        return { hosts: normalizePublishHosts(this.publishHosts).hosts, addresses: normalizePublicAddresses(this.publicAddresses).addresses };
+    }
+
+    /**
+     * The publication of each of the deployment's own hosts (`mail:dns:publish:hosts`, spec 6.3), the same states a domain's records have in its DNS
+     * checklist: manual with the reason (`outside_zones`, `no_addresses`, `no_target`), pending, published, or in conflict - `not_owned` (a takeover
+     * resolves it: `POST /:id/takeover` with `hosts: true`, `providerUid` naming the config) or `type_mismatch` with the `existing` records the admin has to
+     * delete at their DNS host (a CNAME wanted where addresses are, or addresses wanted where a CNAME is). Always looked up live. A trusted role.
+     */
+    @RequiresTrustedRole()
+    @Get("/hosts")
+    public async hosts(): Promise<DnsRecordPublication[]> {
+        const providers: T[] = await findAllRows<T>(this.repo!, {});
+        const domains: Domain[] = await findAllRows<Domain>(this.domainRepo!, {});
+        const observed = (endpointSetId: string): boolean => {
+            const endpoint = providers.find((provider) => hostsEndpointSetId(provider.uid) === endpointSetId)?.status?.hostsEndpoint;
+            return !!endpoint && endpoint.name === endpointSetId && endpoint.observedGeneration !== undefined && endpoint.observedGeneration >= endpoint.generation;
+        };
+        return await checkHostPublication({
+            ...this.publishConfig(),
+            providers,
+            domains,
+            context: { mxHostname: this.mxHostname, autodiscoverHostname: autodiscoverHostnameFor(this.autodiscoverPublicUrl), ttl: this.publishTtlSeconds },
+            resolver: this.dnsResolver!,
+            ownerId: await findDnsOwnerId(this.identityRepo, this.logger),
+            observed,
+        });
     }
 
     @RequiresTrustedRole()
@@ -681,26 +750,6 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
         return toPublicDnsOperation(operation);
     }
 
-    /** The live values of `record`, as text, for the audit entry of a takeover; none when the lookup fails. */
-    private async liveValues(record: DnsRecordV1): Promise<string[]> {
-        try {
-            switch (record.recordType) {
-                case "MX":
-                    return (await this.dnsResolver!.resolveMx(record.dnsName)).map((r) => `${r.priority} ${r.exchange}`);
-                case "SRV":
-                    return (await this.dnsResolver!.resolveSrv(record.dnsName)).map((r) => `${r.priority} ${r.weight} ${r.port} ${r.target}`);
-                case "CNAME":
-                    return await this.dnsResolver!.resolveCname(record.dnsName);
-                case "TXT":
-                    return (await this.dnsResolver!.resolveTxt(record.dnsName)).map((chunks) => chunks.join(""));
-                default:
-                    return [];
-            }
-        } catch {
-            return [];
-        }
-    }
-
     /**
      * Queues the takeover of a domain's records this deployment doesn't own yet (spec 9.3): the controller's one-shot Job overwrites them with the wanted
      * values and this deployment's ownership records, after which the regular instance manages them. Body: `domainUid`, and optionally `records`, the
@@ -708,14 +757,25 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
      * type asked for must be one it publishes through it (a 400 naming the others, such as MX on rfc2136, which can't hold it). The apex TXT set is never
      * taken over here: `PUT mail/domains/:id/apex-txt` alone manages it. A trusted role and an elevated token; audited (`DNS_TAKEOVER`) with the values
      * the live lookup sees now.
+     *
+     * **The deployment's hosts** (`mail:dns:publish:hosts`, spec 6.3) are taken over the same way with `{ hosts: true }` instead of `domainUid` (a body with both,
+     * or `hosts` of any other value, is a 400): the operation's endpoint set is `hosts-<uid>`, it has no domain, and `records` then lists the host names to
+     * take over (all the hosts this config publishes when left out; a name it doesn't publish is a 400). A config that publishes none of the hosts is a 400.
+     * `allowTakeover` governs only the server's own queuing of a takeover (`planAutomaticTakeovers()`), never this.
      */
     @RequiresTrustedRole()
     @Post("/:id/takeover")
     public async takeover(@Param("id") id: string, obj: any, @Request req: HttpRequest, @AuthUser user?: JWTUser): Promise<PublicDnsOperation> {
         assertAdminScope(user, this.trustedRoles, this.elevationMaxAgeSeconds);
         const body: Record<string, unknown> = obj && typeof obj === "object" && !Array.isArray(obj) ? obj : {};
+        if (body.hosts !== undefined) {
+            if (body.hosts !== true || body.domainUid !== undefined) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Name either the domain whose records to take over ('domainUid') or the deployment's hosts ('hosts': true), not both.");
+            }
+            return await this.takeoverHosts(await this.findProvider(id), body, req, user);
+        }
         if (typeof body.domainUid !== "string" || !body.domainUid) {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'domainUid' must name the domain whose records to take over.");
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'domainUid' must name the domain whose records to take over, or 'hosts' the deployment's hosts.");
         }
         const provider: T = await this.findProvider(id);
         const domain: Domain | undefined = await this.domainRepo!.findOne(body.domainUid.toLowerCase(), { ignoreACL: true });
@@ -742,6 +802,17 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
         if (unpublishable.length > 0) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `Not published through this DNS provider, so not taken over: ${unpublishable.join(", ")}.`);
         }
+        // A record whose live counterpart is of another type that can't stand next to it (`type_mismatch`) is never taken over: nothing a takeover writes can
+        // replace it, and the whole operation would fail for it. Asked for by name it is refused with the records to delete; left out otherwise.
+        const mismatched: Map<DnsRecordType, DnsRecordCheck> = await this.mismatchedRecords(domain, provider);
+        const blocked: DnsRecordType[] = types.filter((type) => mismatched.has(type));
+        if (blocked.length > 0 && body.records !== undefined) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `Not taken over, delete the records in the way at your DNS host first: ${blocked.map((type) => describeExisting(type, mismatched.get(type)?.existing)).join("; ")}.`);
+        }
+        types = types.filter((type) => !mismatched.has(type));
+        if (types.length === 0) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "There is no record of this domain to take over.");
+        }
         // Never empty: the ownership record at `_rapidmx-verify.<domain>` is always published through the config covering the domain.
         const records: DnsRecordV1[] = domainDnsRecordsV1(domain, provider, ctx, types);
         const operation: DnsOperation = await queueDnsOperation(this.operations(), this.dnsOperationClass, {
@@ -752,10 +823,90 @@ export abstract class BaseDnsProviderRoute<T extends DnsProvider> {
             records,
             requestedBy: user?.uid,
         });
-        const oldValues: string[] = (await Promise.all(records.map((record) => this.liveValues(record)))).flat();
+        const oldValues: string[] = (await Promise.all(records.map((record) => liveRecordValues(this.dnsResolver!, record)))).flat();
         await this.audit(req, user, AuditAction.DNS_TAKEOVER, provider, {
             provider: provider.uid,
             domain: domain.name,
+            recordNames: [...new Set(records.map((record) => record.dnsName))],
+            oldValues,
+            operation: operation.uid,
+        });
+        await notifyDnsPublisher(this.dnsPublisher, { scope: "operation", operationUid: operation.uid }, this.logger);
+        return toPublicDnsOperation(operation);
+    }
+
+    /** The domain's records (by type) in `type_mismatch` through `provider`: records of another type stand where this deployment publishes, so no takeover can help. */
+    private async mismatchedRecords(domain: Domain, provider: T): Promise<Map<DnsRecordType, DnsRecordCheck>> {
+        const ownerId: string | undefined = await findDnsOwnerId(this.identityRepo, this.logger);
+        if (!ownerId) {
+            return new Map();
+        }
+        const checks: DnsRecordCheck[] = await checkDnsSetup(this.dnsResolver!, domain, this.mxHostname, autodiscoverHostnameFor(this.autodiscoverPublicUrl), {
+            publication: { provider, observed: true, ownerId },
+        });
+        return new Map(checks.filter((check) => check.publication === "conflict" && check.conflictReason === "type_mismatch").map((check) => [check.type, check]));
+    }
+
+    /** The takeover of the deployment's hosts this config publishes (`takeover()`'s `hosts: true`). */
+    private async takeoverHosts(provider: T, body: Record<string, unknown>, req: HttpRequest, user: JWTUser | undefined): Promise<PublicDnsOperation> {
+        const providers: T[] = await findAllRows<T>(this.repo!, {});
+        const domains: Domain[] = await findAllRows<Domain>(this.domainRepo!, {});
+        const ctx = { mxHostname: this.mxHostname, autodiscoverHostname: autodiscoverHostnameFor(this.autodiscoverPublicUrl), ttl: this.publishTtlSeconds };
+        const set = hostEndpointSets({ ...this.publishConfig(), providers, domains, context: ctx }).endpointSets.find((candidate) => candidate.providerUid === provider.uid);
+        if (!set) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "This DNS provider publishes none of the deployment's hosts.");
+        }
+        let records: DnsRecordV1[] = set.records;
+        if (body.records !== undefined) {
+            if (!Array.isArray(body.records) || body.records.length === 0 || !body.records.every((name) => typeof name === "string")) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "'records' must list the names of hosts this DNS provider publishes.");
+            }
+            const wanted: Set<string> = new Set((body.records).map((name) => name.trim().toLowerCase().replace(/\.$/, "")));
+            const unknown: string[] = [...wanted].filter((name) => !set.records.some((record) => record.dnsName === name));
+            if (unknown.length > 0) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `Not hosts this DNS provider publishes, so not taken over: ${unknown.join(", ")}.`);
+            }
+            records = set.records.filter((record) => wanted.has(record.dnsName));
+        }
+        // As for a domain: a host in `type_mismatch` is never taken over (asked for by name: refused with the records to delete; otherwise left out).
+        const ownerId: string | undefined = await findDnsOwnerId(this.identityRepo, this.logger);
+        const publications: DnsRecordPublication[] = ownerId
+            ? await checkHostPublication({
+                  ...this.publishConfig(),
+                  providers,
+                  domains,
+                  context: ctx,
+                  resolver: this.dnsResolver!,
+                  ownerId,
+                  observed: () => true,
+                  onlyProviders: new Set([provider.uid]),
+              })
+            : [];
+        const inTheWay = (record: DnsRecordV1): DnsRecordPublication | undefined =>
+            publications.find((entry) => entry.state === "conflict" && entry.conflictReason === "type_mismatch" && entry.recordName === record.dnsName && entry.recordKind === record.recordType);
+        const blocked: DnsRecordV1[] = records.filter((record) => inTheWay(record));
+        if (blocked.length > 0 && body.records !== undefined) {
+            throw new ApiError(
+                ApiErrors.INVALID_REQUEST,
+                400,
+                `Not taken over, delete the records in the way at your DNS host first: ${blocked.map((record) => describeExisting(record.dnsName, inTheWay(record)?.existing)).join("; ")}.`,
+            );
+        }
+        records = records.filter((record) => !inTheWay(record));
+        if (records.length === 0) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "There is no host of this DNS provider to take over.");
+        }
+        const operation: DnsOperation = await queueDnsOperation(this.operations(), this.dnsOperationClass, {
+            type: "takeover",
+            providerUid: provider.uid,
+            endpointSetId: set.id,
+            records,
+            requestedBy: user?.uid,
+        });
+        const oldValues: string[] = (await Promise.all(records.map((record) => liveRecordValues(this.dnsResolver!, record)))).flat();
+        await this.audit(req, user, AuditAction.DNS_TAKEOVER, provider, {
+            provider: provider.uid,
+            hosts: true,
             recordNames: [...new Set(records.map((record) => record.dnsName))],
             oldValues,
             operation: operation.uid,

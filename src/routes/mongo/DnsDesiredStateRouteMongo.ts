@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { DeploymentIdentityMongo, DnsControllerStateMongo, DnsOperationMongo, DnsProviderMongo, DomainMongo } from "../../mongo.js";
+import { AuditLogEntryMongo, DeploymentIdentityMongo, DnsControllerStateMongo, DnsOperationMongo, DnsProviderMongo, DomainMongo } from "../../mongo.js";
 import { BaseDnsDesiredStateRoute } from "../BaseDnsDesiredStateRoute.js";
 
 export class DnsDesiredStateRouteMongo extends BaseDnsDesiredStateRoute {
@@ -11,4 +11,5 @@ export class DnsDesiredStateRouteMongo extends BaseDnsDesiredStateRoute {
     protected dnsOperationClass: any = DnsOperationMongo;
     protected deploymentIdentityClass: any = DeploymentIdentityMongo;
     protected dnsControllerStateClass: any = DnsControllerStateMongo;
+    protected auditLogClass: any = AuditLogEntryMongo;
 }

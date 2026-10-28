@@ -286,6 +286,8 @@ export class StaticDnsResolver implements DnsResolver {
     public mxRecords: Map<string, DnsMxRecord[]> = new Map();
     public cnameRecords: Map<string, string[]> = new Map();
     public srvRecords: Map<string, DnsSrvRecord[]> = new Map();
+    /** The A and AAAA values of a name, together, as `resolveAddresses()` answers them. */
+    public addressRecords: Map<string, string[]> = new Map();
     public failing: Set<string> = new Set();
 
     /** The entry of `map` for `hostname`: a failed lookup for a name in `failing`, NXDOMAIN for one without an entry. */
@@ -314,6 +316,10 @@ export class StaticDnsResolver implements DnsResolver {
 
     public async resolveSrv(hostname: string): Promise<DnsSrvRecord[]> {
         return this.lookup(this.srvRecords, hostname, "SRV");
+    }
+
+    public async resolveAddresses(hostname: string): Promise<string[]> {
+        return this.lookup(this.addressRecords, hostname, "A");
     }
 }
 

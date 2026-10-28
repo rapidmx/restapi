@@ -2,9 +2,11 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { randomBytes } from "crypto";
+import * as net from "net";
 import { getDnsProviderType, isDnsProviderType, isNameInZones } from "../dns/DnsProviderTypes.js";
 import type { DnsMxRecord, DnsResolver, DnsSrvRecord } from "../dns/DnsResolver.js";
-import type { DnsManualReason, DnsProvider, DnsRecordPublication, DnsRecordType, Domain } from "../models/types.js";
+import type { DnsConflictReason, DnsExistingRecord, DnsManualReason, DnsProvider, DnsRecordPublication, DnsRecordType, Domain } from "../models/types.js";
 import { buildVerificationRecordName, buildVerificationTxtValue, DEFAULT_ACCEPT_LEGACY_APEX, findDomainVerification } from "./DomainVerificationUtils.js";
 
 // Defined next to `Domain.dnsPublication`, which records publication per record type; re-exported here, where it always lived.
@@ -41,6 +43,11 @@ export interface DnsRecordCheck {
      * own is there) - or by hand (`"manual"`, with `manualReason`). The live check (`found`/`matches`) stays the source of truth for "is it working". */
     publication?: DnsRecordPublication["state"];
     manualReason?: DnsManualReason;
+    /** With `publication: "conflict"`: `"not_owned"` (a record of the right type this deployment doesn't own: a takeover can overwrite it) or
+     * `"type_mismatch"` (a record of another type that can't stand next to this one, in `existing`: the admin deletes it at their DNS host). */
+    conflictReason?: DnsConflictReason;
+    /** With `conflictReason: "type_mismatch"`: the live records in the way. */
+    existing?: DnsExistingRecord[];
     /** `ownership` only: the token is (still) at the domain's root, where it lived before `_rapidmx-verify`. The console says it can be moved, or
      * removed from there once it is at the new name. */
     legacyApex?: boolean;
@@ -221,11 +228,11 @@ export interface DnsSetupOptions {
     publication?: DnsSetupPublication;
 }
 
-/** Whether external-dns's TXT registry record for `recordName` (`rmx-<kind>.<name>`, the prefix `--txt-prefix=rmx-%{record_type}.` gives it) names
- * `ownerId` as the owner. A failed lookup is "not owned". */
-async function isOwned(dnsResolver: DnsResolver, check: DnsRecordCheck, ownerId: string): Promise<boolean> {
+/** Whether external-dns's TXT registry record for the `recordKind` record(s) at `recordName` (`rmx-<kind>.<name>`, the prefix
+ * `--txt-prefix=rmx-%{record_type}.` gives it) names `ownerId` as the owner. A failed lookup is "not owned". */
+export async function isRecordOwned(dnsResolver: DnsResolver, recordKind: string, recordName: string, ownerId: string): Promise<boolean> {
     try {
-        const records: string[][] = await dnsResolver.resolveTxt(`rmx-${check.recordKind.toLowerCase()}.${check.recordName}`);
+        const records: string[][] = await dnsResolver.resolveTxt(`rmx-${recordKind.toLowerCase()}.${recordName}`);
         const owner: RegExp = new RegExp(`(^|,)external-dns/owner=${ownerId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(,|$)`);
         return records.some((chunks) => owner.test(chunks.join("").replace(/^"|"$/g, "")));
     } catch {
@@ -241,7 +248,7 @@ interface LiveCheck {
 }
 
 /** `value` as compared with a published one: a TXT value as it is (trimmed); otherwise the host it ends with in lowercase without its final dot. */
-function comparable(kind: DnsRecordKind, value: string): string {
+function comparable(kind: DnsRecordKind | "A" | "AAAA", value: string): string {
     if (kind === "TXT") {
         return value.trim();
     }
@@ -251,10 +258,111 @@ function comparable(kind: DnsRecordKind, value: string): string {
 }
 
 /** Whether the live values at the name are exactly the desired ones, each value once, in any order. */
-function sameValues(kind: DnsRecordKind, live: readonly string[], desired: readonly string[]): boolean {
+export function sameValues(kind: DnsRecordKind | "A" | "AAAA", live: readonly string[], desired: readonly string[]): boolean {
     const a: Set<string> = new Set(live.map((value) => comparable(kind, value)));
     const b: Set<string> = new Set(desired.map((value) => comparable(kind, value)));
     return a.size === b.size && [...a].every((value) => b.has(value));
+}
+
+/** What `judgeConflict()` found in the way of a record: `replacing` when what stands there is this deployment's own record of another type, which
+ * external-dns replaces on its next sync (nothing for the admin to do, and not yet published), or the conflict. */
+export type ConflictJudgement = { replacing: true } | { conflictReason: DnsConflictReason; existing?: DnsExistingRecord[] };
+
+/** The record(s) of one live lookup as `DnsExistingRecord`s; a lookup that fails or answers nothing is none. */
+async function existingOf(lookup: () => Promise<DnsExistingRecord[]>): Promise<DnsExistingRecord[]> {
+    try {
+        return await lookup();
+    } catch {
+        return [];
+    }
+}
+
+/** The records of types other than CNAME at `name`: its addresses (when the resolver can look them up), MX and TXT records. What a CNAME can't stand next to. */
+async function recordsNextTo(dnsResolver: DnsResolver, name: string): Promise<DnsExistingRecord[]> {
+    const groups: DnsExistingRecord[][] = await Promise.all([
+        existingOf(async () => ((await dnsResolver.resolveAddresses?.(name)) ?? []).map((value) => ({ type: net.isIPv6(value) ? "AAAA" : "A", value }))),
+        existingOf(async () => (await dnsResolver.resolveMx(name)).map((r) => ({ type: "MX", value: `${r.priority} ${r.exchange}` }))),
+        existingOf(async () => (await dnsResolver.resolveTxt(name)).map((chunks) => ({ type: "TXT", value: chunks.join("") }))),
+    ]);
+    return groups.flat();
+}
+
+/** A name that exists nowhere, one label deeper than `name`'s parent, to see what a wildcard record of the zone answers for it. `undefined` at a root. */
+function wildcardProbe(name: string): string | undefined {
+    const dot: number = name.indexOf(".");
+    return dot > 0 && name.indexOf(".", dot + 1) > 0 ? `rmx-probe-${randomBytes(6).toString("hex")}.${name.slice(dot + 1)}` : undefined;
+}
+
+/** `records` without the ones a wildcard of the zone answers as well: they are not at `name`, so the admin can't delete them there and they don't conflict. */
+async function withoutWildcard(records: DnsExistingRecord[], name: string, lookup: (probe: string) => Promise<DnsExistingRecord[]>): Promise<DnsExistingRecord[]> {
+    const probe: string | undefined = records.length > 0 ? wildcardProbe(name) : undefined;
+    if (!probe) {
+        return records;
+    }
+    const wild: DnsExistingRecord[] = await existingOf(() => lookup(probe));
+    return records.filter((record) => !wild.some((other) => other.type === record.type && other.value === record.value));
+}
+
+/**
+ * Judges what is live at a record's name against the record this deployment publishes there, for `ownerId` (nothing is judged while it is unknown):
+ *
+ * - `type_mismatch`: a CNAME is published and records of other types are there that this deployment doesn't own (they can't stand next to it), or any other
+ * type is published and a CNAME is there that it doesn't own. The records are returned for the admin to delete at their DNS host; RapidMX never deletes one
+ * and never takes it over. A record this deployment owns is being replaced by the next sync (`replacing`), not in the way. A CNAME is not looked for at
+ * the root of a domain (`checkCname: false`), where none can be.
+ * - `not_owned`: a record of the type published is there (`found`) and the registry record for it doesn't name `ownerId`.
+ *
+ * What a wildcard record of the zone answers for the name is not at the name (`withoutWildcard()`) and is left out.
+ *
+ * The CNAME comes first for every other type because a lookup of the record's own type follows a CNAME to its target: it would find the target's records.
+ */
+export async function judgeConflict(
+    dnsResolver: DnsResolver,
+    subject: { recordKind: DnsRecordPublication["recordKind"]; recordName: string; found: boolean; ownerId?: string; checkCname?: boolean },
+): Promise<ConflictJudgement | undefined> {
+    const { recordKind, recordName, ownerId } = subject;
+    if (!ownerId) {
+        return undefined;
+    }
+    if (recordKind !== "CNAME" && subject.checkCname !== false) {
+        const lookupCnames = async (name: string): Promise<DnsExistingRecord[]> => (await dnsResolver.resolveCname(name)).map((value) => ({ type: "CNAME", value }));
+        const cnames: DnsExistingRecord[] = await withoutWildcard(await existingOf(() => lookupCnames(recordName)), recordName, lookupCnames);
+        if (cnames.length > 0) {
+            return (await isRecordOwned(dnsResolver, "CNAME", recordName, ownerId)) ? { replacing: true } : { conflictReason: "type_mismatch", existing: cnames };
+        }
+    }
+    if (recordKind === "CNAME" && !subject.found) {
+        const next: DnsExistingRecord[] = await withoutWildcard(await recordsNextTo(dnsResolver, recordName), recordName, (probe) => recordsNextTo(dnsResolver, probe));
+        const owned: Map<string, boolean> = new Map();
+        for (const type of new Set(next.map((record) => record.type))) {
+            owned.set(type, await isRecordOwned(dnsResolver, type, recordName, ownerId));
+        }
+        const foreign: DnsExistingRecord[] = next.filter((record) => !owned.get(record.type));
+        if (foreign.length > 0) {
+            return { conflictReason: "type_mismatch", existing: foreign };
+        }
+    }
+    if (subject.found && !(await isRecordOwned(dnsResolver, recordKind, recordName, ownerId))) {
+        return { conflictReason: "not_owned" };
+    }
+    return undefined;
+}
+
+/** `check` with the conflict `judgement` found, or just pending when it only says the record is being replaced. Returns whether it settled the state. */
+function applyJudgement(check: DnsRecordCheck, judgement: ConflictJudgement | undefined): boolean {
+    if (!judgement) {
+        return false;
+    }
+    if ("replacing" in judgement) {
+        check.publication = "pending";
+        return true;
+    }
+    check.publication = "conflict";
+    check.conflictReason = judgement.conflictReason;
+    if (judgement.existing) {
+        check.existing = judgement.existing;
+    }
+    return true;
 }
 
 /**
@@ -271,8 +379,14 @@ async function publicationOf(dnsResolver: DnsResolver, domain: Domain, desired: 
         check.manualReason = reason;
         return;
     }
-    if (check.found && publication.ownerId && !(await isOwned(dnsResolver, check, publication.ownerId))) {
-        check.publication = "conflict";
+    const judgement: ConflictJudgement | undefined = await judgeConflict(dnsResolver, {
+        recordKind: desired.recordKind,
+        recordName: desired.recordName,
+        found: check.found,
+        ownerId: publication.ownerId,
+        checkCname: desired.recordName !== domain.name,
+    });
+    if (applyJudgement(check, judgement)) {
         return;
     }
     const current: boolean = live.live === undefined || sameValues(desired.recordKind, live.live, desired.values);

@@ -57,6 +57,7 @@ export function dnsPublishingSuite(ctx: DnsPublishingSuiteContext): void {
         resolver.mxRecords.clear();
         resolver.cnameRecords.clear();
         resolver.srvRecords.clear();
+        resolver.addressRecords.clear();
         resolver.failing.clear();
     });
 
@@ -196,7 +197,7 @@ export function dnsPublishingSuite(ctx: DnsPublishingSuiteContext): void {
             expect(checks.mx).toMatchObject({ matches: true, publication: "pending" });
             expect(checks.ownership).toMatchObject({ publication: "pending" });
             expect(checks.spf).toMatchObject({ publication: "manual", manualReason: "apex_txt_unmanaged" });
-            expect(checks.dmarc).toMatchObject({ found: true, publication: "conflict" });
+            expect(checks.dmarc).toMatchObject({ found: true, publication: "conflict", conflictReason: "not_owned" });
 
             const status = await report({ endpoints: [{ endpointSetId: "domain-example-com", generation: 2, observedGeneration: 2 }] });
             expect(status.status, JSON.stringify(status.body)).toBe(200);
@@ -904,6 +905,364 @@ export function dnsPublishingSuite(ctx: DnsPublishingSuiteContext): void {
             const controller = (await as(adminToken, request(ctx.app()).get(providers("/controller")))).body;
             expect(controller.lastReport).toEqual(expect.objectContaining({ controllerVersion: "0.1.0", leaseHolder: true }));
             expect(controller.lastStandbyReport).toEqual(expect.objectContaining({ controllerVersion: "0.0.9", leaseHolder: false, leaseIdentity: "mail-dns-controller-old" }));
+        });
+    });
+
+    describe("conflicts the checklist reports", () => {
+        const ownedBy = (ownerId: string) => [[`heritage=external-dns,external-dns/owner=${ownerId},external-dns/resource=crd/mail/x`]];
+
+        it("says not_owned for a record of the right type this deployment doesn't own", async () => {
+            const provider = await createProvider();
+            await ctx.saveDomain({ name: "example.com", verificationToken: "tok" });
+            await assign("example.com", provider.uid);
+            ctx.resolver().records.set("_dmarc.example.com", [["v=DMARC1; p=reject;"]]);
+
+            const checks = await dnsSetup("example.com");
+
+            expect(checks.dmarc).toMatchObject({ publication: "conflict", conflictReason: "not_owned" });
+            expect(checks.dmarc.existing).toBeUndefined();
+        });
+
+        it("names the records to delete when a CNAME is published where other records are, and says nothing of the ones this deployment owns", async () => {
+            const provider = await createProvider();
+            await ctx.saveDomain({ name: "example.com", verificationToken: "tok" });
+            await assign("example.com", provider.uid);
+            const { ownerId } = await desiredState();
+            const resolver = ctx.resolver();
+            resolver.addressRecords.set("openpgpkey.example.com", ["192.0.2.10", "2001:db8::10"]);
+            resolver.records.set("openpgpkey.example.com", [["v=spf1 -all"]]);
+
+            let checks = await dnsSetup("example.com");
+            expect(checks.openpgpkey_cname).toMatchObject({ found: false, publication: "conflict", conflictReason: "type_mismatch" });
+            expect(checks.openpgpkey_cname.existing).toEqual([
+                { type: "A", value: "192.0.2.10" },
+                { type: "AAAA", value: "2001:db8::10" },
+                { type: "TXT", value: "v=spf1 -all" },
+            ]);
+
+            // The addresses are this deployment's own (published as addresses before): nothing for the admin to delete; the TXT one still is.
+            resolver.records.set("rmx-a.openpgpkey.example.com", ownedBy(ownerId));
+            resolver.records.set("rmx-aaaa.openpgpkey.example.com", ownedBy(ownerId));
+            checks = await dnsSetup("example.com");
+            expect(checks.openpgpkey_cname.existing).toEqual([{ type: "TXT", value: "v=spf1 -all" }]);
+            resolver.records.delete("openpgpkey.example.com");
+            checks = await dnsSetup("example.com");
+            expect(checks.openpgpkey_cname).toMatchObject({ publication: "pending" });
+            expect(checks.openpgpkey_cname.conflictReason).toBeUndefined();
+            expect(checks.openpgpkey_cname.existing).toBeUndefined();
+        });
+
+        it("reports a CNAME standing where a record is published as a type mismatch, unless it is this deployment's own or at the domain's root", async () => {
+            const provider = await createProvider();
+            await ctx.saveDomain({ name: "example.com", verificationToken: "tok" });
+            await assign("example.com", provider.uid);
+            const { ownerId } = await desiredState();
+            const resolver = ctx.resolver();
+            resolver.cnameRecords.set("_dmarc.example.com", ["_dmarc.provider.example.net"]);
+            // A lookup of the root never asks for a CNAME: none can be there.
+            resolver.cnameRecords.set("example.com", ["elsewhere.example.net"]);
+
+            let checks = await dnsSetup("example.com");
+            expect(checks.dmarc).toMatchObject({ publication: "conflict", conflictReason: "type_mismatch", existing: [{ type: "CNAME", value: "_dmarc.provider.example.net" }] });
+            expect(checks.mx).toMatchObject({ publication: "pending" });
+
+            resolver.records.set("rmx-cname._dmarc.example.com", ownedBy(ownerId));
+            checks = await dnsSetup("example.com");
+            expect(checks.dmarc).toMatchObject({ publication: "pending" });
+            expect(checks.dmarc.conflictReason).toBeUndefined();
+        });
+    });
+
+    describe("the deployment's hosts", () => {
+        const AUTH_HOST = "auth.rapidmx-test.example.com";
+        const hostsList = (token = adminToken) => as(token, request(ctx.app()).get(providers("/hosts")));
+        const ownedBy = (ownerId: string) => [[`heritage=external-dns,external-dns/owner=${ownerId},external-dns/resource=crd/mail/x`]];
+
+        it("lists each host's publication: manual outside every zone, then pending, published once observed and live, and in conflict", async () => {
+            expect((await hostsList(userToken)).status).toBe(403);
+            expect((await hostsList()).body).toEqual([
+                { type: "host_a", recordName: MX_HOST, recordKind: "A", state: "manual", manualReason: "outside_zones" },
+                { type: "host_cname", recordName: AUTH_HOST, recordKind: "CNAME", state: "manual", manualReason: "outside_zones" },
+            ]);
+            const provider = await createProvider();
+            const hostsSet = `hosts-${provider.uid}`;
+            expect((await hostsList()).body).toEqual([
+                { type: "host_a", recordName: MX_HOST, recordKind: "A", state: "pending", providerUid: provider.uid },
+                { type: "host_cname", recordName: AUTH_HOST, recordKind: "CNAME", state: "pending", providerUid: provider.uid },
+            ]);
+
+            // Live and owned, but not observed yet.
+            const { ownerId } = await desiredState();
+            const resolver = ctx.resolver();
+            resolver.addressRecords.set(MX_HOST, ["203.0.114.7"]);
+            resolver.records.set(`rmx-a.${MX_HOST}`, ownedBy(ownerId));
+            expect((await hostsList()).body[0].state).toBe("pending");
+
+            const status = await report({ endpoints: [{ endpointSetId: hostsSet, generation: 2, observedGeneration: 2 }] });
+            expect(status.status, JSON.stringify(status.body)).toBe(200);
+            expect((await ctx.providerRow(provider.uid)).status.hostsEndpoint).toEqual({ name: hostsSet, generation: 2, observedGeneration: 2 });
+            let list = (await hostsList()).body;
+            expect(list[0]).toMatchObject({ type: "host_a", state: "published" });
+            expect(list[1]).toMatchObject({ type: "host_cname", state: "pending" });
+
+            // The auth host has A records: the CNAME can't be published next to them, and the admin is told which to delete.
+            resolver.addressRecords.set(AUTH_HOST, ["192.0.2.1"]);
+            // The mail host's A is somebody else's now.
+            resolver.records.delete(`rmx-a.${MX_HOST}`);
+            list = (await hostsList()).body;
+            expect(list[0]).toMatchObject({ type: "host_a", state: "conflict", conflictReason: "not_owned", providerUid: provider.uid });
+            expect(list[1]).toMatchObject({ type: "host_cname", state: "conflict", conflictReason: "type_mismatch", existing: [{ type: "A", value: "192.0.2.1" }] });
+        });
+
+        it("keeps the hosts' endpoint status apart from the domains' and doesn't rewrite the provider for a report that says the same", async () => {
+            const provider = await createProvider();
+            const body = { providers: [{ providerUid: provider.uid, readyReplicas: 1 }], endpoints: [{ endpointSetId: `hosts-${provider.uid}`, generation: 1, observedGeneration: 1 }] };
+            await report(body);
+            const row = await ctx.providerRow(provider.uid);
+            expect(row.status.hostsEndpoint).toEqual({ name: `hosts-${provider.uid}`, generation: 1, observedGeneration: 1 });
+
+            await report(body);
+
+            expect((await ctx.providerRow(provider.uid)).version).toBe(row.version);
+        });
+    });
+
+    describe("the hosts' endpoint status when the hosts' set goes away", () => {
+        it("forgets what was observed of it once the provider reports without it, so a set that comes back isn't judged by the old one", async () => {
+            const provider = await createProvider();
+            const hostsSet = `hosts-${provider.uid}`;
+            await report({ providers: [{ providerUid: provider.uid, readyReplicas: 1 }], endpoints: [{ endpointSetId: hostsSet, generation: 5, observedGeneration: 5 }] });
+            expect((await ctx.providerRow(provider.uid)).status.hostsEndpoint).toBeDefined();
+
+            await report({ providers: [{ providerUid: provider.uid, readyReplicas: 1 }], endpoints: [] });
+
+            expect((await ctx.providerRow(provider.uid)).status.hostsEndpoint ?? undefined).toBeUndefined();
+        });
+    });
+
+    describe("taking over the deployment's hosts", () => {
+        const takeover = (uid: string, body: unknown, token = adminToken) => as(token, request(ctx.app()).post(providers(`/${uid}/takeover`))).send(body);
+
+        it("never takes over a record that has records of another type in its way: left out, or refused with them when asked for by name", async () => {
+            const provider = await createProvider();
+            await ctx.saveDomain({ name: "example.com", verificationToken: "tok" });
+            await assign("example.com", provider.uid);
+            ctx.resolver().addressRecords.set("openpgpkey.example.com", ["192.0.2.10"]);
+            ctx.resolver().addressRecords.set("auth.rapidmx-test.example.com", ["192.0.2.1"]);
+
+            const named = await takeover(provider.uid, { domainUid: "example.com", records: ["openpgpkey_cname"] });
+            expect(named.status).toBe(400);
+            expect(named.body.message).toContain("openpgpkey_cname (A 192.0.2.10)");
+            const left = await takeover(provider.uid, { domainUid: "example.com" });
+            expect(left.status, JSON.stringify(left.body)).toBe(200);
+            expect(left.body.records.map((r: any) => `${r.recordType} ${r.dnsName}`)).not.toContain("CNAME openpgpkey.example.com");
+
+            const namedHost = await takeover(provider.uid, { hosts: true, records: ["auth.rapidmx-test.example.com"] });
+            expect(namedHost.status).toBe(400);
+            expect(namedHost.body.message).toContain("auth.rapidmx-test.example.com (A 192.0.2.1)");
+            const hosts = await takeover(provider.uid, { hosts: true });
+            expect(hosts.status, JSON.stringify(hosts.body)).toBe(200);
+            expect(hosts.body.records.map((r: any) => r.dnsName)).toEqual([MX_HOST]);
+        });
+
+        it("queues the takeover of the hosts' records through the config that publishes them, audited with the live values", async () => {
+            const provider = await createProvider();
+            ctx.resolver().cnameRecords.set("auth.rapidmx-test.example.com", ["old.example.net"]);
+
+            expect((await takeover(provider.uid, { hosts: true }, unelevatedToken)).status).toBe(403);
+            const all = await takeover(provider.uid, { hosts: true });
+
+            expect(all.status, JSON.stringify(all.body)).toBe(200);
+            expect(all.body).toEqual(
+                expect.objectContaining({
+                    type: "takeover",
+                    providerUid: provider.uid,
+                    endpointSetId: `hosts-${provider.uid}`,
+                    state: "queued",
+                    records: [
+                        { dnsName: MX_HOST, recordType: "A", targets: ["203.0.114.7"], ttl: 300 },
+                        { dnsName: "auth.rapidmx-test.example.com", recordType: "CNAME", targets: [MX_HOST], ttl: 300 },
+                    ],
+                }),
+            );
+            expect(all.body.domainUid).toBeUndefined();
+            const [entry] = await audit(AuditAction.DNS_TAKEOVER);
+            expect(entry.details).toEqual(
+                expect.objectContaining({ provider: provider.uid, hosts: true, recordNames: [MX_HOST, "auth.rapidmx-test.example.com"], oldValues: ["old.example.net"], operation: all.body.uid }),
+            );
+            expect(entry.details.domain).toBeUndefined();
+            expect(ctx.publisher().changes).toContainEqual({ scope: "operation", operationUid: all.body.uid });
+        });
+
+        it("takes over only the hosts named, and refuses a body that names a domain as well, none, or a host the config doesn't publish", async () => {
+            const provider = await createProvider();
+            await ctx.saveDomain({ name: "example.com" });
+            await assign("example.com", provider.uid);
+
+            const one = await takeover(provider.uid, { hosts: true, records: [MX_HOST] });
+            expect(one.status, JSON.stringify(one.body)).toBe(200);
+            expect(one.body.records).toEqual([{ dnsName: MX_HOST, recordType: "A", targets: ["203.0.114.7"], ttl: 300 }]);
+
+            expect((await takeover(provider.uid, { hosts: true, domainUid: "example.com" })).status).toBe(400);
+            expect((await takeover(provider.uid, {})).status).toBe(400);
+            expect((await takeover(provider.uid, { hosts: "yes" })).status).toBe(400);
+            expect((await takeover(provider.uid, { hosts: true, records: [] })).status).toBe(400);
+            expect((await takeover(provider.uid, { hosts: true, records: ["nope.example.com"] })).status).toBe(400);
+            expect((await takeover(provider.uid, { hosts: true, records: [5] })).status).toBe(400);
+            expect(await ctx.operationRows()).toHaveLength(1);
+        });
+
+        it("refuses a takeover of hosts when the config publishes none of them", async () => {
+            const other = await createProvider({ zones: ["elsewhere.org"] });
+
+            const refused = await takeover(other.uid, { hosts: true });
+
+            expect(refused.status).toBe(400);
+            expect(refused.body.message).toContain("host");
+            expect(await ctx.operationRows()).toEqual([]);
+        });
+    });
+
+    describe("automatic takeover", () => {
+        const quiet = () => new Promise((resolve) => setTimeout(resolve, 300));
+        const takeoverOps = async () => (await ctx.operationRows()).filter((operation: any) => operation.type === "takeover");
+        const names = (records: any[]) => records.map((r) => `${r.recordType} ${r.dnsName}`);
+        const observedDomain = (generation = 1) => ({ endpointSetId: "domain-example-com", generation, observedGeneration: generation });
+
+        const setUp = async (fields: Record<string, unknown> = { allowTakeover: true }) => {
+            const provider = await createProvider(fields);
+            await ctx.saveDomain({ name: "example.com", verificationToken: "tok" });
+            await assign("example.com", provider.uid);
+            const resolver = ctx.resolver();
+            resolver.mxRecords.set("example.com", [{ priority: 5, exchange: "mx.oldhost.net" }]);
+            resolver.records.set("_dmarc.example.com", [["v=DMARC1; p=reject;"]]);
+            // The apex TXT set is never taken over this way.
+            resolver.records.set("example.com", [["v=spf1 include:old.example.net ~all"]]);
+            return provider;
+        };
+
+        it("queues the takeover of the records in conflict once the endpoint is observed, audited as the system, and not again for the same values", async () => {
+            const provider = await setUp();
+            ctx.publisher().reset();
+
+            const status = await report({ endpoints: [observedDomain()] });
+            expect(status.status, JSON.stringify(status.body)).toBe(200);
+
+            await vi.waitFor(async () => expect(await takeoverOps()).toHaveLength(1));
+            const [operation] = await takeoverOps();
+            expect(operation).toEqual(
+                expect.objectContaining({ type: "takeover", providerUid: provider.uid, domainUid: "example.com", endpointSetId: "domain-example-com", state: "queued" }),
+            );
+            expect(operation.requestedBy ?? undefined).toBeUndefined();
+            expect(names(operation.records)).toEqual(["MX example.com", "TXT _dmarc.example.com"]);
+            expect(operation.records[1].targets).toEqual(["v=DMARC1; p=none;"]);
+            const [entry] = (await audit(AuditAction.DNS_TAKEOVER)) as any[];
+            expect(entry.targetUid).toBe(provider.uid);
+            expect(entry.actorUserUid ?? undefined).toBeUndefined();
+            expect(entry.details).toEqual(
+                expect.objectContaining({
+                    provider: provider.uid,
+                    domain: "example.com",
+                    recordNames: ["example.com", "_dmarc.example.com"],
+                    oldValues: ["5 mx.oldhost.net", "v=DMARC1; p=reject;"],
+                    operation: operation.uid,
+                    actor: "system",
+                    automatic: true,
+                }),
+            );
+            expect(ctx.publisher().changes).toContainEqual({ scope: "operation", operationUid: operation.uid });
+            // The controller is handed it.
+            expect((await desiredState()).operations.map((o: any) => o.id)).toEqual([operation.uid]);
+
+            // It fails: the same values are not queued again, report after report.
+            await report({ operations: [{ id: operation.uid, state: "failed", message: "the zone refused" }] });
+            await report({ endpoints: [observedDomain()] });
+            await quiet();
+            expect(await takeoverOps()).toHaveLength(1);
+
+            // A changed desired value is another record: queued again, for that record alone.
+            const row = await ctx.domainRow("example.com");
+            const updated = await as(adminToken, request(ctx.app()).put(domains("/example.com"))).send({ uid: "example.com", version: row.version, dmarcPolicy: "quarantine" });
+            expect(updated.status, JSON.stringify(updated.body)).toBe(200);
+            await report({ endpoints: [observedDomain(2)] });
+            await vi.waitFor(async () => expect(await takeoverOps()).toHaveLength(2));
+            const second = (await takeoverOps()).find((o: any) => o.uid !== operation.uid);
+            expect(second.records).toEqual([{ dnsName: "_dmarc.example.com", recordType: "TXT", targets: ["v=DMARC1; p=quarantine;"], ttl: 300 }]);
+        });
+
+        it("is not held back by a manual takeover that failed", async () => {
+            const provider = await setUp();
+            const manual = await as(adminToken, request(ctx.app()).post(providers(`/${provider.uid}/takeover`))).send({ domainUid: "example.com", records: ["mx", "dmarc"] });
+            await report({ operations: [{ id: manual.body.uid, state: "failed", message: "the zone refused" }] });
+
+            await report({ endpoints: [observedDomain()] });
+
+            await vi.waitFor(async () => expect(await takeoverOps()).toHaveLength(2));
+        });
+
+        it("does nothing for a provider config that doesn't allow takeover, or before the endpoint is observed", async () => {
+            await setUp({ allowTakeover: false });
+            await report({ endpoints: [observedDomain()] });
+            await quiet();
+            expect(await takeoverOps()).toEqual([]);
+
+            await ctx.clear();
+            await setUp({ allowTakeover: true });
+            await report({ endpoints: [{ endpointSetId: "domain-example-com", generation: 2, observedGeneration: 1 }] });
+            await quiet();
+            expect(await takeoverOps()).toEqual([]);
+            expect(await audit(AuditAction.DNS_TAKEOVER)).toEqual([]);
+        });
+
+        it("doesn't act on a report from a pod that isn't the Lease holder", async () => {
+            await setUp();
+
+            await report({ lease: { holder: false, identity: "mail-dns-controller-old" }, endpoints: [observedDomain()] });
+            await quiet();
+
+            expect(await takeoverOps()).toEqual([]);
+        });
+
+        it("leaves a record of another type alone, and waits while another takeover of the set is queued or running, then takes the rest", async () => {
+            const provider = await setUp();
+            const resolver = ctx.resolver();
+            resolver.addressRecords.set("openpgpkey.example.com", ["192.0.2.10"]);
+            const manual = await as(adminToken, request(ctx.app()).post(providers(`/${provider.uid}/takeover`))).send({ domainUid: "example.com", records: ["mx"] });
+            expect(manual.status, JSON.stringify(manual.body)).toBe(200);
+
+            await report({ endpoints: [observedDomain()] });
+            await quiet();
+            expect(await takeoverOps()).toHaveLength(1);
+
+            await report({ endpoints: [observedDomain()], operations: [{ id: manual.body.uid, state: "running" }] });
+            await quiet();
+            expect(await takeoverOps()).toHaveLength(1);
+
+            await report({ endpoints: [observedDomain()], operations: [{ id: manual.body.uid, state: "succeeded", message: "done" }] });
+            await vi.waitFor(async () => expect(await takeoverOps()).toHaveLength(2));
+            const automatic = (await takeoverOps()).find((o: any) => o.uid !== manual.body.uid);
+            // The MX record was taken over by the administrator's; the CNAME is a mismatch, for the admin to delete; the DMARC record is left.
+            expect(names(automatic.records)).toEqual(["TXT _dmarc.example.com"]);
+        });
+
+        it("queues the takeover of the deployment's hosts in conflict, in the hosts' set and without a domain", async () => {
+            const provider = await createProvider({ allowTakeover: true });
+            const resolver = ctx.resolver();
+            resolver.addressRecords.set(MX_HOST, ["198.51.100.9"]);
+            // The CNAME host has an address: a mismatch, never taken over.
+            resolver.addressRecords.set("auth.rapidmx-test.example.com", ["192.0.2.1"]);
+            const hostsSet = `hosts-${provider.uid}`;
+
+            await report({ endpoints: [{ endpointSetId: hostsSet, generation: 1, observedGeneration: 1 }] });
+
+            await vi.waitFor(async () => expect(await takeoverOps()).toHaveLength(1));
+            const [operation] = await takeoverOps();
+            expect(operation).toEqual(expect.objectContaining({ providerUid: provider.uid, endpointSetId: hostsSet, state: "queued" }));
+            expect(operation.domainUid ?? undefined).toBeUndefined();
+            expect(operation.records).toEqual([{ dnsName: MX_HOST, recordType: "A", targets: ["203.0.114.7"], ttl: 300 }]);
+            const [entry] = await audit(AuditAction.DNS_TAKEOVER);
+            expect(entry.details).toEqual(expect.objectContaining({ hosts: true, recordNames: [MX_HOST], oldValues: ["198.51.100.9"], operation: operation.uid, actor: "system", automatic: true }));
+            expect(entry.details.domain).toBeUndefined();
         });
     });
 

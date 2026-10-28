@@ -69,4 +69,14 @@ export interface DnsResolver {
      * @throws if the lookup fails (NXDOMAIN, no SRV records, network error, etc.)
      */
     resolveSrv(hostname: string): Promise<DnsSrvRecord[]>;
+
+    /**
+     * Resolves the A and AAAA records for `hostname` together, as address literals - what the live check of a deployment host (`mail.<domain>`) and the
+     * check for a CNAME wanted where addresses already are need (`util/DnsSetupUtils.ts`'s `judgeConflict()`). Optional, so a resolver written before it
+     * still satisfies the interface: without it, an address record is never judged live, a conflict at a name is never reported for one, and a CNAME is
+     * never reported as standing next to one.
+     *
+     * @throws if the lookup fails (NXDOMAIN, no A or AAAA records, network error, etc.)
+     */
+    resolveAddresses?(hostname: string): Promise<string[]>;
 }

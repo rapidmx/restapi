@@ -11,6 +11,8 @@ import {
     WELL_KNOWN_FOLDER_TYPES,
     wellKnownFolderUid,
 } from "../../src/util/FolderUtils.js";
+import { ApiError } from "@rapidrest/core";
+import { ApiErrors } from "@rapidrest/service-core";
 import { FolderType } from "../../src/models/types.js";
 
 /** A fake Folder entity class that just captures the data it was constructed with. */
@@ -151,6 +153,30 @@ describe("findOrCreateWellKnownFolder() Tests", () => {
 
         expect(result).toBe(winner);
         expect(repo.create).toHaveBeenCalledTimes(1);
+    });
+
+    it("Waits for the winner when its own create() lost the claim of the folder's ACL before the winner had inserted its row, instead of failing the caller.", async () => {
+        // The race the concurrent first reads of one mailbox hit: two creates both found no ACL at the uid, the loser's `createOnly` claim is refused with
+        // IDENTIFIER_EXISTS before any row exists, and the winner's insert lands a moment later. Nothing holds the uid yet when the loser looks.
+        const winner = { uid: wellKnownFolderUid("mbx-1", FolderType.TASKS), type: FolderType.TASKS };
+        let winnerInserted = false;
+        setTimeout(() => (winnerInserted = true), 30);
+        const repo = makeRepo({
+            find: vi.fn().mockImplementation(async () => (winnerInserted ? [winner] : [])),
+            create: vi.fn().mockRejectedValue(new ApiError(ApiErrors.IDENTIFIER_EXISTS, 400, "The identifier already exists.")),
+            findOne: vi.fn().mockImplementation(async () => (winnerInserted ? winner : undefined)),
+        });
+
+        const result = await findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.TASKS);
+
+        expect(result).toBe(winner);
+    });
+
+    it("Gives up on a lost ACL claim whose winner never shows, rethrowing the refusal.", async () => {
+        const refusal = new ApiError(ApiErrors.IDENTIFIER_EXISTS, 400, "The identifier already exists.");
+        const repo = makeRepo({ create: vi.fn().mockRejectedValue(refusal), findOne: vi.fn().mockResolvedValue(undefined) });
+
+        await expect(findOrCreateWellKnownFolder(repo, FakeFolder, "mbx-1", FolderType.TASKS)).rejects.toBe(refusal);
     });
 
     it("Rethrows a create() failure that isn't a lost race.", async () => {

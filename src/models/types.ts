@@ -2318,6 +2318,8 @@ export interface DnsProviderStatus {
     sourceErrors?: number;
     providerErrors?: number;
     ownerMismatchRecords?: number;
+    /** The deployment hosts' endpoint (`hosts-<uid>`) as the controller last reported it, which `GET system/dns-providers/hosts` judges "published" by. */
+    hostsEndpoint?: { name: string; generation: number; observedGeneration?: number };
     /** The instance's last error, as the controller reported it (never a credential). */
     lastError?: string;
 }
@@ -2380,15 +2382,38 @@ export type DnsRecordType =
  * the admin's opt-in (`Domain.apexTxt`). */
 export type DnsManualReason = "no_provider" | "kind_unsupported" | "outside_zones" | "apex_txt_unmanaged";
 
+/** Why a deployment host (`mail:dns:publish:hosts`) is not published automatically: no provider config's zones cover it, there is no public address to point
+ * an address host at, or there is no mail host to point a CNAME host at. The reasons a domain's record can be manual (`DnsManualReason`) also apply to one. */
+export type DnsHostManualReason = DnsManualReason | "no_addresses" | "no_target";
+
+/** Why a published record is in conflict: a live record of the same type is at the name but this deployment's owner id isn't on its registry record
+ * (`"not_owned"`; a takeover can overwrite it), or a live record of another type is there that can't stand next to the one published (`"type_mismatch"`: a
+ * CNAME wanted where other records are, or other records wanted where a CNAME is). RapidMX never deletes a record it doesn't own and never takes one of the
+ * second kind over: the admin deletes it at their DNS host (`DnsExistingRecord`). */
+export type DnsConflictReason = "not_owned" | "type_mismatch";
+
+/** A live record that stands in the way of a published one (`DnsConflictReason` `"type_mismatch"`): its type and its value as text (an MX or SRV with its
+ * priority, a TXT joined). */
+export interface DnsExistingRecord {
+    type: "A" | "AAAA" | "CNAME" | "MX" | "TXT" | "SRV";
+    value: string;
+}
+
 /** Whether one record a domain needs is published automatically, and if not, why. Same identity as a `DnsRecordCheck`: `type` and `recordName`. */
 export interface DnsRecordPublication {
     type: DnsRecordType | "host_a" | "host_aaaa" | "host_cname";
     recordName: string;
     recordKind: "A" | "AAAA" | "CNAME" | "MX" | "TXT" | "SRV";
     /** `"published"`: external-dns observed it and the live lookup sees it; `"pending"`: applied, not yet live; `"conflict"`: a record at this name exists
-     * that this deployment does not own; `"manual"`: the admin publishes it, see `manualReason`. */
+     * that this deployment does not own, or that can't stand next to it, see `conflictReason`; `"manual"`: the admin publishes it, see `manualReason`. */
     state: "published" | "pending" | "conflict" | "manual";
-    manualReason?: DnsManualReason;
+    manualReason?: DnsHostManualReason;
+    /** With `state: "conflict"`: why. */
+    conflictReason?: DnsConflictReason;
+    /** With `conflictReason: "type_mismatch"`: the live records the admin has to delete for this one to be published. */
+    existing?: DnsExistingRecord[];
+    /** A deployment host's record (`GET system/dns-providers/hosts`): the provider config that publishes it, which a takeover of it names. */
+    providerUid?: string;
 }
 
 /** What the DNS controller and the live check last said about a domain's published records. Server-managed. */

@@ -334,6 +334,25 @@ export function toOperationV1(operation: DnsOperation): OperationV1 {
     return v1;
 }
 
+/**
+ * One endpoint set per domain published through an existing config that covers it (disabled domains too: they keep their records), in the order of
+ * `domains`. A domain with nothing to publish through its config has none.
+ */
+export function buildDomainEndpointSets(domains: readonly Domain[], providers: readonly DnsProvider[], ctx: DesiredDnsPublishContext): EndpointSetV1[] {
+    const endpointSets: EndpointSetV1[] = [];
+    for (const domain of domains) {
+        const provider: DnsProvider | undefined = domainProvider(domain, providers);
+        if (!provider) {
+            continue;
+        }
+        const records: DnsRecordV1[] = domainDnsRecordsV1(domain, provider, ctx);
+        if (records.length > 0) {
+            endpointSets.push({ id: domainEndpointSetId(domain.uid), providerUid: provider.uid, domainUid: domain.uid, records });
+        }
+    }
+    return endpointSets;
+}
+
 /** Everything the desired state is built from. */
 export interface DesiredStateInput {
     version: number;
@@ -353,17 +372,7 @@ export interface DesiredStateInput {
  * sets without the records a domain's set already publishes, and the operations still queued or running.
  */
 export function buildDesiredState(input: DesiredStateInput): DesiredStateV1 {
-    const endpointSets: EndpointSetV1[] = [];
-    for (const domain of input.domains) {
-        const provider: DnsProvider | undefined = domainProvider(domain, input.providers);
-        if (!provider) {
-            continue;
-        }
-        const records: DnsRecordV1[] = domainDnsRecordsV1(domain, provider, input.context);
-        if (records.length > 0) {
-            endpointSets.push({ id: domainEndpointSetId(domain.uid), providerUid: provider.uid, domainUid: domain.uid, records });
-        }
-    }
+    const endpointSets: EndpointSetV1[] = buildDomainEndpointSets(input.domains, input.providers, input.context);
     const published: DnsRecordV1[] = endpointSets.flatMap((set) => set.records);
     endpointSets.push(...buildHostEndpointSets(input.hosts, input.addresses, input.providers, input.context, published).endpointSets);
     return {

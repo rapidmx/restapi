@@ -7,11 +7,13 @@
 import * as crypto from "crypto";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, HttpRequest, HttpResponse, ObjectFactory, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
+import { planAutomaticTakeovers, type PlannedTakeover } from "../dns/DnsAutoTakeover.js";
 import {
     buildDesiredState,
     DEFAULT_EXTERNAL_DNS_IMAGE,
     DEFAULT_PUBLISH_TTL,
     domainEndpointSetId,
+    hostsEndpointSetId,
     normalizePublicAddresses,
     normalizePublishHosts,
     type PublishHost,
@@ -25,24 +27,44 @@ import {
     type DesiredStateV1,
     type DnsProviderCredentialsV1,
     type HandshakeResult,
+    type EndpointStatusV1,
     type StatusReportResultV1,
     type StatusReportV1,
 } from "../dns/DnsDesiredStateApiV1.js";
 import type { DnsControllerTokenVerifier } from "../dns/DnsControllerTokenVerifier.js";
 import { noConfigCipher, openDnsCredentials, savedCredentialKeys, type OpenedDnsCredentials } from "../dns/DnsProviderCredentials.js";
-import { resolveDnsPublisher, type DnsPublisher } from "../dns/DnsPublisher.js";
+import { notifyDnsPublisher, resolveDnsPublisher, type DnsPublisher } from "../dns/DnsPublisher.js";
+import type { DnsResolver } from "../dns/DnsResolver.js";
 import type { ConfigCipher } from "../secrets/ConfigCipher.js";
 import { findOrCreateDeploymentIdentity } from "../util/DeploymentIdentityUtils.js";
-import { autodiscoverHostnameFor, DEFAULT_LONG_POLL_SECONDS, DNS_CONTROLLER_STATE_UID, dnsOwnerId, findAllRows } from "../util/DnsPublishingUtils.js";
+import { AuditLogUtils } from "../util/AuditLogUtils.js";
+import {
+    autodiscoverHostnameFor,
+    DEFAULT_LONG_POLL_SECONDS,
+    DNS_CONTROLLER_STATE_UID,
+    dnsOwnerId,
+    findAllRows,
+    findDnsOwnerId,
+    liveRecordValues,
+    queueDnsOperation,
+} from "../util/DnsPublishingUtils.js";
+import { DEFAULT_ACCEPT_LEGACY_APEX } from "../util/DomainVerificationUtils.js";
 import { asEntity } from "../util/EntityUtils.js";
 import { findOrCreateSingleton } from "../util/MailboxPolicyUtils.js";
-import { DeploymentIdentity, DnsControllerState, DnsOperation, DnsProvider, DnsProviderStatus, DnsPublicationStatus, Domain } from "../models/types.js";
+import { isDuplicateKeyError } from "../util/RequestBodyUtils.js";
+import { AuditAction, DeploymentIdentity, DnsControllerState, DnsOperation, DnsProvider, DnsProviderStatus, DnsPublicationStatus, Domain } from "../models/types.js";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Get, Param, Post, Put, Query, Request, Response } = RouteDecorators;
 
 /** A provider config's status is rewritten when only its report time moved, but no more often than this: what keeps a status report every minute from
  * bumping the row's version (and failing an admin's edit made meanwhile) every minute. */
 const PROVIDER_STATUS_REFRESH_MS = 5 * 60 * 1000;
+
+/** The shortest time between two looks at the conflicts for an automatic takeover, unless a report arrives while one runs (`mail:dns:takeover:min_interval_seconds`). */
+const DEFAULT_TAKEOVER_MIN_INTERVAL_SECONDS = 60;
+
+/** The endpoints a status report said external-dns has observed (at their current generation), by endpoint set id. */
+type ObservedEndpoints = ReadonlySet<string>;
 
 /** `res` answering 400 with `body`, the shape the controller reads a refusal from. */
 function refuse(res: HttpResponse, body: Record<string, unknown>): HttpResponse {
@@ -68,7 +90,11 @@ function withoutReportedAt(status: DnsProviderStatus | null | undefined): string
  * - `GET /v1/providers/:uid/credentials`: one provider config's credentials, decrypted (spec 5.4), for the controller to write the Secret its external-dns
  * instance reads. Answered to the controller's token only, with `Cache-Control: no-store`; logged with the provider and generation only, never audited per call.
  * - `PUT /v1/status`: the controller's report - per provider config (`DnsProvider.status`), per endpoint set (`Domain.dnsPublication`), per operation,
- * and its Lease. Only the Lease holder's report changes rows; another pod's is kept apart (`lastStandbyReport`).
+ * and its Lease. Only the Lease holder's report changes rows; another pod's is kept apart (`lastStandbyReport`). It is also what drives the
+ * **automatic takeover**: after applying a Lease holder's report, the server queues a takeover of the records in conflict for every provider config that
+ * allows it (`planAutomaticTakeovers()`), in the background so the report is answered at once. This is the place that sees conflicts: the report is the one
+ * periodic, serialized signal that the controller is alive (a takeover can't run without it) and that external-dns has observed an endpoint (a conflict
+ * counts only once it has tried to publish), so no second job on every replica has to agree on "at most once".
  *
  * **Access:** only the DNS controller. It presents its projected ServiceAccount token (`Authorization: Bearer`, audience `rapidmx-internal-dns`); the
  * registered `DnsControllerTokenVerifier` verifies it against the cluster's keys, and its subject must be exactly `mail:dns:controller:subject`. With
@@ -86,6 +112,9 @@ export abstract class BaseDnsDesiredStateRoute {
     protected abstract dnsOperationClass: any;
     protected abstract deploymentIdentityClass: any;
     protected abstract dnsControllerStateClass: any;
+
+    /** Supplied by the Mongo/SQL concrete subclasses so an automatic takeover is audited; without it none is queued. */
+    protected auditLogClass?: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -125,11 +154,32 @@ export abstract class BaseDnsDesiredStateRoute {
     @Config("mail:autodiscover:public_url", "")
     private autodiscoverPublicUrl: string = "";
 
+    /** Whether a verification token at a domain's root still counts (`mail:domain_verification:accept_legacy_apex`): the ownership record is judged the same way. */
+    @Config("mail:domain_verification:accept_legacy_apex", DEFAULT_ACCEPT_LEGACY_APEX)
+    private acceptLegacyApex: boolean = DEFAULT_ACCEPT_LEGACY_APEX;
+
+    @Config("mail:dns:takeover:min_interval_seconds", DEFAULT_TAKEOVER_MIN_INTERVAL_SECONDS)
+    private takeoverMinIntervalSeconds: number = DEFAULT_TAKEOVER_MIN_INTERVAL_SECONDS;
+
+    /** Looks up the live records an automatic takeover judges conflicts by. */
+    @Inject("DnsResolver")
+    private dnsResolver?: DnsResolver;
+
     protected providerRepo?: RepoUtils<DnsProvider>;
     protected domainRepo?: RepoUtils<Domain>;
     protected operationRepo?: RepoUtils<DnsOperation>;
     protected identityRepo?: RepoUtils<DeploymentIdentity>;
     protected controllerStateRepo?: RepoUtils<DnsControllerState>;
+    protected auditLogRepo?: RepoUtils<any>;
+    protected auditLogUtils?: AuditLogUtils;
+
+    /** The automatic takeover looking at conflicts right now, if one is. */
+    private takeoverScan?: Promise<void>;
+
+    /** What a report asked to be looked at while a scan was running: looked at once it ends. */
+    private pendingTakeoverScan?: ObservedEndpoints;
+
+    private lastTakeoverScanAt: number = 0;
 
     /** Decrypts the credentials the controller asks for; unset on a server that registers none (a config with credentials is then answered 503). */
     @Inject("ConfigCipher")
@@ -158,6 +208,10 @@ export abstract class BaseDnsDesiredStateRoute {
         this.operationRepo ??= await repo(this.dnsOperationClass);
         this.identityRepo ??= await repo(this.deploymentIdentityClass);
         this.controllerStateRepo ??= await repo(this.dnsControllerStateClass);
+        this.auditLogRepo ??= await repo(this.auditLogClass);
+        if (!this.auditLogUtils && this.auditLogRepo) {
+            this.auditLogUtils = await this._objectFactory.newInstance(AuditLogUtils, { name: this.auditLogClass.name, args: [this.auditLogRepo] });
+        }
         if (!this.tokenVerifier) {
             try {
                 this.tokenVerifier = await this._objectFactory.newInstance<DnsControllerTokenVerifier>("DnsControllerTokenVerifier", { name: "default" });
@@ -378,8 +432,10 @@ export abstract class BaseDnsDesiredStateRoute {
         }
         await this.applyProviderStatus(report, now);
         await this.applyEndpointStatus(report, now);
+        await this.applyHostsEndpointStatus(report);
         await this.applyOperationStatus(report, now);
         await this.recordControllerState({ lastReport: summary });
+        this.requestTakeoverScan(report);
         return { apiVersion: API_VERSION_V1, kind: "StatusReportResult" };
     }
 
@@ -399,6 +455,10 @@ export abstract class BaseDnsDesiredStateRoute {
                 continue;
             }
             const status: DnsProviderStatus = { reportedAt: now, readyReplicas: entry.readyReplicas };
+            // The hosts' endpoint is written apart (`applyHostsEndpointStatus()`); this rewrite of the instance's status keeps it.
+            if (provider.status?.hostsEndpoint) {
+                status.hostsEndpoint = provider.status.hostsEndpoint;
+            }
             if (entry.image !== undefined) {
                 status.image = entry.image;
             }
@@ -448,6 +508,163 @@ export abstract class BaseDnsDesiredStateRoute {
                 }),
             );
         }
+    }
+
+    /** Records, on each provider config, the generation external-dns observed of its hosts' endpoint (`hosts-<uid>`), which `GET system/dns-providers/hosts` judges
+     * "published" by. Written only when it changed, so a report every minute doesn't bump the row's version. */
+    private async applyHostsEndpointStatus(report: StatusReportV1): Promise<void> {
+        const reported: Map<string, EndpointStatusV1> = new Map(report.endpoints.map((entry) => [entry.endpointSetId, entry]));
+        const reporting: Set<string> = new Set(report.providers.map((entry) => entry.providerUid));
+        if (reported.size === 0 && reporting.size === 0) {
+            return;
+        }
+        for (const provider of await findAllRows<DnsProvider>(this.providerRepo!)) {
+            const name: string = hostsEndpointSetId(provider.uid);
+            const entry: EndpointStatusV1 | undefined = reported.get(name);
+            if (!entry) {
+                // The provider reports but its hosts' set is gone: forget what was observed of it, so a set that comes back (its generation starting lower)
+                // isn't judged by the old one.
+                if (provider.status?.hostsEndpoint && reporting.has(provider.uid)) {
+                    const { hostsEndpoint: _gone, ...status } = provider.status;
+                    await this.bestEffort(`DNS provider '${provider.uid}'`, () =>
+                        this.providerRepo!.update({ uid: provider.uid, version: provider.version, status }, asEntity(this.providerRepo!, provider), {
+                            version: provider.version,
+                            ignoreACL: true,
+                        }),
+                    );
+                }
+                continue;
+            }
+            const endpoint: NonNullable<DnsProviderStatus["hostsEndpoint"]> = { name, generation: entry.generation };
+            if (entry.observedGeneration !== undefined) {
+                endpoint.observedGeneration = entry.observedGeneration;
+            }
+            if (JSON.stringify(provider.status?.hostsEndpoint ?? null) === JSON.stringify(endpoint)) {
+                continue;
+            }
+            const status: DnsProviderStatus = { ...(provider.status ?? {}), hostsEndpoint: endpoint };
+            await this.bestEffort(`DNS provider '${provider.uid}'`, () =>
+                this.providerRepo!.update({ uid: provider.uid, version: provider.version, status }, asEntity(this.providerRepo!, provider), {
+                    version: provider.version,
+                    ignoreACL: true,
+                }),
+            );
+        }
+    }
+
+    /**
+     * Starts looking for conflicts to take over (`queueAutomaticTakeovers()`) in the background, for the report of the Lease holder that was just applied.
+     * One look runs at a time; a report that arrives while one runs is looked at once it ends, and one that arrives within
+     * `mail:dns:takeover:min_interval_seconds` of the last start is skipped (the next report is a minute away). Never throws: the report is answered first.
+     */
+    private requestTakeoverScan(report: StatusReportV1): void {
+        if (!this.auditLogUtils || !this.dnsResolver) {
+            return;
+        }
+        const observed: Set<string> = new Set(
+            report.endpoints.filter((entry) => entry.observedGeneration !== undefined && entry.observedGeneration >= entry.generation).map((entry) => entry.endpointSetId),
+        );
+        if (this.takeoverScan) {
+            this.pendingTakeoverScan = observed;
+            return;
+        }
+        const now: number = Date.now();
+        if (now - this.lastTakeoverScanAt < this.takeoverMinIntervalSeconds * 1000) {
+            return;
+        }
+        this.lastTakeoverScanAt = now;
+        this.takeoverScan = this.runTakeoverScans(observed);
+    }
+
+    /** Looks for conflicts with `observed`, then again for whatever report arrived meanwhile. */
+    private async runTakeoverScans(observed: ObservedEndpoints): Promise<void> {
+        let current: ObservedEndpoints | undefined = observed;
+        while (current) {
+            this.pendingTakeoverScan = undefined;
+            try {
+                await this.queueAutomaticTakeovers(current);
+            } catch (err: any) {
+                this.logger?.warn(`Could not look for DNS records to take over: ${err?.message}`);
+            }
+            // A report that came meanwhile is looked at once the minimum interval since the last look started has passed; otherwise the next report asks again.
+            current = this.pendingTakeoverScan && Date.now() - this.lastTakeoverScanAt >= this.takeoverMinIntervalSeconds * 1000 ? this.pendingTakeoverScan : undefined;
+            if (current) {
+                this.lastTakeoverScanAt = Date.now();
+            }
+        }
+        this.pendingTakeoverScan = undefined;
+        this.takeoverScan = undefined;
+    }
+
+    /**
+     * Queues the takeovers `planAutomaticTakeovers()` plans: for every enabled provider config with `allowTakeover`, the domain records and deployment hosts in
+     * conflict, once per name, type and values. Each is created under a uid derived from its records, so two servers looking at the same moment queue it once
+     * (the second create is refused as a duplicate and skipped).
+     */
+    private async queueAutomaticTakeovers(observed: ObservedEndpoints): Promise<void> {
+        const providers: DnsProvider[] = await findAllRows<DnsProvider>(this.providerRepo!);
+        if (!providers.some((provider) => provider.allowTakeover && provider.enabled)) {
+            return;
+        }
+        const ownerId: string | undefined = await findDnsOwnerId(this.identityRepo, this.logger);
+        if (!ownerId) {
+            return;
+        }
+        const [domains, operations] = await Promise.all([findAllRows<Domain>(this.domainRepo!), findAllRows<DnsOperation>(this.operationRepo!)]);
+        const plan: PlannedTakeover[] = await planAutomaticTakeovers({
+            providers,
+            domains,
+            operations,
+            ...this.publishConfig(),
+            context: { mxHostname: this.mxHostname, autodiscoverHostname: autodiscoverHostnameFor(this.autodiscoverPublicUrl), ttl: this.publishTtlSeconds },
+            resolver: this.dnsResolver!,
+            ownerId,
+            observed: (endpointSetId) => observed.has(endpointSetId),
+            acceptLegacyApex: this.acceptLegacyApex,
+        });
+        for (const planned of plan) {
+            await this.queueTakeover(planned);
+        }
+    }
+
+    /** Queues one planned takeover, audits it as the system (no user) and announces it to the controller. */
+    private async queueTakeover(planned: PlannedTakeover): Promise<void> {
+        let operation: DnsOperation;
+        try {
+            operation = await queueDnsOperation(this.operationRepo!, this.dnsOperationClass, {
+                uid: planned.uid,
+                type: "takeover",
+                providerUid: planned.provider.uid,
+                domainUid: planned.domain?.uid,
+                endpointSetId: planned.endpointSetId,
+                records: planned.records,
+            });
+        } catch (err: any) {
+            // Queued already, by another server looking at the same moment.
+            if (isDuplicateKeyError(err)) {
+                return;
+            }
+            throw err;
+        }
+        const oldValues: string[] = (await Promise.all(planned.records.map((record) => liveRecordValues(this.dnsResolver!, record)))).flat();
+        await this.auditLogUtils!.record({
+            action: AuditAction.DNS_TAKEOVER,
+            targetType: "DnsProvider",
+            targetUid: planned.provider.uid,
+            details: {
+                provider: planned.provider.uid,
+                ...(planned.domain ? { domain: planned.domain.name } : { hosts: true }),
+                recordNames: [...new Set(planned.records.map((record) => record.dnsName))],
+                oldValues,
+                operation: operation.uid,
+                actor: "system",
+                automatic: true,
+            },
+        });
+        this.logger?.info(
+            `Queued the takeover of ${planned.records.length} record(s) of '${planned.endpointSetId}' through DNS provider '${planned.provider.uid}', which allows takeover (operation ${operation.uid}).`,
+        );
+        await notifyDnsPublisher(this.dnsPublisher, { scope: "operation", operationUid: operation.uid }, this.logger);
     }
 
     private async applyOperationStatus(report: StatusReportV1, now: Date): Promise<void> {

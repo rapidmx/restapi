@@ -7,6 +7,8 @@
 import * as crypto from "crypto";
 import type { RepoUtils } from "@rapidrest/service-core";
 import { domainEndpointSetId } from "../dns/DnsDesiredState.js";
+import type { DnsRecordV1 } from "../dns/DnsDesiredStateApiV1.js";
+import type { DnsResolver } from "../dns/DnsResolver.js";
 import { PluginRegistry } from "../plugins/PluginRegistry.js";
 import type { DeploymentIdentity, DnsOperation, DnsOperationRecord, DnsOperationState, DnsOperationType, Domain } from "../models/types.js";
 import { findOrCreateDeploymentIdentity } from "./DeploymentIdentityUtils.js";
@@ -69,6 +71,8 @@ export function isDomainEndpointObserved(domain: Pick<Domain, "uid" | "dnsPublic
 
 /** What a queued operation is created from. */
 export interface DnsOperationRequest {
+    /** The operation's uid; a random one when left out. A name-based one makes creating the same operation twice fail the second time (an automatic takeover). */
+    uid?: string;
     type: DnsOperationType;
     providerUid: string;
     domainUid?: string;
@@ -86,6 +90,32 @@ export async function queueDnsOperation<T extends DnsOperation>(repo: RepoUtils<
         }
     }
     return await repo.create(new operationClass(fields), { ignoreACL: true });
+}
+
+/** The live values of `record` as text, for an audit entry's old values (an MX or SRV with its priority and more, a TXT joined); none for a record that isn't there or a
+ * lookup that fails. */
+export async function liveRecordValues(dnsResolver: DnsResolver, record: Pick<DnsRecordV1, "dnsName" | "recordType">): Promise<string[]> {
+    try {
+        switch (record.recordType) {
+            case "MX":
+                return (await dnsResolver.resolveMx(record.dnsName)).map((r) => `${r.priority} ${r.exchange}`);
+            case "SRV":
+                return (await dnsResolver.resolveSrv(record.dnsName)).map((r) => `${r.priority} ${r.weight} ${r.port} ${r.target}`);
+            case "CNAME":
+                return await dnsResolver.resolveCname(record.dnsName);
+            case "TXT":
+                return (await dnsResolver.resolveTxt(record.dnsName)).map((chunks) => chunks.join(""));
+            case "A":
+            case "AAAA": {
+                const addresses: string[] = (await dnsResolver.resolveAddresses?.(record.dnsName)) ?? [];
+                return addresses.filter((address) => address.includes(":") === (record.recordType === "AAAA"));
+            }
+            default:
+                return [];
+        }
+    } catch {
+        return [];
+    }
 }
 
 /** The wire shape of a queued operation. */

@@ -5,13 +5,13 @@
 // Isolated unit tests for what HTTP can't reach in DNS publishing: the `@Init` hooks on a server that registers no model, publisher or token verifier,
 // the best-effort writes of the controller's reports when they fail, and the status writes skipped because nothing changed. The routes themselves are
 // tested over HTTP on both backends in test/routes/dnsPublishingSuite.ts.
-import { RepoUtils } from "@rapidrest/service-core";
+import { ApiErrors, RepoUtils } from "@rapidrest/service-core";
 import { NullDnsPublisher } from "../../src/dns/NullDnsPublisher.js";
 import { ConfigSecretUnavailableError } from "../../src/secrets/ConfigCipher.js";
 import { BaseDnsDesiredStateRoute } from "../../src/routes/BaseDnsDesiredStateRoute.js";
 import { BaseDnsProviderRoute } from "../../src/routes/BaseDnsProviderRoute.js";
 import { BaseDomainRoute } from "../../src/routes/BaseDomainRoute.js";
-import { findDnsOwnerId, queueDnsOperation } from "../../src/util/DnsPublishingUtils.js";
+import { findDnsOwnerId, liveRecordValues, queueDnsOperation } from "../../src/util/DnsPublishingUtils.js";
 
 function model(name: string): any {
     return { [name]: class {} }[name];
@@ -286,16 +286,23 @@ describe("BaseDnsProviderRoute operations", () => {
     });
 
     it("reads the live values of every record kind for the audit entry, none when the lookup fails", async () => {
-        const route: any = new TestDnsProviderRoute();
-        route.dnsResolver = {
+        const resolver: any = {
             resolveSrv: vi.fn(async () => [{ priority: 0, weight: 5, port: 443, target: "old.example.net" }]),
+            resolveMx: vi.fn(async () => [{ priority: 5, exchange: "mx.old.example.net" }]),
             resolveTxt: vi.fn(async () => [["v=DMARC1; ", "p=none;"]]),
             resolveCname: vi.fn(async () => Promise.reject(new Error("NXDOMAIN"))),
         };
-        expect(await route.liveValues({ dnsName: "_autodiscover._tcp.example.com", recordType: "SRV" })).toEqual(["0 5 443 old.example.net"]);
-        expect(await route.liveValues({ dnsName: "_dmarc.example.com", recordType: "TXT" })).toEqual(["v=DMARC1; p=none;"]);
-        expect(await route.liveValues({ dnsName: "openpgpkey.example.com", recordType: "CNAME" })).toEqual([]);
-        expect(await route.liveValues({ dnsName: "mail.example.com", recordType: "A" })).toEqual([]);
+        expect(await liveRecordValues(resolver, { dnsName: "_autodiscover._tcp.example.com", recordType: "SRV" })).toEqual(["0 5 443 old.example.net"]);
+        expect(await liveRecordValues(resolver, { dnsName: "example.com", recordType: "MX" })).toEqual(["5 mx.old.example.net"]);
+        expect(await liveRecordValues(resolver, { dnsName: "_dmarc.example.com", recordType: "TXT" })).toEqual(["v=DMARC1; p=none;"]);
+        expect(await liveRecordValues(resolver, { dnsName: "openpgpkey.example.com", recordType: "CNAME" })).toEqual([]);
+        // A resolver that can't look addresses up knows none; one that can gives each family its own.
+        expect(await liveRecordValues(resolver, { dnsName: "mail.example.com", recordType: "A" })).toEqual([]);
+        resolver.resolveAddresses = vi.fn(async () => ["198.51.100.9", "2001:db8::9"]);
+        expect(await liveRecordValues(resolver, { dnsName: "mail.example.com", recordType: "A" })).toEqual(["198.51.100.9"]);
+        expect(await liveRecordValues(resolver, { dnsName: "mail.example.com", recordType: "AAAA" })).toEqual(["2001:db8::9"]);
+        resolver.resolveAddresses = vi.fn(async () => Promise.reject(new Error("NXDOMAIN")));
+        expect(await liveRecordValues(resolver, { dnsName: "mail.example.com", recordType: "A" })).toEqual([]);
     });
 });
 
@@ -412,5 +419,145 @@ describe("BaseDnsDesiredStateRoute providerCredentials()", () => {
             throw new TypeError("cipher is broken");
         });
         await expect(route.providerCredentials("aws-x", req, res)).rejects.toThrow("cipher is broken");
+    });
+});
+
+describe("BaseDnsDesiredStateRoute automatic takeover scheduling", () => {
+    /** A route that can audit and look things up, with its looking replaced by `look`. */
+    function scanRoute(look: (observed: ReadonlySet<string>) => Promise<void> = async () => undefined) {
+        const route: any = new TestDesiredStateRoute();
+        const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+        Object.defineProperty(route, "logger", { value: logger, configurable: true, writable: true });
+        route.auditLogUtils = { record: vi.fn() };
+        route.dnsResolver = {};
+        route.takeoverMinIntervalSeconds = 60;
+        route.queueAutomaticTakeovers = vi.fn(look);
+        return { route, logger };
+    }
+    const reportOf = (...endpoints: [string, number, number | undefined][]): any => ({
+        endpoints: endpoints.map(([endpointSetId, generation, observedGeneration]) => ({ endpointSetId, generation, observedGeneration })),
+    });
+
+    it("looks at nothing on a server that registers no audit log or resolver, since an unaudited takeover is never queued", async () => {
+        const { route } = scanRoute();
+        route.auditLogUtils = undefined;
+        route.requestTakeoverScan(reportOf(["domain-a-com", 1, 1]));
+        route.auditLogUtils = { record: vi.fn() };
+        route.dnsResolver = undefined;
+        route.requestTakeoverScan(reportOf(["domain-a-com", 1, 1]));
+
+        expect(route.queueAutomaticTakeovers).not.toHaveBeenCalled();
+        expect(route.takeoverScan).toBeUndefined();
+    });
+
+    it("hands the look the endpoints external-dns has observed at their current generation, and no more than one look within the interval", async () => {
+        const { route } = scanRoute();
+
+        route.requestTakeoverScan(reportOf(["domain-a-com", 2, 2], ["domain-b-com", 2, 1], ["domain-c-com", 1, undefined], ["hosts-p", 3, 4]));
+        await route.takeoverScan;
+        route.requestTakeoverScan(reportOf(["domain-a-com", 2, 2]));
+
+        expect(route.queueAutomaticTakeovers).toHaveBeenCalledTimes(1);
+        expect([...route.queueAutomaticTakeovers.mock.calls[0][0]].sort()).toEqual(["domain-a-com", "hosts-p"]);
+        expect(route.takeoverScan).toBeUndefined();
+    });
+
+    it("looks again, at the latest report, when reports arrive while a look runs", async () => {
+        let release: () => void = () => undefined;
+        const { route } = scanRoute((observed) => (observed.has("first") ? new Promise<void>((resolve) => (release = resolve)) : Promise.resolve()));
+
+        route.takeoverMinIntervalSeconds = 0;
+        route.requestTakeoverScan(reportOf(["first", 1, 1]));
+        route.requestTakeoverScan(reportOf(["second", 1, 1]));
+        route.requestTakeoverScan(reportOf(["third", 1, 1]));
+        expect(route.queueAutomaticTakeovers).toHaveBeenCalledTimes(1);
+        release();
+        await route.takeoverScan;
+
+        expect(route.queueAutomaticTakeovers).toHaveBeenCalledTimes(2);
+        expect([...route.queueAutomaticTakeovers.mock.calls[1][0]]).toEqual(["third"]);
+        expect(route.takeoverScan).toBeUndefined();
+    });
+
+    it("doesn't look again for a report that arrived while a look ran before the minimum interval since it started has passed: the next report asks again", async () => {
+        let release: () => void = () => undefined;
+        const { route } = scanRoute((observed) => (observed.has("first") ? new Promise<void>((resolve) => (release = resolve)) : Promise.resolve()));
+
+        route.requestTakeoverScan(reportOf(["first", 1, 1]));
+        route.requestTakeoverScan(reportOf(["second", 1, 1]));
+        release();
+        await route.takeoverScan;
+
+        expect(route.queueAutomaticTakeovers).toHaveBeenCalledTimes(1);
+        expect(route.pendingTakeoverScan).toBeUndefined();
+        expect(route.takeoverScan).toBeUndefined();
+    });
+
+    it("logs a look that failed and goes on to the next, without failing the report", async () => {
+        const { route, logger } = scanRoute(async (observed) => {
+            if (observed.has("first")) {
+                throw new Error("resolver is down");
+            }
+        });
+        route.takeoverMinIntervalSeconds = 0;
+
+        route.requestTakeoverScan(reportOf(["first", 1, 1]));
+        await route.takeoverScan;
+        route.requestTakeoverScan(reportOf(["second", 1, 1]));
+        await route.takeoverScan;
+
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("resolver is down"));
+        expect(route.queueAutomaticTakeovers).toHaveBeenCalledTimes(2);
+    });
+
+    describe("queueAutomaticTakeovers()", () => {
+        function lookRoute(providers: any[], identity: any = { uid: "deployment-identity", installationId: "abcdefghijklmnop" }) {
+            const route: any = new TestDesiredStateRoute();
+            const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+            Object.defineProperty(route, "logger", { value: logger, configurable: true, writable: true });
+            route.auditLogUtils = { record: vi.fn() };
+            route.dnsResolver = {};
+            route.providerRepo = { find: vi.fn(async () => providers) };
+            route.domainRepo = { find: vi.fn(async () => []) };
+            route.operationRepo = { find: vi.fn(async () => []), create: vi.fn(async (row: any) => row) };
+            route.identityRepo = { findOne: vi.fn(async () => identity) };
+            return { route, logger };
+        }
+
+        it("reads nothing more while no enabled provider config allows takeover, nor without an owner id to judge ownership by", async () => {
+            const none = lookRoute([{ uid: "a", allowTakeover: false, enabled: true }, { uid: "b", allowTakeover: true, enabled: false }]);
+            await none.route.queueAutomaticTakeovers(new Set());
+            expect(none.route.identityRepo.findOne).not.toHaveBeenCalled();
+
+            const noOwner = lookRoute([{ uid: "a", allowTakeover: true, enabled: true }], { uid: "deployment-identity", installationId: "BAD" });
+            await noOwner.route.queueAutomaticTakeovers(new Set());
+            expect(noOwner.route.domainRepo.find).not.toHaveBeenCalled();
+        });
+
+        const planned = (): any => ({
+            uid: "11111111-2222-5333-8444-555555555555",
+            provider: { uid: "a" },
+            domain: { uid: "example.com", name: "example.com" },
+            endpointSetId: "domain-example-com",
+            records: [{ dnsName: "example.com", recordType: "MX", targets: ["10 mail.example.com"] }],
+        });
+
+        it("skips a takeover another server queued at the same moment, and says nothing of it", async () => {
+            const { route } = lookRoute([]);
+            const refusal = Object.assign(new Error("exists"), { code: ApiErrors.IDENTIFIER_EXISTS, status: 400 });
+            route.operationRepo.create = vi.fn(async () => Promise.reject(refusal));
+            route.dnsResolver = { resolveMx: vi.fn(async () => []) };
+
+            await route.queueTakeover(planned());
+
+            expect(route.auditLogUtils.record).not.toHaveBeenCalled();
+        });
+
+        it("doesn't hide a failure to queue that isn't a duplicate", async () => {
+            const { route } = lookRoute([]);
+            route.operationRepo.create = vi.fn(async () => Promise.reject(new Error("database is down")));
+
+            await expect(route.queueTakeover(planned())).rejects.toThrow("database is down");
+        });
     });
 });
