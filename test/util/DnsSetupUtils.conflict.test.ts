@@ -114,5 +114,51 @@ describe("judgeConflict()", () => {
             resolver.addressRecords.set("autodiscover.example.com", ["192.0.2.1"]);
             expect(await judgeConflict(answering, { recordKind: "CNAME", recordName: "autodiscover.example.com", found: false, ownerId: OWNER })).toBeUndefined();
         });
+
+        describe("answering for a name that has no record of its own", () => {
+            /** `resolver` as a real one answers: a name with no record of the type gets the zone's `*.` record of it. */
+            const wildcarding = (): any => {
+                const wild = async (method: "resolveTxt" | "resolveCname" | "resolveAddresses" | "resolveMx", name: string): Promise<any> => {
+                    // A wildcard matches the labels below it however many (`*.example.com` answers `mail._domainkey.example.com`).
+                    for (let at = -1; at !== -2; at = name.indexOf(".", at + 1) < 0 ? -2 : name.indexOf(".", at + 1)) {
+                        try {
+                            return await resolver[method](at < 0 ? name : `*.${name.slice(at + 1)}`);
+                        } catch {
+                            // The next suffix.
+                        }
+                    }
+                    throw new Error(`no ${method} records for '${name}'`);
+                };
+                return Object.create(resolver, {
+                    resolveTxt: { value: (name: string) => wild("resolveTxt", name) },
+                    resolveCname: { value: (name: string) => wild("resolveCname", name) },
+                    resolveAddresses: { value: (name: string) => wild("resolveAddresses", name) },
+                    resolveMx: { value: (name: string) => wild("resolveMx", name) },
+                });
+            };
+
+            it.each([
+                ["a CNAME", "CNAME" as const, "openpgpkey.example.com", () => resolver.cnameRecords.set("*.example.com", ["web.host.example.net"])],
+                ["a TXT record", "TXT" as const, "mail._domainkey.example.com", () => resolver.records.set("*.example.com", [["v=spf1 -all"]])],
+                ["an address", "A" as const, "auth.example.com", () => resolver.addressRecords.set("*.example.com", ["192.0.2.50"])],
+                ["an MX record", "MX" as const, "mail.example.com", () => resolver.mxRecords.set("*.example.com", [{ priority: 10, exchange: "mx.example.net" }])],
+            ])("is judged not owned for %s whose value is the wildcard's: no lookup tells the wildcard from a record of the name's own with the same value", async (_name, recordKind, recordName, wildcard) => {
+                wildcard();
+                const answering = wildcarding();
+                // A hosting zone's `*` and an explicit record at the same address block external-dns for good; hiding it would leave the record pending with no takeover.
+                expect(await judgeConflict(answering, { recordKind, recordName, found: true, ownerId: OWNER })).toEqual({ conflictReason: "not_owned" });
+            });
+
+            it("is still a record that isn't ours when the name has one of its own", async () => {
+                resolver.cnameRecords.set("*.example.com", ["web.host.example.net"]);
+                resolver.cnameRecords.set("openpgpkey.example.com", ["elsewhere.example.net"]);
+                resolver.records.set("*.example.com", [["v=spf1 -all"]]);
+                resolver.records.set("mail._domainkey.example.com", [["v=DKIM1; p=OTHER"]]);
+                const answering = wildcarding();
+
+                expect(await judgeConflict(answering, { recordKind: "CNAME", recordName: "openpgpkey.example.com", found: true, ownerId: OWNER })).toEqual({ conflictReason: "not_owned" });
+                expect(await judgeConflict(answering, { recordKind: "TXT", recordName: "mail._domainkey.example.com", found: true, ownerId: OWNER })).toEqual({ conflictReason: "not_owned" });
+            });
+        });
     });
 });

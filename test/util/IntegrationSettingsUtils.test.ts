@@ -553,10 +553,15 @@ describe("IntegrationSettingsUtils", () => {
             });
 
             it("leaves the deployment's credentials in place for the deployment's own registry, however its URL is written", () => {
+                // The administrator's URL can't carry credentials, so the deployment's user name and password (basic auth, when it has no token) go with it.
                 for (const url of ["https://npm.internal.example.com/", "https://NPM.internal.example.com"]) {
                     const layer = buildIntegrationsConfigLayer({ pluginRegistry: { url } } as any, cipher(), deployment);
-                    expect(layer.values).toEqual({ "system:plugins:registry": url });
+                    expect(layer.values).toEqual({ "system:plugins:registry": "https://ci:s3cret@npm.internal.example.com/" });
                 }
+                const paths = buildIntegrationsConfigLayer({ pluginRegistry: { url: "https://npm.internal.example.com/" } } as any, cipher(), {
+                    "system:plugins:registry": "https://ci%40corp:p%3Aw@npm.internal.example.com/",
+                });
+                expect(paths.values).toEqual({ "system:plugins:registry": "https://ci%40corp:p%3Aw@npm.internal.example.com/" });
                 expect(buildIntegrationsConfigLayer({ pluginRegistry: { url: DEFAULT_PLUGIN_REGISTRY } } as any, cipher(), {}).values).toEqual({
                     "system:plugins:registry": DEFAULT_PLUGIN_REGISTRY,
                 });

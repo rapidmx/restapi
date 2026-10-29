@@ -12,6 +12,7 @@ import { savedCredentialKeys } from "./DnsProviderCredentials.js";
 import { isNameInZones } from "./DnsProviderTypes.js";
 import {
     API_VERSION_V1,
+    MAX_ENDPOINT_SET_ID_LENGTH,
     type DesiredStateV1,
     type DnsProviderV1,
     type DnsRecordKindV1,
@@ -29,9 +30,7 @@ export const DEFAULT_PUBLISH_TTL = 300;
 /** Cloudflare refuses a TTL under 2 minutes (other than "automatic"). */
 export const CLOUDFLARE_MIN_TTL = 120;
 
-/** The longest endpoint set id: the controller prefixes it with the release's full name (up to 63 characters) to name a `DNSEndpoint`, whose name may
- * be 253 characters long. */
-export const MAX_ENDPOINT_SET_ID_LENGTH = 180;
+export { MAX_ENDPOINT_SET_ID_LENGTH };
 
 /** What publishing needs beyond the domain: the hosts of `DesiredDnsRecordContext` and the TTL. */
 export interface DesiredDnsPublishContext extends DesiredDnsRecordContext {

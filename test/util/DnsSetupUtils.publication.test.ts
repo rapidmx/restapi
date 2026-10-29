@@ -288,6 +288,23 @@ describe("checkDnsSetup() publication and the legacy ownership location", () => 
         expect(moved.legacyApex).toBeUndefined();
     });
 
+    it("is a conflict when another value than the token is at _rapidmx-verify and the registry record isn't ours, as for every other record", async () => {
+        // A hand-made record of an earlier token (the domain was deleted and added again), or one a rebuilt installation owned.
+        const stale = [["rapidmx-domain-verification=old999"]];
+        const foreign = resolverFor({ txt: { "_rapidmx-verify.example.com": stale } });
+        let checks = await checkDnsSetup(foreign, domain, "", undefined, { publication: { provider: cloudflare, observed: true, ownerId } });
+        expect(checks.find((c) => c.type === "ownership")).toMatchObject({ found: true, matches: false, publication: "conflict", conflictReason: "not_owned" });
+
+        const oursStale = resolverFor({ txt: { "_rapidmx-verify.example.com": stale, "rmx-txt._rapidmx-verify.example.com": owned } });
+        checks = await checkDnsSetup(oursStale, domain, "", undefined, { publication: { provider: cloudflare, observed: true, ownerId } });
+        expect(checks.find((c) => c.type === "ownership")).toMatchObject({ found: true, matches: false, publication: "pending" });
+
+        // A lookup that fails is no record.
+        const nothing = resolverFor();
+        checks = await checkDnsSetup(nothing, domain, "", undefined, { publication: { provider: cloudflare, observed: true, ownerId } });
+        expect(checks.find((c) => c.type === "ownership")).toMatchObject({ found: false, matches: false, publication: "pending" });
+    });
+
     it("live-checks the next and previous DKIM selectors during a rotation", async () => {
         const rotating = makeDomain({ dkimSelector: "mail", dkimPublicKey: "KEY", dkimRotation: rotation });
         const live = resolverFor({ txt: { "rmx20261027._domainkey.example.com": [["v=DKIM1; k=rsa; p=NEXTKEY"]] } });

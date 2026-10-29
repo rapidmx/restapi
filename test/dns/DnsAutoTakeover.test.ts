@@ -145,6 +145,36 @@ describe("planAutomaticTakeovers()", () => {
         });
     });
 
+    it("takes over the ownership record when another token than the domain's is published there and not owned", async () => {
+        resolver.records.set("_rapidmx-verify.example.com", [["rapidmx-domain-verification=0ld"]]);
+
+        const [plan] = await planAutomaticTakeovers(input());
+
+        expect(plan.records).toEqual([{ dnsName: "_rapidmx-verify.example.com", recordType: "TXT", targets: ["rapidmx-domain-verification=3f9c1d"], ttl: 300 }]);
+    });
+
+    describe("what could not be looked up", () => {
+        it("reports no look of a domain whose SRV lookup failed, through a resolver that has no address lookup", async () => {
+            const looks: string[] = [];
+            const plain = {
+                resolveTxt: (name: string) => resolver.resolveTxt(name),
+                resolveMx: (name: string) => resolver.resolveMx(name),
+                resolveCname: (name: string) => resolver.resolveCname(name),
+                resolveSrv: (name: string) => resolver.resolveSrv(name),
+            };
+            const context = { mxHostname: "mail.example.com", autodiscoverHostname: "autodiscover.example.com", ttl: 300 };
+            const looked = (providerUid: string, endpointSetId: string, conflict: boolean): number => looks.push(`${providerUid}/${endpointSetId} ${conflict}`);
+
+            await planAutomaticTakeovers(input({ resolver: plain, context, looked }));
+            expect(looks).toEqual(["cloudflare-main/domain-example-com false"]);
+
+            looks.length = 0;
+            resolver.failing.add("_autodiscover._tcp.example.com");
+            await planAutomaticTakeovers(input({ resolver: plain, context, looked }));
+            expect(looks).toEqual([]);
+        });
+    });
+
     describe("what was taken over before, and what is under way", () => {
         it("doesn't take over again what a takeover of the same name, type and values was queued for, whatever became of it", async () => {
             conflictingMxAndDmarc();
@@ -241,6 +271,65 @@ describe("planAutomaticTakeovers()", () => {
             expect(plan[0].endpointSetId).toBe("hosts-cloudflare-main");
             expect(plan[0].domain).toBeUndefined();
             expect(plan[0].records).toEqual([{ dnsName: "mail.example.com", recordType: "A", targets: ["203.0.113.7"], ttl: 300 }]);
+        });
+
+        it("says what it found of each set it looked up, and doesn't look up a set the caller has found clean and unchanged", async () => {
+            const looks: string[] = [];
+            const looked = (providerUid: string, endpointSetId: string, conflict: boolean): number => looks.push(`${providerUid}/${endpointSetId} ${conflict}`);
+            const both = { hosts, addresses: ["203.0.113.7"], looked };
+            resolver.addressRecords.set("mail.example.com", ["198.51.100.9"]);
+
+            const plan = await planAutomaticTakeovers(input({ ...both }));
+            expect(plan.map((p) => p.endpointSetId)).toEqual(["hosts-cloudflare-main"]);
+            expect(looks).toEqual(["cloudflare-main/domain-example-com false", "cloudflare-main/hosts-cloudflare-main true"]);
+
+            // Nothing is looked up for a set the caller says is unchanged, so nothing is found of it, even with a record in conflict.
+            looks.length = 0;
+            const skipped = await planAutomaticTakeovers(input({ ...both, unchanged: () => true }));
+            expect(skipped).toEqual([]);
+            expect(looks).toEqual([]);
+            const asked: string[] = [];
+            await planAutomaticTakeovers(input({ ...both, unchanged: (providerUid, id) => (asked.push(`${providerUid}/${id}`), id.startsWith("domain-")) }));
+            expect(asked).toEqual(["cloudflare-main/domain-example-com", "cloudflare-main/hosts-cloudflare-main"]);
+            expect(looks).toEqual(["cloudflare-main/hosts-cloudflare-main true"]);
+        });
+
+        it("reports no look of a set when a lookup of it could not be answered, so that a resolver that failed does not keep it from being looked at again", async () => {
+            const looks: string[] = [];
+            const looked = (providerUid: string, endpointSetId: string, conflict: boolean): number => looks.push(`${providerUid}/${endpointSetId} ${conflict}`);
+            const both = { hosts, addresses: ["203.0.113.7"], looked };
+            // A name that is not there is an answer; a timeout is not.
+            resolver.failing.add("_dmarc.example.com");
+
+            await planAutomaticTakeovers(input({ ...both }));
+            expect(looks).toEqual(["cloudflare-main/hosts-cloudflare-main false"]);
+
+            looks.length = 0;
+            resolver.failing.clear();
+            resolver.failing.add("mail.example.com");
+            await planAutomaticTakeovers(input({ ...both }));
+            expect(looks).toEqual(["cloudflare-main/domain-example-com false"]);
+        });
+
+        it("reports a set whose conflict was taken over before as clean, since nothing is left for the scan to do for it", async () => {
+            const looks: string[] = [];
+            const looked = (providerUid: string, endpointSetId: string, conflict: boolean): number => looks.push(`${providerUid}/${endpointSetId} ${conflict}`);
+            conflictingMxAndDmarc();
+            resolver.addressRecords.set("mail.example.com", ["198.51.100.9"]);
+            const taken = operation({
+                state: "failed",
+                endpointSetId: "domain-example-com",
+                records: [
+                    { dnsName: "example.com", recordType: "MX", targets: ["10 mail.example.com"], ttl: 300 },
+                    { dnsName: "_dmarc.example.com", recordType: "TXT", targets: ["v=DMARC1; p=none;"], ttl: 300 },
+                ],
+            });
+            const takenHost = operation({ state: "failed", endpointSetId: "hosts-cloudflare-main", records: [{ dnsName: "mail.example.com", recordType: "A", targets: ["203.0.113.7"], ttl: 300 }] });
+
+            const plan = await planAutomaticTakeovers(input({ hosts, addresses: ["203.0.113.7"], looked, operations: [taken, takenHost] }));
+
+            expect(plan).toEqual([]);
+            expect(looks).toEqual(["cloudflare-main/domain-example-com false", "cloudflare-main/hosts-cloudflare-main false"]);
         });
 
         it("leaves out a host whose live records are another type than the one published, and one that stays manual", async () => {

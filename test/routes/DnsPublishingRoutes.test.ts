@@ -12,6 +12,7 @@ import { BaseDnsDesiredStateRoute } from "../../src/routes/BaseDnsDesiredStateRo
 import { BaseDnsProviderRoute } from "../../src/routes/BaseDnsProviderRoute.js";
 import { BaseDomainRoute } from "../../src/routes/BaseDomainRoute.js";
 import { findDnsOwnerId, liveRecordValues, queueDnsOperation } from "../../src/util/DnsPublishingUtils.js";
+import { StaticDnsResolver } from "../testDoubles.js";
 
 function model(name: string): any {
     return { [name]: class {} }[name];
@@ -541,6 +542,138 @@ describe("BaseDnsDesiredStateRoute automatic takeover scheduling", () => {
             domain: { uid: "example.com", name: "example.com" },
             endpointSetId: "domain-example-com",
             records: [{ dnsName: "example.com", recordType: "MX", targets: ["10 mail.example.com"] }],
+        });
+
+        describe("what it looks up again", () => {
+            const ENVELOPE = { $enc: 1, kid: "k1", iv: "iv", ct: "ct", tag: "tag" };
+            const cloudflare: any = {
+                uid: "cloudflare-main",
+                name: "Cloudflare",
+                type: "cloudflare",
+                zones: ["example.com"],
+                credentials: { apiToken: ENVELOPE },
+                enabled: true,
+                allowTakeover: true,
+            };
+            const example: any = { uid: "example.com", name: "example.com", enabled: true, verified: false, verificationToken: "3f9c1d", dnsProviderUid: "cloudflare-main" };
+            const registry = [["heritage=external-dns,external-dns/owner=rapidmx-abcdefghijklmnop,external-dns/resource=crd/mail/x"]];
+
+            /** A route with one domain on a provider that allows takeover, a counting resolver, and a mailbox host at `mail.example.com`. */
+            function scanning(operations: any[] = []) {
+                const { route } = lookRoute([cloudflare]);
+                const resolver = new StaticDnsResolver();
+                const lookups = { count: 0 };
+                for (const method of ["resolveTxt", "resolveMx", "resolveCname", "resolveSrv", "resolveAddresses"] as const) {
+                    const original = resolver[method].bind(resolver) as (name: string) => Promise<any>;
+                    (resolver as any)[method] = async (name: string) => {
+                        lookups.count++;
+                        return await original(name);
+                    };
+                }
+                route.dnsResolver = resolver;
+                route.mxHostname = "mail.example.com";
+                route.takeoverMinIntervalSeconds = 0;
+                route.takeoverRecheckSeconds = 3600;
+                route.domainRepo.find = vi.fn(async () => [example]);
+                route.operationRepo.find = vi.fn(async (query: any) => operations.filter((operation) => !query.type || operation.type === query.type));
+                const scan = async (generation: number): Promise<number> => {
+                    lookups.count = 0;
+                    route.requestTakeoverScan({ endpoints: [{ endpointSetId: "domain-example-com", generation, observedGeneration: generation }] });
+                    await route.takeoverScan;
+                    return lookups.count;
+                };
+                return { route, resolver, scan, lookups };
+            }
+
+            it("doesn't look a domain found clean up again until its endpoint changes or the time to look again has passed", async () => {
+                const { route, resolver, scan } = scanning();
+                resolver.mxRecords.set("example.com", [{ priority: 10, exchange: "mail.example.com" }]);
+                resolver.records.set("rmx-mx.example.com", registry);
+
+                expect(await scan(1)).toBeGreaterThan(0);
+                expect(await scan(1)).toBe(0);
+                expect(await scan(1)).toBe(0);
+                // The endpoint changed: its records may be too.
+                expect(await scan(2)).toBeGreaterThan(0);
+                expect(await scan(2)).toBe(0);
+                // Long enough since the look, though nothing in the endpoint changed.
+                route.takeoverRecheckSeconds = 0;
+                expect(await scan(2)).toBeGreaterThan(0);
+                expect(route.operationRepo.create).not.toHaveBeenCalled();
+            });
+
+            it("keeps looking at a domain with a record in conflict, until a takeover has cleared it, and queues it once", async () => {
+                const { route, resolver, scan } = scanning();
+                resolver.mxRecords.set("example.com", [{ priority: 5, exchange: "mx.oldhost.net" }]);
+
+                expect(await scan(1)).toBeGreaterThan(0);
+                expect(route.operationRepo.create).toHaveBeenCalledTimes(1);
+                expect(await scan(1)).toBeGreaterThan(0);
+                // The takeover ran: the record is the deployment's.
+                resolver.mxRecords.set("example.com", [{ priority: 10, exchange: "mail.example.com" }]);
+                resolver.records.set("rmx-mx.example.com", registry);
+                expect(await scan(1)).toBeGreaterThan(0);
+                expect(await scan(1)).toBe(0);
+            });
+
+            it("forgets what it saw of an endpoint set that is no longer reported, and of a domain moved to another provider config", async () => {
+                const { route, resolver, scan } = scanning();
+                resolver.mxRecords.set("example.com", [{ priority: 10, exchange: "mail.example.com" }]);
+                resolver.records.set("rmx-mx.example.com", registry);
+                await scan(1);
+                expect(await scan(1)).toBe(0);
+
+                route.requestTakeoverScan({ endpoints: [] });
+                await route.takeoverScan;
+                expect(await scan(1)).toBeGreaterThan(0);
+
+                const other = { ...cloudflare, uid: "cloudflare-other" };
+                route.providerRepo.find = vi.fn(async () => [other]);
+                route.domainRepo.find = vi.fn(async () => [{ ...example, dnsProviderUid: "cloudflare-other" }]);
+                expect(await scan(1)).toBeGreaterThan(0);
+            });
+
+            it("records a look under the generation of the report its scan was made for, not one a report brought while it ran", async () => {
+                const { route, resolver, scan } = scanning();
+                resolver.mxRecords.set("example.com", [{ priority: 10, exchange: "mail.example.com" }]);
+                resolver.records.set("rmx-mx.example.com", registry);
+                let release: () => void = () => undefined;
+                const gate = new Promise<void>((resolve) => (release = resolve));
+                route.domainRepo.find = vi.fn(async () => {
+                    await gate;
+                    return [example];
+                });
+
+                route.requestTakeoverScan({ endpoints: [{ endpointSetId: "domain-example-com", generation: 1, observedGeneration: 1 }] });
+                // The endpoint changed meanwhile; external-dns has not read the new generation.
+                route.requestTakeoverScan({ endpoints: [{ endpointSetId: "domain-example-com", generation: 2, observedGeneration: 1 }] });
+                release();
+                await route.takeoverScan;
+
+                // Observed at generation 2 now: what was seen at generation 1 does not stand for it.
+                expect(await scan(2)).toBeGreaterThan(0);
+                expect(await scan(2)).toBe(0);
+            });
+
+            it("looks at a domain again when a lookup of it could not be answered, however clean it looked", async () => {
+                const { resolver, scan } = scanning();
+                resolver.failing.add("_dmarc.example.com");
+
+                expect(await scan(1)).toBeGreaterThan(0);
+                expect(await scan(1)).toBeGreaterThan(0);
+                resolver.failing.clear();
+                expect(await scan(1)).toBeGreaterThan(0);
+                expect(await scan(1)).toBe(0);
+            });
+
+            it("reads only the takeovers and restores among the operations, not the whole history", async () => {
+                const { route, scan } = scanning([{ uid: "t", type: "test", providerUid: "cloudflare-main", state: "succeeded" }]);
+
+                await scan(1);
+
+                const queries = route.operationRepo.find.mock.calls.map(([query]: any) => query.type).sort();
+                expect(queries).toEqual(["restore", "takeover"]);
+            });
         });
 
         it("skips a takeover another server queued at the same moment, and says nothing of it", async () => {

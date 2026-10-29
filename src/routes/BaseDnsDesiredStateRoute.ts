@@ -63,8 +63,22 @@ const PROVIDER_STATUS_REFRESH_MS = 5 * 60 * 1000;
 /** The shortest time between two looks at the conflicts for an automatic takeover, unless a report arrives while one runs (`mail:dns:takeover:min_interval_seconds`). */
 const DEFAULT_TAKEOVER_MIN_INTERVAL_SECONDS = 60;
 
+/** How long a domain or host set found with nothing to take over is not looked at again while its endpoint stays as it is (`mail:dns:takeover:recheck_seconds`): what a
+ * record added at the DNS host behind the endpoint's back waits for, since nothing else tells the server about it. */
+const DEFAULT_TAKEOVER_RECHECK_SECONDS = 6 * 60 * 60;
+
 /** The endpoints a status report said external-dns has observed (at their current generation), by endpoint set id. */
 type ObservedEndpoints = ReadonlySet<string>;
+
+/** What one status report said of the endpoint sets, kept for the scan it starts: the generation of each set, as a scan that runs for minutes must record what
+ * it looked at under the generation it was told was observed, not under one a later report brought. */
+type ReportedGenerations = ReadonlyMap<string, number>;
+
+/** The report a scan is made for. */
+interface TakeoverScanRequest {
+    observed: ObservedEndpoints;
+    generations: ReportedGenerations;
+}
 
 /** `res` answering 400 with `body`, the shape the controller reads a refusal from. */
 function refuse(res: HttpResponse, body: Record<string, unknown>): HttpResponse {
@@ -161,6 +175,9 @@ export abstract class BaseDnsDesiredStateRoute {
     @Config("mail:dns:takeover:min_interval_seconds", DEFAULT_TAKEOVER_MIN_INTERVAL_SECONDS)
     private takeoverMinIntervalSeconds: number = DEFAULT_TAKEOVER_MIN_INTERVAL_SECONDS;
 
+    @Config("mail:dns:takeover:recheck_seconds", DEFAULT_TAKEOVER_RECHECK_SECONDS)
+    private takeoverRecheckSeconds: number = DEFAULT_TAKEOVER_RECHECK_SECONDS;
+
     /** Looks up the live records an automatic takeover judges conflicts by. */
     @Inject("DnsResolver")
     private dnsResolver?: DnsResolver;
@@ -177,9 +194,17 @@ export abstract class BaseDnsDesiredStateRoute {
     private takeoverScan?: Promise<void>;
 
     /** What a report asked to be looked at while a scan was running: looked at once it ends. */
-    private pendingTakeoverScan?: ObservedEndpoints;
+    private pendingTakeoverScan?: TakeoverScanRequest;
 
     private lastTakeoverScanAt: number = 0;
+
+    /** The generation of each endpoint set in the latest report of the Lease holder. */
+    private reportedGenerations: Map<string, number> = new Map();
+
+    /** What the last look found for each set of a provider config (`<provider uid>/<set id>`): the generation it looked at, when, and whether a record was in
+     * conflict. A set found clean at the generation the controller still reports is not looked at again before `takeoverRecheckSeconds`; one in conflict is, on
+     * every look, until a takeover has cleared it. Kept per copy: only the copy that was sent the report looks, and a restart looks at everything once. */
+    private takeoverLooks: Map<string, { generation: number | undefined; at: number; conflict: boolean }> = new Map();
 
     /** Decrypts the credentials the controller asks for; unset on a server that registers none (a config with credentials is then answered 503). */
     @Inject("ConfigCipher")
@@ -561,11 +586,13 @@ export abstract class BaseDnsDesiredStateRoute {
         if (!this.auditLogUtils || !this.dnsResolver) {
             return;
         }
+        const generations: Map<string, number> = new Map(report.endpoints.map((entry) => [entry.endpointSetId, entry.generation]));
+        this.reportedGenerations = generations;
         const observed: Set<string> = new Set(
             report.endpoints.filter((entry) => entry.observedGeneration !== undefined && entry.observedGeneration >= entry.generation).map((entry) => entry.endpointSetId),
         );
         if (this.takeoverScan) {
-            this.pendingTakeoverScan = observed;
+            this.pendingTakeoverScan = { observed, generations };
             return;
         }
         const now: number = Date.now();
@@ -573,16 +600,16 @@ export abstract class BaseDnsDesiredStateRoute {
             return;
         }
         this.lastTakeoverScanAt = now;
-        this.takeoverScan = this.runTakeoverScans(observed);
+        this.takeoverScan = this.runTakeoverScans({ observed, generations });
     }
 
     /** Looks for conflicts with `observed`, then again for whatever report arrived meanwhile. */
-    private async runTakeoverScans(observed: ObservedEndpoints): Promise<void> {
-        let current: ObservedEndpoints | undefined = observed;
+    private async runTakeoverScans(request: TakeoverScanRequest): Promise<void> {
+        let current: TakeoverScanRequest | undefined = request;
         while (current) {
             this.pendingTakeoverScan = undefined;
             try {
-                await this.queueAutomaticTakeovers(current);
+                await this.queueAutomaticTakeovers(current.observed, current.generations);
             } catch (err: any) {
                 this.logger?.warn(`Could not look for DNS records to take over: ${err?.message}`);
             }
@@ -601,7 +628,7 @@ export abstract class BaseDnsDesiredStateRoute {
      * conflict, once per name, type and values. Each is created under a uid derived from its records, so two servers looking at the same moment queue it once
      * (the second create is refused as a duplicate and skipped).
      */
-    private async queueAutomaticTakeovers(observed: ObservedEndpoints): Promise<void> {
+    private async queueAutomaticTakeovers(observed: ObservedEndpoints, generations: ReportedGenerations): Promise<void> {
         const providers: DnsProvider[] = await findAllRows<DnsProvider>(this.providerRepo!);
         if (!providers.some((provider) => provider.allowTakeover && provider.enabled)) {
             return;
@@ -610,17 +637,34 @@ export abstract class BaseDnsDesiredStateRoute {
         if (!ownerId) {
             return;
         }
-        const [domains, operations] = await Promise.all([findAllRows<Domain>(this.domainRepo!), findAllRows<DnsOperation>(this.operationRepo!)]);
+        // Only takeovers and restores matter to the plan (what was taken over before, what is under way); tests and the like are never read.
+        const [domains, takeovers, restores] = await Promise.all([
+            findAllRows<Domain>(this.domainRepo!),
+            findAllRows<DnsOperation>(this.operationRepo!, { type: "takeover" }),
+            findAllRows<DnsOperation>(this.operationRepo!, { type: "restore" }),
+        ]);
+        // What was looked at of a set that is no longer reported is forgotten, so one that comes back (its generation starting lower) is looked at again.
+        const looks: Map<string, { generation: number | undefined; at: number; conflict: boolean }> = new Map(
+            [...this.takeoverLooks].filter(([key]) => this.reportedGenerations.has(key.slice(key.indexOf("/") + 1))),
+        );
+        this.takeoverLooks = looks;
         const plan: PlannedTakeover[] = await planAutomaticTakeovers({
             providers,
             domains,
-            operations,
+            operations: [...takeovers, ...restores],
             ...this.publishConfig(),
             context: { mxHostname: this.mxHostname, autodiscoverHostname: autodiscoverHostnameFor(this.autodiscoverPublicUrl), ttl: this.publishTtlSeconds },
             resolver: this.dnsResolver!,
             ownerId,
             observed: (endpointSetId) => observed.has(endpointSetId),
             acceptLegacyApex: this.acceptLegacyApex,
+            unchanged: (providerUid, endpointSetId) => {
+                const look = looks.get(`${providerUid}/${endpointSetId}`);
+                return !!look && !look.conflict && look.generation === this.reportedGenerations.get(endpointSetId) && Date.now() - look.at < this.takeoverRecheckSeconds * 1000;
+            },
+            // Under the generation of the report this scan was made for (the one it was told was observed), not the latest: a report that came meanwhile may
+            // bring a generation external-dns has not read, and a look made before it must not stand for it.
+            looked: (providerUid, endpointSetId, conflict) => looks.set(`${providerUid}/${endpointSetId}`, { generation: generations.get(endpointSetId), at: Date.now(), conflict }),
         });
         for (const planned of plan) {
             await this.queueTakeover(planned);

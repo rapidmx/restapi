@@ -456,6 +456,120 @@ export function dnsPublishingSuite(ctx: DnsPublishingSuiteContext): void {
             expect((await ctx.operationRows()).filter((op) => op.type === "restore")).toHaveLength(1);
         });
 
+        /** A domain opted in with a kept value and opted out again, so a restore is queued. */
+        async function optedOutWithRestore(): Promise<any> {
+            const provider = await createProvider();
+            await ctx.saveDomain({ name: "example.com", verificationToken: "tok" });
+            await assign("example.com", provider.uid);
+            ctx.resolver().records.set("example.com", apex);
+            expect((await putApexTxt("example.com", { managed: true, keep: ["google-site-verification=g"] })).status).toBe(200);
+            expect((await putApexTxt("example.com", { managed: false })).status).toBe(200);
+            const restore = (await ctx.operationRows()).find((op) => op.type === "restore");
+            expect(restore.state).toBe("queued");
+            return restore;
+        }
+        const restoreRecords = (restore: any): string[][] => [...restore.records[0].targets.map((target: string) => [target]), ["rapidmx-domain-verification=tok"]];
+
+        it("refuses to opt back in while the restore of the opt-out has values to put back (409): the set is gone, or its Job has started", async () => {
+            const restore = await optedOutWithRestore();
+
+            // The set was released and deleted: the restore is what brings the values back, and an opt-in now would not see them.
+            const refused = await putApexTxt("example.com", { managed: true, keep: [] });
+            expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+            expect(refused.body.message).toContain("restore");
+            expect(refused.body.message).toContain("queued");
+            expect((await ctx.domainRow("example.com")).apexTxt).toEqual(expect.objectContaining({ managed: false }));
+            expect((await ctx.operationRows()).filter((op) => op.type === "takeover")).toHaveLength(1);
+
+            // The values are at the apex but its Job has started writing them: not cancelled under it.
+            ctx.resolver().records.set("example.com", restoreRecords(restore));
+            expect((await report({ operations: [{ id: restore.uid, state: "running", message: "Running the restore." }] })).status).toBe(200);
+            const started = await putApexTxt("example.com", { managed: true, keep: [] });
+            expect(started.status).toBe(409);
+            expect(started.body.message).toContain("Running the restore.");
+
+            expect((await report({ operations: [{ id: restore.uid, state: "succeeded" }] })).status).toBe(200);
+            const optedIn = await putApexTxt("example.com", { managed: true, keep: ["google-site-verification=g"] });
+            expect(optedIn.status, JSON.stringify(optedIn.body)).toBe(200);
+            expect((await ctx.operationRows()).filter((op) => op.type === "takeover")).toHaveLength(2);
+        });
+
+        it("opts back in over a restore that has not started while every value is still at the apex, and cancels the restore", async () => {
+            const restore = await optedOutWithRestore();
+            ctx.resolver().records.set("example.com", restoreRecords(restore));
+
+            // Queued, nothing removed (the provider's instance may not even run).
+            const optedIn = await putApexTxt("example.com", { managed: true, keep: ["google-site-verification=g"] });
+            expect(optedIn.status, JSON.stringify(optedIn.body)).toBe(200);
+            const rows = await ctx.operationRows();
+            expect(rows.find((op) => op.uid === restore.uid)).toEqual(expect.objectContaining({ state: "failed", message: "Cancelled: the root TXT records were opted into again before it ran." }));
+            expect(rows.filter((op) => op.type === "takeover")).toHaveLength(2);
+
+            // And one the controller reports waiting for the set to be removed.
+            expect((await putApexTxt("example.com", { managed: false })).status).toBe(200);
+            const second = (await ctx.operationRows()).find((op) => op.type === "restore" && op.state === "queued");
+            expect((await report({ operations: [{ id: second.uid, state: "running", message: "Waiting for the provider's external-dns instance to remove the set." }] })).status).toBe(200);
+            expect((await putApexTxt("example.com", { managed: true, keep: [] })).status).toBe(200);
+            expect((await ctx.operationRows()).find((op) => op.uid === second.uid)!.state).toBe("failed");
+        });
+
+        it("doesn't opt in when the restore it would replace can't be cancelled, since both would then be pending", async () => {
+            const restore = await optedOutWithRestore();
+            ctx.resolver().records.set("example.com", restoreRecords(restore));
+            const route = await ctx.newDomainRoute(`optin-${uuid.v4()}`);
+            const admin: any = { uid: uuid.v4(), roles: ["admin"], elevated: Date.now() };
+            const updating = vi.spyOn(route.dnsOperationRepo, "update").mockRejectedValueOnce(new Error("version conflict"));
+            try {
+                await expect(route.updateApexTxt("example.com", { managed: true, keep: [] }, {}, admin)).rejects.toThrow("version conflict");
+            } finally {
+                updating.mockRestore();
+            }
+            expect((await ctx.domainRow("example.com")).apexTxt).toEqual(expect.objectContaining({ managed: false }));
+            expect((await ctx.operationRows()).filter((op) => op.type === "takeover")).toHaveLength(1);
+        });
+
+        it("saves the opt-in before queueing its takeover, so no state read lists a takeover the set doesn't hold, and puts the row back when the takeover can't be queued", async () => {
+            const provider = await createProvider();
+            await ctx.saveDomain({ name: "example.com", verificationToken: "tok" });
+            await assign("example.com", provider.uid);
+            ctx.resolver().records.set("example.com", apex);
+            const route = await ctx.newDomainRoute(`optin-${uuid.v4()}`);
+            const admin: any = { uid: uuid.v4(), roles: ["admin"], elevated: Date.now() };
+
+            // The row is managed by the time the takeover exists.
+            const creating = vi.spyOn(route.dnsOperationRepo, "create");
+            let managedAtCreate: unknown;
+            creating.mockImplementationOnce(async () => {
+                managedAtCreate = (await ctx.domainRow("example.com")).apexTxt?.managed;
+                throw new Error("database is gone");
+            });
+            try {
+                await expect(route.updateApexTxt("example.com", { managed: true, keep: [] }, {}, admin)).rejects.toThrow("database is gone");
+            } finally {
+                creating.mockRestore();
+            }
+            expect(managedAtCreate).toBe(true);
+            // Put back, so the retry is the opt-in again, with its takeover.
+            expect((await ctx.domainRow("example.com")).apexTxt).toEqual(expect.objectContaining({ managed: false }));
+            expect(await ctx.operationRows()).toEqual([]);
+            expect((await putApexTxt("example.com", { managed: true, keep: [] })).status).toBe(200);
+            expect((await ctx.operationRows()).map((op) => op.type)).toEqual(["takeover"]);
+
+            // A row that can't be put back is logged; the failure of the queue is still what the admin gets.
+            await ctx.saveDomain({ name: "other.example.com", verificationToken: "tok2" });
+            await assign("other.example.com", provider.uid);
+            ctx.resolver().records.set("other.example.com", apex);
+            const failing = vi.spyOn(route.dnsOperationRepo, "create").mockRejectedValueOnce(new Error("database is gone"));
+            const original = route.repoUtils.update.bind(route.repoUtils);
+            const undoing = vi.spyOn(route.repoUtils, "update").mockImplementationOnce(original).mockRejectedValueOnce(new Error("version conflict"));
+            try {
+                await expect(route.updateApexTxt("other.example.com", { managed: true, keep: [] }, {}, admin)).rejects.toThrow("database is gone");
+            } finally {
+                failing.mockRestore();
+                undoing.mockRestore();
+            }
+        });
+
         it("restores the SPF record it adopted when no other value was kept", async () => {
             const provider = await createProvider();
             await ctx.saveDomain({ name: "example.com" });

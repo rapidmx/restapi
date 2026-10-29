@@ -184,6 +184,11 @@ export class DnsApiPayloadError extends Error {
 export const MAX_REPORTED_TEXT_LENGTH = 2000;
 /** The longest version or identity string accepted. */
 const MAX_LABEL_LENGTH = 100;
+/**
+ * The longest endpoint set id: the controller prefixes it with the release's full name (up to 63 characters) to name a `DNSEndpoint`, whose name may
+ * be 253 characters long. A domain's id is `domain-` and its name, so it is longer than `MAX_LABEL_LENGTH` for a name of about 94 characters.
+ */
+export const MAX_ENDPOINT_SET_ID_LENGTH = 180;
 /** The longest image reference accepted (registry, repository, tag and digest). */
 const MAX_IMAGE_LENGTH = 500;
 /** The most API versions a handshake may list. */
@@ -214,6 +219,10 @@ export function expectV1<T extends V1Envelope<string>>(payload: unknown, kind: T
 
 function isLabel(value: unknown): value is string {
     return typeof value === "string" && value.length > 0 && value.length <= MAX_LABEL_LENGTH;
+}
+
+function isEndpointSetId(value: unknown): value is string {
+    return typeof value === "string" && value.length > 0 && value.length <= MAX_ENDPOINT_SET_ID_LENGTH;
 }
 
 function isCount(value: unknown): value is number {
@@ -303,7 +312,7 @@ export function parseStatusReport(payload: unknown): StatusReportV1 {
         return status;
     });
     const endpoints: EndpointStatusV1[] = list(report.endpoints, "endpoints", (entry) => {
-        if (!isLabel(entry.endpointSetId) || !isCount(entry.generation) || (entry.observedGeneration !== undefined && !isCount(entry.observedGeneration))) {
+        if (!isEndpointSetId(entry.endpointSetId) || !isCount(entry.generation) || (entry.observedGeneration !== undefined && !isCount(entry.observedGeneration))) {
             return undefined;
         }
         const status: EndpointStatusV1 = { endpointSetId: entry.endpointSetId, generation: entry.generation };

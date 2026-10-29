@@ -369,7 +369,8 @@ export function configKeyRotationSuite(ctx: ConfigKeyRotationSuiteContext): void
             it("takes up the key a crashed copy had already written, instead of adding a second", async () => {
                 const added = { kid: "ex7ra001", key: Buffer.alloc(32, 9).toString("base64"), createdAt: new Date().toISOString() };
                 writeRing(OLD, added);
-                await startRotation({ requestedAt: new Date(Date.now() - MINUTE) });
+                // The copy recorded the keys the ring held before it wrote the new one.
+                await startRotation({ requestedAt: new Date(Date.now() - MINUTE), keyringKids: [OLD.kid] });
                 await job.run();
                 expect(kids()).toEqual([OLD.kid, "ex7ra001"]);
                 const current = await rotation();
@@ -377,6 +378,36 @@ export function configKeyRotationSuite(ctx: ConfigKeyRotationSuiteContext): void
                 expect(current.previousKids).toEqual([OLD.kid]);
                 expect(current.phase).toBe("activating");
                 expect(await ctx.auditEntries(AuditAction.CONFIG_KEY_ROTATED)).toHaveLength(1);
+            });
+
+            it("adds a key of its own even when a key of the ring was made by a clock ahead of the request's, as a keyring written by another machine can be", async () => {
+                // The installer's machine ran ten minutes ahead of the cluster, so the original key looks newer than a request made a minute ago.
+                const ahead = { ...OLD, createdAt: new Date(Date.now() + 10 * MINUTE).toISOString() };
+                writeRing(ahead);
+                await startRotation({ compromised: true });
+
+                await job.run();
+
+                expect(kids()).toHaveLength(2);
+                const current = await rotation();
+                expect(current.kid).toBe(addedKid());
+                expect(current.kid).not.toBe(OLD.kid);
+                expect(current.previousKids).toEqual([OLD.kid]);
+                expect(current.phase).toBe("activating");
+                expect((await ctx.auditEntries(AuditAction.CONFIG_KEY_ROTATED))[0].details).toEqual({ kid: current.kid, reason: "compromised" });
+            });
+
+            it("records the keys the ring held before it writes the new one, so a retry after a failed write finds the same ring, and drops them once the key is recorded", async () => {
+                await startRotation();
+                vi.spyOn(store, "write").mockRejectedValueOnce(new Error("OpenBao is sealed"));
+                await job.run();
+                expect((await rotation()).keyringKids).toEqual([OLD.kid]);
+
+                await job.run();
+                const current = await rotation();
+                expect(kids()).toHaveLength(2);
+                expect(current.phase).toBe("activating");
+                expect(current.keyringKids).toBeUndefined();
             });
 
             it("adds the key when the request carries no usable date, taking the key's date from the clock", async () => {

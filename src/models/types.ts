@@ -2580,6 +2580,9 @@ export interface ConfigKeyRotation {
     kid?: string;
     /** The keys it replaces. */
     previousKids: string[];
+    /** The `kid`s the keyring held before this rotation wrote its key, recorded before the write and dropped once the new key is recorded: what tells the key a
+     * copy wrote and stopped before recording from one that was already there (the dates of keys made on other machines can't). */
+    keyringKids?: string[];
     compromised: boolean;
     /** The uid of the administrator who asked for it. */
     requestedBy: string;

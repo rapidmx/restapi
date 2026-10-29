@@ -17,13 +17,16 @@
 // - Never while a takeover or restore of the same endpoint set is queued or running.
 // - Only after external-dns has observed the endpoint: until then nothing has tried to publish the record, and a registry record just written may not be
 // visible yet.
+// - A set the caller says it has already looked at and found clean (`unchanged`) is not looked up again: the look costs a dozen or more DNS queries per domain.
+// What is reported of a look (`looked`) is "conflict" only when a takeover could be planned from it, and nothing at all when a lookup could not be answered
+// (SERVFAIL, a timeout, a rate-limited upstream): a look made blind is no look, and the next scan makes it again.
 import type { DnsOperation, DnsProvider, Domain } from "../models/types.js";
 import { nameBasedUuid } from "../util/UuidUtils.js";
 import { checkDnsSetup, type DnsRecordCheck } from "../util/DnsSetupUtils.js";
 import { domainDnsRecordsV1, domainEndpointSetId, domainProvider, type DesiredDnsPublishContext, type PublishHost } from "./DnsDesiredState.js";
 import type { DnsRecordV1, EndpointSetV1 } from "./DnsDesiredStateApiV1.js";
 import { checkHostPublication, hostEndpointSets } from "./DnsHostPublication.js";
-import type { DnsResolver } from "./DnsResolver.js";
+import { isDnsNoRecordsError, type DnsMxRecord, type DnsResolver, type DnsSrvRecord } from "./DnsResolver.js";
 
 /** How many domains are looked up at once. */
 const DOMAIN_CONCURRENCY = 5;
@@ -44,6 +47,13 @@ export interface AutoTakeoverInput {
     /** Whether external-dns has observed the endpoint set `id` at its current generation, as the controller last reported it. */
     observed: (endpointSetId: string) => boolean;
     acceptLegacyApex?: boolean;
+    /** Whether the endpoint set `endpointSetId` of the provider config `providerUid` was looked at before, found with no record to take over, and is still as
+     * it was (the caller decides: the endpoint's generation, the time since). Such a set is not looked up. Unset, every set is. */
+    unchanged?: (providerUid: string, endpointSetId: string) => boolean;
+    /** Told, for each set looked up and every lookup of it answered (NXDOMAIN and NODATA are answers), whether a takeover could be planned for it now: a record in
+     * it is in conflict and not owned, and no takeover of that record was queued before. A set whose conflict was taken over already is told as clean:
+     * there is nothing the scan could do for it until the endpoint changes. */
+    looked?: (providerUid: string, endpointSetId: string, conflict: boolean) => void;
 }
 
 /** One takeover to queue. */
@@ -65,6 +75,31 @@ function recordKey(record: Pick<DnsRecordV1, "dnsName" | "recordType" | "targets
 /** The uid of the operation for these records: the same records always give the same uid. */
 function takeoverUid(providerUid: string, endpointSetId: string, records: readonly DnsRecordV1[]): string {
     return nameBasedUuid(`dns-takeover:${providerUid}:${endpointSetId}:${records.map(recordKey).sort().join("\n")}`);
+}
+
+/** A resolver that answers as `resolver` does and notes whether any lookup could not be answered (not NXDOMAIN or NODATA). */
+function trackingResolver(resolver: DnsResolver): { resolver: DnsResolver; failed: () => boolean } {
+    let failed = false;
+    const track = async <R>(lookup: () => Promise<R>): Promise<R> => {
+        try {
+            return await lookup();
+        } catch (err: unknown) {
+            if (!isDnsNoRecordsError(err)) {
+                failed = true;
+            }
+            throw err;
+        }
+    };
+    const tracking: DnsResolver = {
+        resolveTxt: (name: string): Promise<string[][]> => track(() => resolver.resolveTxt(name)),
+        resolveMx: (name: string): Promise<DnsMxRecord[]> => track(() => resolver.resolveMx(name)),
+        resolveCname: (name: string): Promise<string[]> => track(() => resolver.resolveCname(name)),
+        resolveSrv: (name: string): Promise<DnsSrvRecord[]> => track(() => resolver.resolveSrv(name)),
+    };
+    if (resolver.resolveAddresses) {
+        tracking.resolveAddresses = (name: string): Promise<string[]> => track(() => resolver.resolveAddresses!(name));
+    }
+    return { resolver: tracking, failed: () => failed };
 }
 
 /** Runs `work` for each of `items`, `DOMAIN_CONCURRENCY` at a time, and returns the results in the order of `items`. */
@@ -112,31 +147,40 @@ export async function planAutomaticTakeovers(input: AutoTakeoverInput): Promise<
     const planned: PlannedTakeover[][] = await inChunks(input.domains, async (domain): Promise<PlannedTakeover[]> => {
         const provider: DnsProvider | undefined = domainProvider(domain, candidates);
         const endpointSetId: string = domainEndpointSetId(domain.uid);
-        if (!provider || underway.has(endpointSetId) || !input.observed(endpointSetId)) {
+        if (!provider || underway.has(endpointSetId) || !input.observed(endpointSetId) || input.unchanged?.(provider.uid, endpointSetId)) {
             return [];
         }
-        const checks: DnsRecordCheck[] = await checkDnsSetup(input.resolver, domain, input.context.mxHostname, input.context.autodiscoverHostname, {
+        const lookups = trackingResolver(input.resolver);
+        const checks: DnsRecordCheck[] = await checkDnsSetup(lookups.resolver, domain, input.context.mxHostname, input.context.autodiscoverHostname, {
             acceptLegacyApex: input.acceptLegacyApex,
             publication: { provider, observed: true, ownerId: input.ownerId },
         });
         // Never the apex TXT set (SPF and what is kept next to it), and never a record whose live counterpart is of another type: nothing a takeover can write.
         const types: string[] = checks.filter((check) => check.publication === "conflict" && check.conflictReason === "not_owned" && check.type !== "spf").map((check) => check.type);
-        if (types.length === 0) {
-            return [];
+        const records: DnsRecordV1[] = types.length > 0 ? fresh(provider, endpointSetId, domainDnsRecordsV1(domain, provider, input.context, types)) : [];
+        if (!lookups.failed()) {
+            input.looked?.(provider.uid, endpointSetId, records.length > 0);
         }
-        return plan(provider, domain, endpointSetId, fresh(provider, endpointSetId, domainDnsRecordsV1(domain, provider, input.context, types)));
+        return plan(provider, domain, endpointSetId, records);
     });
 
     const candidateUids: Set<string> = new Set(candidates.map((provider) => provider.uid));
-    const sets: EndpointSetV1[] = hostEndpointSets(input).endpointSets.filter((set) => candidateUids.has(set.providerUid) && !underway.has(set.id) && input.observed(set.id));
+    const sets: EndpointSetV1[] = hostEndpointSets(input).endpointSets.filter(
+        (set) => candidateUids.has(set.providerUid) && !underway.has(set.id) && input.observed(set.id) && !input.unchanged?.(set.providerUid, set.id),
+    );
     const hostPlans: PlannedTakeover[] = [];
     if (sets.length > 0) {
-        const publications = await checkHostPublication({ ...input, onlyProviders: new Set(sets.map((set) => set.providerUid)) });
+        const lookups = trackingResolver(input.resolver);
+        const publications = await checkHostPublication({ ...input, resolver: lookups.resolver, onlyProviders: new Set(sets.map((set) => set.providerUid)) });
         for (const set of sets) {
             const provider = candidates.find((candidate) => candidate.uid === set.providerUid) as DnsProvider;
             const inConflict = publications.filter((entry) => entry.state === "conflict" && entry.conflictReason === "not_owned" && entry.providerUid === set.providerUid);
             const records: DnsRecordV1[] = set.records.filter((record) => inConflict.some((entry) => entry.recordName === record.dnsName && entry.recordKind === record.recordType));
-            hostPlans.push(...plan(provider, undefined, set.id, fresh(provider, set.id, records)));
+            const untaken: DnsRecordV1[] = fresh(provider, set.id, records);
+            if (!lookups.failed()) {
+                input.looked?.(provider.uid, set.id, untaken.length > 0);
+            }
+            hostPlans.push(...plan(provider, undefined, set.id, untaken));
         }
     }
     return [...planned.flat(), ...hostPlans];

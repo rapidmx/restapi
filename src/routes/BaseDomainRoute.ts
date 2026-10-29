@@ -613,8 +613,8 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
     }
 
     /** Marks `operation`, queued for a change that then failed, as failed with `reason`, so the controller never runs it. Logged, never thrown: the
-     * caller is already failing with the change's own error. */
-    private async cancelDnsOperation(operation: DnsOperation | undefined, reason: string): Promise<void> {
+     * caller is already failing with the change's own error (`thrown`: the caller is not failing, and so needs to know). */
+    private async cancelDnsOperation(operation: DnsOperation | undefined, reason: string, thrown: boolean = false): Promise<void> {
         if (!operation) {
             return;
         }
@@ -625,6 +625,9 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
                 { version: operation.version, ignoreACL: true },
             );
         } catch (err: any) {
+            if (thrown) {
+                throw err;
+            }
             this.logger?.error(`BaseDomainRoute: the DNS operation '${operation.uid}' could not be cancelled after ${reason}: ${err?.message}`);
         }
     }
@@ -664,9 +667,11 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
      * - **Opting in** needs the domain assigned to a provider config covering it, and the values at the apex looked up (a 503 when the lookup can't be
      * answered: opting in on an apex wrongly taken for empty would delete what is there). The SPF value published is the existing SPF record verbatim
      * when it already authorizes the MX hosts (`mx`), else `v=spf1 mx ~all`; with it, every value of `keep` (SPF refused, ownership tokens dropped). A
-     * takeover of the set is queued for the controller (the set isn't owned yet), and the opt-in is audited as `DNS_TAKEOVER` with the values that were
+     * takeover of the set is queued for the controller (the set isn't owned yet; saved first, put back when it can't be queued), and the opt-in is audited as `DNS_TAKEOVER` with the values that were
      * there. A 400 when the provider can't keep the set (`providerKeepsTxt()`), here and when editing: Azure keeps one value per name, so it takes
-     * no `keep`, and rfc2136 can't keep an SPF value at all. Opting out is never refused.
+     * no `keep`, and rfc2136 can't keep an SPF value at all.
+     * A restore of an earlier opt-out that hasn't started (queued, or waiting for the set to be removed) while every value it restores is still at the apex is
+     * cancelled by the opt-in; one whose values are gone or whose Job has started is a 409. Opting out is never refused.
      * - **Editing** `keep` while managed bumps the desired state; audited as `DOMAIN_APEX_TXT_UPDATE`.
      * - **Opting out** releases the set and queues the restore of the SPF value and the kept values as unowned records, so the domain keeps its SPF
      * record; audited as `DOMAIN_APEX_TXT_UPDATE`. The kept values stay on the row so the console can show what was restored.
@@ -737,6 +742,7 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
         }
 
         const operations: RepoUtils<DnsOperation> = this.dnsOperations();
+        const endpointSetId: string = domainEndpointSetId(domain.uid);
         const current: string[] | undefined = await this.apexTxtValues(domain.name);
         if (!current) {
             throw new ApiError(
@@ -745,16 +751,53 @@ export abstract class BaseDomainRoute<T extends Domain> extends CRUDRoute<T> {
                 "The TXT records at the domain's root could not be looked up, and owning the set would delete whatever is there. Try again in a moment.",
             );
         }
+        // The controller starts the restore of an earlier opt-out only once the set is gone and waits again whenever it is back, so a set opted in again
+        // under it would leave it waiting for good (and the domain without an automatic takeover, the provider config undeletable).
+        const [queuedRestores, runningRestores] = await Promise.all([
+            findAllRows<DnsOperation>(operations, { type: "restore", endpointSetId, state: "queued" }),
+            findAllRows<DnsOperation>(operations, { type: "restore", endpointSetId, state: "running" }),
+        ]);
+        const restores: DnsOperation[] = [...queuedRestores, ...runningRestores];
+        if (restores.length > 0) {
+            // One that has not started its Job (queued, or the controller's own "Waiting for ..." while the set is still to be removed, the provider's instance is
+            // not running, or its credentials are not written) and whose values are all still at the apex has nothing to put back: the set was never removed, so the
+            // opt-in takes its place. Any other would lose values (the set is gone and the restore is to bring them back) or race a Job already writing them.
+            const unstarted: boolean = restores.every((restore) => restore.state === "queued" || /^Waiting for /.test(restore.message ?? ""));
+            const stillThere: boolean = restores.every((restore) => (restore.records ?? []).every((record) => record.targets.every((target) => current.includes(target))));
+            if (!unstarted || !stillThere) {
+                throw new ApiError(
+                    ApiErrors.IDENTIFIER_EXISTS,
+                    409,
+                    `The restore of this domain's root TXT records after it stopped being managed hasn't finished yet (${restores.map((restore) => `${restore.state}${restore.message ? `: ${restore.message}` : ""}`).join("; ")}), and opting in now would lose the values it puts back. Try again once it has.`,
+                );
+            }
+            for (const restore of restores) {
+                await this.cancelDnsOperation(restore, "the root TXT records were opted into again before it ran", true);
+            }
+        }
         const spf: string = chooseApexSpf(current);
+        // Saved before the takeover is queued: the controller fails a takeover at once when the desired state it read lists it but the endpoint set doesn't hold
+        // its records yet, which a state read between the two (another change's announcement, a long poll timing out, another copy) would cause. A queue that
+        // then fails puts the row back, so a retry is the whole opt-in and not an edit of `keep` that never takes the set over.
         const updated: T = await this.saveApexTxt(domain, { managed: true, keep, spf }, user);
-        const operation: DnsOperation = await queueDnsOperation(operations, this.dnsOperationClass, {
-            type: "takeover",
-            providerUid: provider.uid,
-            domainUid: domain.uid,
-            endpointSetId: domainEndpointSetId(domain.uid),
-            records: [{ dnsName: domain.name, recordType: "TXT", targets: [spf, ...keep], ttl: publishTtl(provider.type, this.publishTtlSeconds) }],
-            requestedBy: user?.uid,
-        });
+        let operation: DnsOperation;
+        try {
+            operation = await queueDnsOperation(operations, this.dnsOperationClass, {
+                type: "takeover",
+                providerUid: provider.uid,
+                domainUid: domain.uid,
+                endpointSetId,
+                records: [{ dnsName: domain.name, recordType: "TXT", targets: [spf, ...keep], ttl: publishTtl(provider.type, this.publishTtlSeconds) }],
+                requestedBy: user?.uid,
+            });
+        } catch (err) {
+            try {
+                await this.saveApexTxt(updated, domain.apexTxt ?? { managed: false, keep: [] }, user);
+            } catch (undoErr: any) {
+                this.logger?.error(`BaseDomainRoute: the apex TXT opt-in of '${domain.name}' could not be undone after its takeover could not be queued: ${undoErr?.message}`);
+            }
+            throw err;
+        }
         await this.auditLogUtils!.record(
             {
                 action: AuditAction.DNS_TAKEOVER,

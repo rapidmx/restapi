@@ -312,7 +312,11 @@ async function withoutWildcard(records: DnsExistingRecord[], name: string, looku
  * the root of a domain (`checkCname: false`), where none can be.
  * - `not_owned`: a record of the type published is there (`found`) and the registry record for it doesn't name `ownerId`.
  *
- * What a wildcard record of the zone answers for the name is not at the name (`withoutWildcard()`) and is left out.
+ * What a wildcard record of the zone answers for the name is not at the name (`withoutWildcard()`) and is left out of the `type_mismatch` records. It is NOT
+ * left out of `found` for `not_owned`: a record of the name's own whose value is the wildcard's answers exactly as the wildcard alone does, so the two can't be
+ * told apart by any lookup, and taking the first for the second would hide a record that blocks external-dns for good (a hosting zone's `*` and an explicit
+ * `autodiscover` at the same address). A wildcard alone shows as `not_owned` until external-dns has created the record and its registry record, which takes
+ * one sync once the endpoint is observed (the only time a takeover is planned), and a takeover of a record that isn't there writes what would be written anyway.
  *
  * The CNAME comes first for every other type because a lookup of the record's own type follows a CNAME to its target: it would find the target's records.
  */
@@ -393,10 +397,23 @@ async function publicationOf(dnsResolver: DnsResolver, domain: Domain, desired: 
     check.publication = check.matches && current && publication.observed ? "published" : "pending";
 }
 
-/** The ownership check: its token never changes, so the exact match `findDomainVerification()` looks for is what "published" needs too. */
+/**
+ * The ownership check. `matches` is the exact token `findDomainVerification()` looks for, which is what "published" needs. `found` is any TXT value at the
+ * name, as for every other type: a token that is not the domain's (a hand-made record of an earlier token after the domain was deleted and added again, or
+ * one a rebuilt installation owned) is in the way, since external-dns does not create a record where an unowned one of its type is, and so is a conflict
+ * a takeover replaces.
+ */
 async function checkOwnership(dnsResolver: DnsResolver, domain: Domain, desired: DesiredDnsRecord, acceptLegacyApex: boolean): Promise<LiveCheck> {
     const result = await findDomainVerification(dnsResolver, domain, acceptLegacyApex);
-    const check: DnsRecordCheck = { ...base(desired), found: result.atRecord, matches: result.atRecord };
+    let found: boolean = result.atRecord;
+    if (!found) {
+        try {
+            found = (await dnsResolver.resolveTxt(desired.recordName)).length > 0;
+        } catch {
+            // NXDOMAIN, no TXT records and network errors all mean "not there".
+        }
+    }
+    const check: DnsRecordCheck = { ...base(desired), found, matches: result.atRecord };
     if (result.atLegacyApex) {
         check.legacyApex = true;
     }

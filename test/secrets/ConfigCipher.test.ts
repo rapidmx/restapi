@@ -576,6 +576,36 @@ describe("ConfigCipher reloading", () => {
         expect(logger.warn).toHaveBeenCalledTimes(2);
     });
 
+    it("encrypts nothing, and reports no key it encrypts with, until the active key has been read once: an unread state is not 'no rotation ever activated'", async () => {
+        vi.useFakeTimers();
+        const cipher: any = new ConfigCipher();
+        cipher.keyring = ringOf(OLD, NEW);
+        cipher.logger = { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() };
+        // A rotation is re-encrypting: the ring holds both keys and NEW is the active one, but this process's first read of the row fails.
+        const findOne = vi.fn().mockRejectedValueOnce(new Error("datastore unavailable")).mockResolvedValue({ activeKid: NEW.kid });
+        cipher.stateRepo = { findOne };
+        await cipher.init();
+        live.push(cipher);
+
+        expect(cipher.currentKid()).toBeUndefined();
+        expect(cipher.keyInfo().map((key: any) => key.active)).toEqual([false, false]);
+        let refused: any;
+        try {
+            cipher.encrypt("hunter2-value", CONTEXT);
+        } catch (err) {
+            refused = err;
+        }
+        expect(refused).toMatchObject({ status: 503 });
+        expect(refused.message).not.toContain("hunter2");
+        // It still reads what is already sealed.
+        expect(cipher.decryptString(await sealedBy([OLD], "kept"), CONTEXT)).toBe("kept");
+
+        // The next reload (the minute's timer) reads the row and encrypts with the key it names.
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(cipher.currentKid()).toBe(NEW.kid);
+        expect(cipher.encrypt("secret", CONTEXT).kid).toBe(NEW.kid);
+    });
+
     it("doesn't start another periodic reload while the previous one waits on the datastore", async () => {
         write(ringOf(OLD));
         vi.useFakeTimers();

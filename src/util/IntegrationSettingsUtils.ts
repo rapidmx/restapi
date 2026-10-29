@@ -316,6 +316,18 @@ export function withoutUrlCredentials(url: string): string {
     return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#]*@/i, "$1");
 }
 
+/** `url` with the user name and password of `from`, when it has any. Both are known to parse (`sameRegistryUrl()` said they are the same registry). */
+function withUrlCredentialsOf(url: string, from: string): string {
+    const credentials: URL = new URL(from.trim());
+    if (!credentials.username && !credentials.password) {
+        return url;
+    }
+    const result: URL = new URL(url.trim());
+    result.username = credentials.username;
+    result.password = credentials.password;
+    return result.href;
+}
+
 /** A URL from config as the view shows it: without credentials. */
 function configUrl(value: unknown): string | undefined {
     const text: string | undefined = configText(value);
@@ -504,7 +516,12 @@ export function buildIntegrationsConfigLayer(
         set(keys.dnsResolver[field], (settings?.dnsResolver)?.[field]);
     }
     const registry = settings?.pluginRegistry;
-    set(keys.pluginRegistry.url, registry?.url);
+    const deploymentRegistry: string = configText(deployment[keys.pluginRegistry.url]) ?? DEFAULT_PLUGIN_REGISTRY;
+    const registryUrl: string | undefined = registry?.url;
+    const sameRegistry: boolean = registryUrl !== undefined && sameRegistryUrl(registryUrl, deploymentRegistry);
+    // The administrator's URL never carries credentials, so for the deployment's own registry the deployment's go with it: they are how a
+    // deployment without a registry token authenticates (`NpmRegistryClient` sends them as basic auth).
+    set(keys.pluginRegistry.url, registryUrl !== undefined && sameRegistry ? withUrlCredentialsOf(registryUrl, deploymentRegistry) : registryUrl);
     set(keys.pluginRegistry.token, secret(registry?.token, PLUGIN_REGISTRY_TOKEN_FIELD));
     if (registry?.namespaces) {
         layer.values[keys.pluginRegistry.namespaces] = registry.namespaces.map(({ token: envelope, ...namespace }) => {
@@ -512,7 +529,7 @@ export function buildIntegrationsConfigLayer(
             return { ...namespace, ...(token !== undefined ? { token } : {}) };
         });
     }
-    if (registry?.url && !sameRegistryUrl(registry.url, configText(deployment[keys.pluginRegistry.url]) ?? DEFAULT_PLUGIN_REGISTRY)) {
+    if (registry?.url && !sameRegistry) {
         layer.values[keys.pluginRegistry.token] ??= "";
         if (!registry.namespaces) {
             const namespaces: PluginNamespace[] = normalizePluginNamespaces(deployment[keys.pluginRegistry.namespaces] ?? DEFAULT_PLUGIN_NAMESPACES);

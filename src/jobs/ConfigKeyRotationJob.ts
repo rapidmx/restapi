@@ -84,8 +84,8 @@ function advance(rotation: ConfigKeyRotation, changes: Partial<ConfigKeyRotation
  * next, so another copy can take over after a restart, and every write is version-checked, so two copies that do act at once can't both win:
  *
  * 1. **adding.** Generates the key (32 random bytes, an 8-hex `kid`), reads the keyring with its version through the `ConfigKeyringStore`, adds it and writes it
- * back with that version (`CONFIG_KEY_ROTATED`). A key already in the ring that is newer than the request is the one a copy that crashed before recording it had
- * added, and is taken up instead of a second. A refused write is shown as `lastError` and retried; a ring that can't be parsed fails the rotation.
+ * back with that version (`CONFIG_KEY_ROTATED`). The kids the ring holds are recorded first (`keyringKids`), so a key in the ring that isn't among them is the one
+ * a copy that crashed before recording it had added, and is taken up instead of a second (never told by its date, which another machine's clock may have set). A refused write is shown as `lastError` and retried; a ring that can't be parsed fails the rotation.
  * 2. **activating.** Waits until every live heartbeat (`ConfigKeyHeartbeat`) lists the new key, naming the copies that don't (`waitingFor`, a warning in the log
  * after `config_encryption:activation:warn_minutes`), and never activates on a timeout, on silence or when the heartbeats can't be read. Then sets
  * `ConfigKeyState.activeKid` (`CONFIG_KEY_ACTIVATED`). An administrator's "Activate anyway" does the same by hand (`BaseConfigKeyRoute`).
@@ -348,9 +348,15 @@ export abstract class ConfigKeyRotationJob<S extends ConfigKeyState> extends Bac
         if (!snapshot) {
             return false;
         }
+        if (!rotation.keyringKids) {
+            // The keys the ring holds now are recorded before the new one is written, so a retry can tell it from them. Their dates can't: the original key may
+            // have been made by the installer's machine, whose clock is not the cluster's.
+            state = await this.saveState(state, { rotation: { ...rotation, keyringKids: snapshot.keyring.keys.map((key) => key.kid) } });
+            rotation = state.rotation!;
+        }
         const requestedAt: number = rotationDate(rotation.requestedAt)?.getTime() ?? Date.now();
-        // A key made after the request is this rotation's own: a copy wrote it and stopped before recording it.
-        const own: ConfigKeyEntry | undefined = snapshot.keyring.keys.filter((key) => Date.parse(key.createdAt) >= requestedAt).pop();
+        // A key that was not in the ring then is this rotation's own: a copy wrote it and stopped before recording it.
+        const own: ConfigKeyEntry | undefined = snapshot.keyring.keys.filter((key) => !rotation.keyringKids!.includes(key.kid)).pop();
         let added: ConfigKeyEntry;
         if (own) {
             added = own;
@@ -361,8 +367,9 @@ export abstract class ConfigKeyRotationJob<S extends ConfigKeyState> extends Bac
                 return false;
             }
         }
+        const { keyringKids: _recorded, ...recorded } = rotation;
         await this.saveState(state, {
-            rotation: advance(rotation, {
+            rotation: advance(recorded, {
                 kid: added.kid,
                 previousKids: snapshot.keyring.keys.filter((key) => key.kid !== added.kid).map((key) => key.kid),
                 phase: "activating",

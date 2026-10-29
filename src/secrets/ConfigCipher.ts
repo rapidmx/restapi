@@ -145,6 +145,9 @@ export class ConfigCipher {
     private oldestKid?: string;
     /** `ConfigKeyState.activeKid` as last read. */
     private activeKid?: string;
+    /** Whether the row was read at least once (always so without a repository for it). Until then `activeKid` is unknown, which is not the same as none: a
+     * process that couldn't read it during a rotation would encrypt with the oldest key, which that rotation is about to retire. */
+    private activeKidKnown: boolean = true;
     /** Whether a periodic reload is still running, and which `ConfigKeyState` read started last, so an older read that finishes late is discarded. */
     private reloading: boolean = false;
     private stateReads: number = 0;
@@ -163,6 +166,7 @@ export class ConfigCipher {
             this.stateRepo = await this._objectFactory.newInstance(RepoUtils, { name: this.configKeyStateClass.name, args: [this.configKeyStateClass] });
         }
         this.loadKeys("error");
+        this.activeKidKnown = !this.stateRepo;
         await this.loadActiveKid();
         this.timer = setInterval(() => void this.reloadUnlessRunning(), CONFIG_RELOAD_INTERVAL_MS);
         this.timer.unref();
@@ -199,7 +203,7 @@ export class ConfigCipher {
         }
     }
 
-    /** The `kid` new values are encrypted with, or `undefined` when no keyring is loaded. */
+    /** The `kid` new values are encrypted with, or `undefined` when no keyring is loaded or the active key hasn't been read yet. */
     public currentKid(): string | undefined {
         return this.activeKey()?.kid;
     }
@@ -257,7 +261,13 @@ export class ConfigCipher {
         }
         const active: { kid: string; key: Buffer } | undefined = this.activeKey();
         if (!active) {
-            throw new ApiError(ApiErrors.INTERNAL_ERROR, 503, "No configuration keyring is loaded, so secrets can't be saved.");
+            throw new ApiError(
+                ApiErrors.INTERNAL_ERROR,
+                503,
+                this.keys.size > 0 && !this.activeKidKnown
+                    ? "The active configuration key could not be read yet, so secrets can't be saved. Try again in a moment."
+                    : "No configuration keyring is loaded, so secrets can't be saved.",
+            );
         }
         const iv: Buffer = crypto.randomBytes(NONCE_BYTES);
         const cipher: crypto.CipherGCM = crypto.createCipheriv(ALGORITHM, active.key, iv, { authTagLength: TAG_BYTES });
@@ -325,9 +335,13 @@ export class ConfigCipher {
     /**
      * The key that encrypts and its `kid`: `activeKid` when it is in the ring. With none set, no rotation has ever been activated, so the oldest key - the
      * original one every process has - encrypts, even while a rotation has added a newer one that some process may not have loaded yet. With one this process
-     * hasn't loaded, a key activated after its last reload, the newest it has: every process had that one when it was activated.
+     * hasn't loaded, a key activated after its last reload, the newest it has: every process had that one when it was activated. None while the row has not been
+     * read yet (`activeKidKnown`): which key is active is not known, so no key is chosen.
      */
     private activeKey(): { kid: string; key: Buffer } | undefined {
+        if (!this.activeKidKnown) {
+            return undefined;
+        }
         const kid: string | undefined = this.activeKid === undefined ? this.oldestKid : this.keys.has(this.activeKid) ? this.activeKid : this.newestKid;
         const key: Buffer | undefined = kid === undefined ? undefined : this.keys.get(kid);
         return kid !== undefined && key ? { kid, key } : undefined;
@@ -374,12 +388,15 @@ export class ConfigCipher {
                 return;
             }
             this.activeKid = state?.activeKid ?? undefined;
+            this.activeKidKnown = true;
             this.lastStateError = undefined;
             this.notifyIfChanged();
         } catch (err: any) {
             if (err.message !== this.lastStateError) {
                 this.lastStateError = err.message;
-                this.logger?.warn(`ConfigCipher: the active key can't be read (${err.message}); keeping the one already known.`);
+                this.logger?.warn(
+                    `ConfigCipher: the active key can't be read (${err.message}); ${this.activeKidKnown ? "keeping the one already known" : "encrypting nothing until it can be"}.`,
+                );
             }
         }
     }

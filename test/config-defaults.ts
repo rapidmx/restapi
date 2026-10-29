@@ -82,8 +82,8 @@ export function buildTestConfigDefaults(datastores: Record<string, any>) {
                 // controller token. A long poll answers after a second, so the suites that wait for one stay quick.
                 controller: { subject: "system:serviceaccount:mail:mail-dns-controller" },
                 desired_state: { long_poll_seconds: 1 },
-                // The automatic takeover looks at every status report in these suites, however soon after the last one.
-                takeover: { min_interval_seconds: 0 },
+                // The automatic takeover looks at every status report in these suites, however soon after the last one, and at a domain found clean again.
+                takeover: { min_interval_seconds: 0, recheck_seconds: 0 },
                 publish: {
                     hosts: [
                         { name: "mail.rapidmx-test.example.com", type: "address" },

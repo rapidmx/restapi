@@ -5,6 +5,7 @@
 // The contract with the DNS controller. `test/fixtures/dns-api/v1/*.json` are byte-identical copies of rapidmx/dns-controller's
 // `test/fixtures/api/v1/*.json`, which that repository's own contract test reads: change both repositories together, never one copy.
 import { readFileSync } from "node:fs";
+import { domainEndpointSetId, MAX_ENDPOINT_SET_ID_LENGTH } from "../../src/dns/DnsDesiredState.js";
 import {
     API_VERSION_V1,
     ApiVersionError,
@@ -109,6 +110,21 @@ describe("DNS desired-state API v1 (contract)", () => {
             for (const report of bad) {
                 expect(() => parseStatusReport(report), JSON.stringify(report)).toThrow(DnsApiPayloadError);
             }
+        });
+
+        it("accepts the endpoint set id of a domain whose name is long, up to the longest id the controller takes", () => {
+            // 98 characters without a hyphen, and one with a hyphen, whose id gets a hash after it: both are over 100 and valid.
+            const names: string[] = [`mail.${"a".repeat(40)}.${"b".repeat(40)}.example.com`, `mail-x.${"a".repeat(40)}.${"b".repeat(40)}.example.com`];
+            for (const name of names) {
+                const id: string = domainEndpointSetId(name);
+                expect(id.length).toBeGreaterThan(100);
+                const report = parseStatusReport({ ...fixture("status-report"), endpoints: [{ endpointSetId: id, generation: 1, observedGeneration: 1 }] });
+                expect(report.endpoints).toEqual([{ endpointSetId: id, generation: 1, observedGeneration: 1 }]);
+            }
+            const longest: string = "d".repeat(MAX_ENDPOINT_SET_ID_LENGTH);
+            expect(parseStatusReport({ ...fixture("status-report"), endpoints: [{ endpointSetId: longest, generation: 1 }] }).endpoints[0].endpointSetId).toBe(longest);
+            const tooLong = { ...fixture("status-report"), endpoints: [{ endpointSetId: "d".repeat(MAX_ENDPOINT_SET_ID_LENGTH + 1), generation: 1 }] };
+            expect(() => parseStatusReport(tooLong)).toThrow(DnsApiPayloadError);
         });
 
         it("keeps only the fields it knows, and shortens an over-long message", () => {
