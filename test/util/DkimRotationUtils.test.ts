@@ -15,6 +15,7 @@ import {
     resolveDkimManaged,
     rotationDate,
 } from "../../src/util/DkimRotationUtils.js";
+import type { DnsResolver } from "../../src/dns/DnsResolver.js";
 import { StaticDnsResolver } from "../testDoubles.js";
 
 const DAY = 86_400_000;
@@ -117,22 +118,29 @@ describe("DkimRotationUtils", () => {
 
         it("Is live when a TXT record at <selector>._domainkey.<domain> carries the key, its strings rejoined and spaces ignored.", async () => {
             resolver.records.set("rmx1._domainkey.example.com", [["v=DKIM1; k=rsa; ", "p=ABC", "DEF"]]);
-            expect(await isDkimKeyLive(resolver, "example.com", "rmx1", "ABCDEF")).toBe(true);
+            expect(await isDkimKeyLive(resolver, "example.com", "rmx1", "ABCDEF")).toBe("live");
             resolver.records.set("rmx1._domainkey.example.com", [["v=DKIM1; k=rsa; p=ABC DEF"]]);
-            expect(await isDkimKeyLive(resolver, "example.com", "rmx1", "ABCDEF")).toBe(true);
+            expect(await isDkimKeyLive(resolver, "example.com", "rmx1", "ABCDEF")).toBe("live");
         });
 
-        it("Is not live for another key, no record or a failed lookup.", async () => {
+        it("Is absent for another key or no record.", async () => {
             resolver.records.set("rmx1._domainkey.example.com", [["v=DKIM1; k=rsa; p=OTHER"]]);
-            expect(await isDkimKeyLive(resolver, "example.com", "rmx1", "ABCDEF")).toBe(false);
-            expect(await isDkimKeyLive(resolver, "example.com", "rmx2", "ABCDEF")).toBe(false);
+            expect(await isDkimKeyLive(resolver, "example.com", "rmx1", "ABCDEF")).toBe("absent");
+            expect(await isDkimKeyLive(resolver, "example.com", "rmx2", "ABCDEF")).toBe("absent");
+        });
+
+        it("Is unknown when the lookup could not be answered, absent when it says the name has no TXT records.", async () => {
             resolver.failing.add("rmx1._domainkey.example.com");
-            expect(await isDkimKeyLive(resolver, "example.com", "rmx1", "OTHER")).toBe(false);
+            expect(await isDkimKeyLive(resolver, "example.com", "rmx1", "OTHER")).toBe("unknown");
+            const nodata: DnsResolver = { ...resolver, resolveTxt: async () => Promise.reject(Object.assign(new Error("no data"), { code: "ENODATA" })) } as any;
+            expect(await isDkimKeyLive(nodata, "example.com", "rmx1", "OTHER")).toBe("absent");
+            const bare: DnsResolver = { ...resolver, resolveTxt: async () => Promise.reject(new Error("no code")) } as any;
+            expect(await isDkimKeyLive(bare, "example.com", "rmx1", "OTHER")).toBe("unknown");
         });
 
         it("Is never live for an empty key.", async () => {
             resolver.records.set("rmx1._domainkey.example.com", [["v=DKIM1; k=rsa; p="]]);
-            expect(await isDkimKeyLive(resolver, "example.com", "rmx1", "")).toBe(false);
+            expect(await isDkimKeyLive(resolver, "example.com", "rmx1", "")).toBe("absent");
         });
     });
 

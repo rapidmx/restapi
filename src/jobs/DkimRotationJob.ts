@@ -20,6 +20,7 @@ import {
     generateNextDkimKey,
     isConfigFlagOn,
     isDkimKeyLive,
+    type DkimKeyLiveness,
     keptDkimRotationState,
     nextScheduledDkimRotation,
     resolveDkimManaged,
@@ -35,6 +36,8 @@ const { Config, Inject, Init, Logger } = ObjectDecorators;
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
+/** How long the lookup of a pending rotation's new record may go unanswered before it counts as absent: six of the hourly runs. */
+const DKIM_UNKNOWN_LOOKUP_TOLERANCE_MS = 6 * HOUR_MS;
 /** At most this many phase changes per domain per run: a compromised key can go from "live" through the switch to retired in one run once the MTA has
  * confirmed, and nothing loops. */
 const MAX_TRANSITIONS_PER_RUN = 5;
@@ -95,6 +98,10 @@ export abstract class DkimRotationJob<D extends Domain> extends BackgroundServic
      * fall due at once (the first run after rotation arrives) spreads their new keys, and their new records, over several runs. */
     @Config("mail:dkim:rotation:max_starts_per_run", DEFAULT_DKIM_ROTATION_MAX_STARTS_PER_RUN)
     protected maxStartsPerRun: unknown = DEFAULT_DKIM_ROTATION_MAX_STARTS_PER_RUN;
+
+    /** The run since which the lookup of each pending rotation's new record has gone unanswered, by domain uid; only in this process, so a restart
+     * begins the streak again. */
+    private unknownSince: Map<string, Date> = new Map();
 
     /** What is left of `maxStartsPerRun` in the current run (no limit for an `advanceDomain()` outside one). */
     private startsLeft: number = Number.POSITIVE_INFINITY;
@@ -178,6 +185,9 @@ export abstract class DkimRotationJob<D extends Domain> extends BackgroundServic
     /** One transition of `domain`, returning the updated row when another may follow at once, or `undefined` when there is nothing more to do now. */
     private async step(domain: D, now: Date): Promise<D | undefined> {
         const state: DkimRotationState | null | undefined = domain.dkimRotation;
+        if (state?.phase !== "pending") {
+            this.unknownSince.delete(domain.uid);
+        }
         switch (state?.phase) {
             case "pending":
                 return await this.stepPending(domain, state, now);
@@ -235,7 +245,26 @@ export abstract class DkimRotationJob<D extends Domain> extends BackgroundServic
             return generated.dkimRotation?.next?.publicKey ? generated : undefined;
         }
         const liveSince: Date | undefined = rotationDate(next.liveSince);
-        if (!(await isDkimKeyLive(this.dnsResolver!, domain.name, next.selector, next.publicKey))) {
+        let liveness: DkimKeyLiveness = await isDkimKeyLive(this.dnsResolver!, domain.name, next.selector, next.publicKey);
+        if (liveness === "unknown") {
+            // A lookup that could not be answered says nothing about the record: the grace already served stands and the run waits for the next one.
+            // Not for ever, though: a resolver that reports a vanished record in a way that isn't recognised as such (no `code`) would otherwise keep the
+            // grace of a record that is long gone, so a streak of unanswered lookups as long as DKIM_UNKNOWN_LOOKUP_TOLERANCE_MS counts as absent.
+            const since: Date = this.unknownSince.get(domain.uid) ?? now;
+            if (since === now) {
+                this.unknownSince.set(domain.uid, now);
+                this.logger?.warn(
+                    `DkimRotationJob: the DNS lookup of the new DKIM record of '${domain.name}' (selector '${next.selector}') could not be answered; the rotation waits and the lookup is repeated on the next run.`,
+                );
+            }
+            if (now.getTime() - since.getTime() < DKIM_UNKNOWN_LOOKUP_TOLERANCE_MS) {
+                return undefined;
+            }
+            liveness = "absent";
+        } else {
+            this.unknownSince.delete(domain.uid);
+        }
+        if (liveness === "absent") {
             if (liveSince) {
                 // The record went away again: the grace starts over once it is back.
                 const { liveSince: _gone, ...rest } = next;

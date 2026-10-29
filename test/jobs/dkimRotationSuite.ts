@@ -325,6 +325,63 @@ export function dkimRotationSuite(ctx: DkimRotationSuiteContext): void {
             expect(after.dkimRotation!.next!.selector).toBe(pending.dkimRotation!.next!.selector);
         });
 
+        it("Keeps the wait when the lookup of the new record fails without saying it is gone.", async () => {
+            const domain: Domain = await managedDomain("timeout.example.com");
+            await job.run();
+            const pending: Domain = await ctx.findDomain(domain.uid);
+            publishNext(pending);
+            await job.run();
+            const live: Domain = await ctx.findDomain(domain.uid);
+            const liveSince: number = date(live.dkimRotation!.next!.liveSince);
+
+            // A timeout or SERVFAIL says nothing about the record, so the grace already served stands and the row is not written.
+            ctx.dnsResolver().failing.add(`${pending.dkimRotation!.next!.selector}._domainkey.${domain.name}`);
+            await job.run();
+
+            const after: Domain = await ctx.findDomain(domain.uid);
+            expect(after.dkimRotation!.phase).toBe("pending");
+            expect(date(after.dkimRotation!.next!.liveSince)).toBe(liveSince);
+            expect(after.version).toBe(live.version);
+        });
+
+        it("Says once that the lookup of the new record went unanswered, and counts a streak of six hours of that as the record being gone.", async () => {
+            vi.useFakeTimers({ toFake: ["Date"] });
+            try {
+                const warn = vi.spyOn(job.logger, "warn");
+                const domain: Domain = await managedDomain("streak.example.com");
+                await job.run();
+                const pending: Domain = await ctx.findDomain(domain.uid);
+                publishNext(pending);
+                await job.run();
+                const name: string = `${pending.dkimRotation!.next!.selector}._domainkey.${domain.name}`;
+                expect(date((await ctx.findDomain(domain.uid)).dkimRotation!.next!.liveSince)).toBeGreaterThan(0);
+
+                // The lookups fail from here on: the first says so, the following ones within the six hours stay quiet and keep the grace served.
+                ctx.dnsResolver().failing.add(name);
+                await job.run();
+                vi.setSystemTime(Date.now() + 5 * HOUR);
+                await job.run();
+                expect(warn.mock.calls.filter((call) => String(call[0]).includes("could not be answered"))).toHaveLength(1);
+                expect(warn.mock.calls.filter((call) => String(call[0]).includes(name.split(".")[0]))).toHaveLength(1);
+                expect((await ctx.findDomain(domain.uid)).dkimRotation!.next!.liveSince).toBeDefined();
+
+                // An answer ends the streak: a failure after it starts a new one, so the grace is still kept six hours on.
+                ctx.dnsResolver().failing.delete(name);
+                await job.run();
+                ctx.dnsResolver().failing.add(name);
+                vi.setSystemTime(Date.now() + 5 * HOUR);
+                await job.run();
+                expect((await ctx.findDomain(domain.uid)).dkimRotation!.next!.liveSince).toBeDefined();
+
+                // Six hours without an answer: the record counts as gone, so the grace starts over once it is back.
+                vi.setSystemTime(Date.now() + 6 * HOUR);
+                await job.run();
+                expect((await ctx.findDomain(domain.uid)).dkimRotation!.next!.liveSince).toBeUndefined();
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
         it("Moves to the overlap once the MTA acknowledges the new selector, keeping the old record until retireAt.", async () => {
             job.publishGraceHours = 0;
             const domain: Domain = await managedDomain("ack.example.com");

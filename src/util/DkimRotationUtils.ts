@@ -6,7 +6,7 @@ import type { JWTUser } from "@rapidrest/core";
 import type { HttpRequest, RepoUtils } from "@rapidrest/service-core";
 import type { DkimKeyProvider } from "../dkim/DkimKeyProvider.js";
 import { notifyDnsPublisher, type DnsPublisher } from "../dns/DnsPublisher.js";
-import type { DnsResolver } from "../dns/DnsResolver.js";
+import { isDnsNoRecordsError, type DnsResolver } from "../dns/DnsResolver.js";
 import { AuditAction, type DkimRotationReason, type DkimRotationState, type Domain } from "../models/types.js";
 import type { AuditLogUtils } from "./AuditLogUtils.js";
 import { asEntity } from "./EntityUtils.js";
@@ -88,17 +88,21 @@ export function nextScheduledDkimRotation(domain: { dateCreated?: Date; dkimRota
     return anchor === undefined ? undefined : new Date(anchor + intervalDays * DAY_MS);
 }
 
+/** What a lookup of a DKIM record found: `live` (the record carries the key), `absent` (no such record, or one carrying another key) or `unknown` (the
+ * lookup could not be answered - a timeout, SERVFAIL, a refused answer - so nothing is known about the record). */
+export type DkimKeyLiveness = "live" | "absent" | "unknown";
+
 /** Whether `<selector>._domainkey.<domainName>` carries `publicKey` live: a TXT record there whose strings, rejoined and without spaces, hold
- * `p=<publicKey>`. A failed lookup is not live. */
-export async function isDkimKeyLive(dnsResolver: DnsResolver, domainName: string, selector: string, publicKey: string): Promise<boolean> {
+ * `p=<publicKey>`. A lookup that fails without saying the name has no TXT records (`isDnsNoRecordsError()`) is `unknown`, not `absent`. */
+export async function isDkimKeyLive(dnsResolver: DnsResolver, domainName: string, selector: string, publicKey: string): Promise<DkimKeyLiveness> {
     if (!publicKey) {
-        return false;
+        return "absent";
     }
     try {
         const values: string[] = (await dnsResolver.resolveTxt(`${selector}._domainkey.${domainName}`)).map((chunks) => chunks.join("").replace(/\s+/g, ""));
-        return values.some((value) => value.includes(`p=${publicKey}`));
-    } catch {
-        return false;
+        return values.some((value) => value.includes(`p=${publicKey}`)) ? "live" : "absent";
+    } catch (err) {
+        return isDnsNoRecordsError(err) ? "absent" : "unknown";
     }
 }
 
