@@ -7,6 +7,240 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-10-29
+
+### Added
+- Added the design spec for DNS publishing through external-dns, admin-console Integrations and seeding the install's domains
+- Added scheduled and on-demand DKIM rotation across restapi, the server's key provider and postfix-bridge's OpenDKIM sync
+- Added the SecretStore interface (DI token "SecretStore") for credentials kept outside the database, with SecretRef and SecretBackend in models/types.ts
+- Added NullSecretStore, the default store, which refuses to save credentials with a 400, reports reads as unavailable with a 503 and lets deletes succeed so a row holding a reference can still be removed
+- Added secretMask(), isSecretMask() and maskSecretRef(), the one write-only mask shared by plugin secret settings and the secret store
+- Added toSecretPatch(), which turns a write-only form's credentials into a store patch, trimming pasted whitespace, refusing empty values and control characters, and never repeating a sent key or value in its errors
+- Added HostConfig, a read-only accessor for the host server's live configuration that is installed once, uninstalled only through the handle install() returns, and returns objects as copies
+- Added the DnsProvider model (Mongo and SQL, deny-all ACL) with its types, a lowercased nameKey under a unique index so two racing writes can't save the same name, and DnsProviderStatus
+- Added the DNS provider types registry for cloudflare, route53, rfc2136, google and azure: options with defaults, credential fields checked for shape without repeating values, record kinds a type can't manage, zone normalization, isNameInZones and newDnsProviderUid
+- Added BaseDnsProviderRoute (system/dns-providers): types, list and get for a trusted role with credentials only as masks plus domainCount; create, update and delete for a trusted role with elevation, audited without values
+- Added Domain.dnsProviderUid and Domain.dnsPublication as server-managed fields, dropped by a plain PUT, refused by PUT /:id/:property and stripped on create
+- Added PUT mail/domains/:id/dns-provider for a trusted role with elevation, checking the provider exists and covers the domain, audited with from and to, answering 503 when the server hasn't registered the DnsProvider model instead of failing to boot
+- Added the DeploymentIdentity model and findOrCreateDeploymentIdentity(), a race-safe singleton with a random installation id that refuses a malformed one
+- Added the DNS provider, domain assignment, takeover, DKIM rotation, integration and plugin secret migration audit actions
+- Added buildDesiredDnsRecords(), the one source of the DNS checklist and the records the DNS controller publishes, and rebuild checkDnsSetup() on it with dkim_next/dkim_previous during a rotation, dnsManualReason() and publication states (published only once the live values are exactly the desired ones and external-dns observed the endpoint, pending, conflict by the rmx-<kind>.<name> owner record, manual with its reason)
+- Added DnsPublisher with NullDnsPublisher as the fallback, and announce every domain, provider and operation change that moves the desired state
+- Added the DnsControllerTokenVerifier interface and BaseDnsDesiredStateRoute (/internal/dns): the handshake, the /v1/desired-state long poll that answers at once when the server's version is behind since, and /v1/status, where only the Lease holder's report changes rows and another pod's is kept as lastStandbyReport; only the configured controller subject is accepted
+- Added the v1 DNS API types mirroring dns-controller's, with the contract fixtures byte-identical to the controller's, now with zoneIds as a list
+- Added the DnsOperation and DnsControllerState models (Mongo and SQL, deny-all ACL)
+- Added POST system/dns-providers/:id/test, POST /:id/takeover (refusing, by name, a record type the config doesn't publish), GET /:id/operations and GET /controller
+- Added Domain.apexTxt and GET/PUT mail/domains/:id/apex-txt: the opt-in owns the apex TXT set with the chosen SPF and the values to keep, refuses with 503 when the apex lookup can't be answered, keeps an existing SPF only when it authorizes the domain's own MX hosts, and queues a takeover audited with the old values
+- Added Domain.dkimRotation's type and column for the next and previous DKIM records
+- Added isDnsNoRecordsError() to tell NXDOMAIN and NODATA from a failed lookup, shared with federation policy lookups
+- Added the optional DkimKeyProvider rotation members supportsRotation, generateKeyPair(), findKeyPair(), activate(), signingSelector() and deleteKeyPair(), counting a provider as rotating only with all of supportsRotation, generateKeyPair(), activate() and signingSelector(), and set supportsRotation false on NullDkimKeyProvider
+- Added Domain.dkimManaged (Mongo and SQL), true for a key the provider made and false for one imported by hand, server-managed, classifying rows from before it once through findKeyPair(), and refuse a PUT changing the DKIM key during a rotation
+- Added DkimRotationJob (Mongo and SQL) driving each domain from idle through pending, switching and overlap back to idle with one versioned row update per step, never rotating imported keys, a provider that doesn't rotate or SES
+- Added GET /:id/dkim/rotation, POST /:id/dkim/rotate with compromised, POST /:id/dkim/rotation/cancel and PUT /:id/dkim/rotation with paused on mail/domains, for a trusted role with the writes elevated and audited, adding DKIM_ROTATION_PAUSED
+- Added the IntegrationSettings model (Mongo and SQL, one JSON column per section on SQL, deny-all ACL) as a singleton created empty by the first change, never seeded from config, with the plugin namespaces stored without their tokens
+- Added BaseIntegrationsRoute (system/integrations): GET for a trusted role with each section's values, the deployment's defaults and the source of each field, secrets only as masks; PUT /:section and POST /:section/reset for a trusted role with elevation, an optional version refused with INVALID_OBJECT_VERSION when stale, audited as INTEGRATION_UPDATE and INTEGRATION_RESET with field names only
+- Added IntegrationSettingsUtils: the one table of the config keys each field overrides, the STUN, https URL, contact and namespace validators, the deployment defaults without URL credentials, the view and buildIntegrationsConfigLayer() for the server's integrations layer
+- Added the giphy:enabled config key, emptying giphy:api_key in the layer when Giphy is off
+- Added integrations to CORE_CONFIG_NAMESPACES
+- Added DomainSeeder (Mongo and SQL) creating the domains listed in mail:domains at startup through the console's own create path, with origin "seed", audited as DOMAIN_CREATE without a user and announced to the DnsPublisher, never creating a name recorded in SetupState.seededDomains again and never changing or deleting an existing domain
+- Added parseSeedDomainEntries() reading mail:domains as a list, JSON text, one object or a comma-separated string of names, skipping a malformed, repeated or misspelled entry with a warning so a corrected entry seeds on a later start
+- Added SetupState.seededDomains and Domain.origin ("seed" or "console", server-managed, set by create and refused from clients) on both backends
+- Added updateSetupState(), retrying a setup row save that lost an optimistic-lock race on the re-read row, used by the seeder and by the setup route's step save, complete and reopen
+- Added PluginSecretUtils: pluginSecretPath() giving plugins/<package>/<key>-<16 hex>, a new path per write capped at 253 characters with a hashed cut for long names, writePluginSecretSetting(), storePluginSecretSettings() for every save path and the server's seeding, resolvePluginSecretSettings() for the plugin host, plaintextSecretKeys()/plaintextPluginSecrets(), releasedPluginSecretRefs() and withoutSecretSettings()
+- Added PluginSecretMigrator (Mongo and SQL) moving plaintext secret settings into the store at startup page by page with one versioned update per row, retrying a lost race on the re-read row, dropping an uninstalled plugin's plaintext secrets, auditing PLUGIN_SECRET_MIGRATED per key without values, and reporting what remains in plaintext without a store
+- Added the open questions the approved plan leaves for JP: keyring reload, activation delay, the keyring Secret and lookup, the rotator's image, key removal timing, the rotator's API, console run-now, the plugin-state hash, rolling upgrades, v1 in place, the controller's internal API, installer bootstrap credentials, credentials over in-cluster HTTP, IntegrationSettings field names and the server step 2 trim
+- Added ConfigCipher, encrypting configuration secrets as AES-256-GCM envelopes bound to their record, row and field by length-prefixed associated data, with the active key taken from ConfigKeyState.activeKid when it is in the ring and otherwise the oldest key, so a key a first rotation adds never encrypts before it is activated
+- Added the keyring loading from config_encryption:keyring_file or config_encryption:keyring, re-read every minute, on the rotation notice and on an unknown kid at most once a minute, keeping the loaded keyring and logging once when a reload fails, with the production guard and the development keyring helper
+- Added ConfigSecretUnavailableError naming the record and field and never a value, and decryptString() refusing a stored number or flag
+- Added the ConfigKeyState model for Mongo and SQL, ConfigCipherMongo and ConfigCipherSQL, and config_encryption among the core configuration namespaces
+- Added the rule that the more specific agent model assignment wins where categories overlap
+- Added the ConfigKeyringStore interface with FileConfigKeyringStore, whose write replaces the keyring only when its version is still the stored one, and resolveConfigKeyringStore() choosing the store by config_encryption:keyring_store:backend Add ConfigKeyChannel with RedisConfigKeyChannel for the server to register and the in-process LocalConfigKeyChannel only outside production, so production without a registered channel has no rotation rather than copies coordinating alone Add ConfigKeyHeartbeat reporting the loaded keys and the encrypting key every 30 seconds with a 90 second TTL, after each keyring reload and on rapidmx:config-keys:changed Add the ConfigEnvelopeSource registry through which the rotation re-encrypts each record type's envelopes Add ConfigKeyRotationJob for Mongo and SQL, adding, activating, re-encrypting and retiring keys under a Redis lock every 30 seconds and on rapidmx:config-keys:changed, with every write version-checked, paging each pass by uid after the last row so a row deleted or added meanwhile is never skipped, and naming the rows it can't save or the error that stopped a pass in the rotation's lastError Add BaseConfigKeyRoute with GET /, POST /rotate and POST /activate for Activate anyway, one rotation at a time (409, a compromised request upgrading a running normal one), and 503 when the keyring store is none, can't be read or has no Redis channel in production Add the CONFIG_KEY_ROTATION_REQUESTED, CONFIG_KEY_ROTATED, CONFIG_KEY_ACTIVATED, CONFIG_KEY_ACTIVATION_FORCED, CONFIG_KEY_RETIRED and CONFIG_REENCRYPTED audit actions and the unreadable and complete fields of ConfigKeyState.reencryption Add ConfigCipher.loadedKids(), keyInfo() and onChange()
+- Added GET /internal/dns/v1/providers/:uid/credentials for the DNS controller's token, answering with decrypted values and naming unreadable fields, uncached and never logging a value
+- Added DnsProviderEnvelopeSource so key rotation re-encrypts DnsProvider credentials without bumping credentialsGeneration
+- Added integrationSettingsEnvelopeSource() so key rotation re-encrypts the Integrations secrets, registered in ConfigKeyRotationJobMongo and ConfigKeyRotationJobSQL
+- Added pluginEnvelopeSource() so key rotation re-encrypts plugin secret settings, registered in ConfigKeyRotationJobMongo and ConfigKeyRotationJobSQL
+- Added the DNS API contract fixtures to .gitattributes as LF text so their bytes match dns-controller's whatever core.autocrlf says
+- Added SetupState.bootstrapDnsProviderUid, the uid of the DNS provider config the server created for the installer, set once so that deleting that config in the console is final
+- Added automatic takeover of the records in conflict for a provider config with allowTakeover, planned by planAutomaticTakeovers() when the Lease holder's status report is applied, for domains and the deployment's hosts, once per name, type and values, audited as the system
+- Added the takeover of the deployment's hosts with POST system/dns-providers/:id/takeover {hosts: true} on the hosts-<uid> endpoint set, and GET system/dns-providers/hosts with each host's publication
+- Added the type_mismatch conflict reason with the existing records to delete, for a CNAME wanted next to other records or the reverse, for domains and hosts, never deleted and never taken over by the server or by a manual takeover, ignoring what a wildcard record of the zone answers
+- Added DnsResolver.resolveAddresses() as an optional lookup, implemented in NodeDnsResolver
+- Added the server's As implemented note for web-client W6 to the DNS publishing spec
+
+### Changed
+- Publish only from a release tag's own Build, and only once every Build of that commit has finished green
+- Move all Kubernetes writes in the DNS publishing spec to a separate single-replica DNS controller that reads desired state from the server's internal API, leaving the server read-only
+- Specify OpenBao Kubernetes auth with per-consumer scoped policies and TLS on the in-cluster listener, migrating the existing periodic tokens
+- Seed the install's domains through mail:domains and read STUN servers in the meet plugin through a new HostConfig accessor
+- Settle the remaining open questions with JP's defaults and update the phased plan
+- Make the DNS controller a dedicated project, rapidmx/dns-controller, with its own minimal distroless image that the server chart templates and pins in lock-step, instead of the server image with another command
+- Version the controller's internal API under /internal/dns/v1 with an apiVersion in every payload and an unversioned startup handshake after which a mismatched controller refuses to act and the server records the mismatch for the console
+- Fetch the service-account JWKS in-cluster from kubernetes.default.svc, confirmed readable through the issuer-discovery binding on k3s v1.36.4
+- Reload the OpenBao listener certificate with a SIGHUP sidecar on certificate change instead of restarting
+- Record the takeover spike results: noop-registry takeover proven on Cloudflare, the exact ownership TXT name and value, no TTL on ownership records, quoted TXT targets, and whole-set ownership after a takeover
+- Move ownership verification to _rapidmx-verify.<domain>, accepting the legacy apex token during a transition while recommending and publishing only the new name
+- Propose apex SPF management only on a per-domain opt-in with an editable list of values to keep, restored on opt-out, domain deletion and uninstall
+- Use the shared secret mask helpers in BasePluginRoute in place of its private copy
+- Update the DNS publishing spec for the "none" backend, NullSecretStore's per-operation failures, the mask helpers and HostConfig's one-time installation
+- Write DNS provider credentials to the SecretStore at dns/<uid> before the row, removing them again when the row can't be saved, and remove them after the row on delete, auditing secretLeftBehind when they stay
+- Refuse a stale version on PUT /:id with INVALID_OBJECT_VERSION, check it again right before the store write, and when the row write still fails after the store changed point the current row at the new secretRef and audit rowWriteFailed
+- Never send a secretRef from another backend to the current store: clearing every credential leaves it there, replacing every credential writes a new secret, keeping some is a 409
+- Count a provider's assigned domains with count() and check zone narrowing against every page of them
+- Move DnsRecordType to models/types.ts, still exported from DnsSetupUtils
+- Register an InMemorySecretStore as SecretStore for every test server, with a hook that stages a write racing a store call
+- Update the DNS publishing spec for list-valued options, nullable secretRef and status, nameKey, per-type validation, the response shape, the PUT race and foreign-backend handling, the audit details, the test and takeover routes moving to step 3, and the server prerequisites of this release
+- Verify domain ownership at _rapidmx-verify.<domain> with findDomainVerification(), still accepting the token at the apex while mail:domain_verification:accept_legacy_apex is on (the text "false" turns it off), and audit where it was found
+- Build the desired state from every provider config, each domain published through a config covering it, the deployment's hosts without the records a domain's endpoint set already publishes, and the queued or running operations, never a credential
+- Refuse to delete a DNS provider config while a restore of it is queued or running, and cancel its other pending operations when it is deleted
+- Restore the SPF value and the kept values on an opt-out or the deletion of a managed domain, queuing the restore before the write and cancelling it if the write fails, and refuse reassigning a managed domain
+- Require an elevated token to delete a domain published through a provider config
+- Make the test StaticDnsResolver answer with ENOTFOUND codes and fail lookups for the names in failing
+- Update the DNS publishing spec: 9.4 decided, the legacy apex key, apexTxt.spf, the operations and controller state models, restoring SPF with the kept values, the lookup-failure refusal, exact publication, host deduplication, the long poll on a reset counter, standby reports and provider deletion with a pending restore
+- Give FsDkimKeyProvider one key file per selector, <domain>.selector written atomically by activate() (refusing a selector without a key), <domain>.signing read as the MTA's acknowledgement, and deleteKeyPair() refusing the selector signing uses
+- Generate DKIM keys asynchronously off the event loop, with mail:dkim:rotation:key_bits accepted only as a whole number from 2048 to 4096 (or its text) and 2048 with a warning otherwise
+- Start scheduled rotations only for enabled and verified domains with a key, at most mail:dkim:rotation:max_starts_per_run per run, never minting again a selector used earlier the same UTC day
+- Delete a newly generated DKIM key whose recording lost a race unless the winning row names its selector, and point the provider back at the row's selector when a cancel reverted a switch the job was activating
+- Treat "Key compromised" during a rotation as the replaced key's: a pending rotation skips the grace, a switching one gets no overlap and an overlap is retired at once
+- Revert a switch the MTA hasn't confirmed on cancel, signing with the old key again before and after the versioned write and refusing when the old key is gone or can't be activated
+- Update the DNS publishing spec for the rotation as built: FsDkimKeyProvider's methods in restapi, findKeyPair(), the extra state fields, the start limit, reverting cancel, compromise during a rotation, key size checks and the server's remaining step
+- Protect the DKIM rotation job's mail:jobs:dkim_rotation namespace from plugin settings like every other core job
+- Clear the domains the SQL DKIM rotation and domain verification suites leave in the shared test database, which made later SQL suites find verified domains
+- Write the Giphy key, the registry token and the plugin namespaces' tokens to the SecretStore before the row, each write at a path of its own under server/, removing the secret it replaced after the row is saved and the new one when the row can't be saved, so a failed save never changes the secret in use
+- Merge a write that lost a race field by field on the newer row, the last saved secret winning, and refuse with 409 a namespaces change whose tokens another write changed meanwhile
+- Keep the deployment's registry token and its default-registry namespace tokens away from a registry URL the administrator points elsewhere, in the layer and in the view
+- Refuse an empty STUN server list, which the meet plugin would take as its built-in list
+- Tie the RFC 8823 ACME account to the CA it was registered with, registering the same key again when the directory changes, sending a changed contact email to the account and driving each enrollment at the CA and account it was started with
+- Export DEFAULT_RFC8823_DIRECTORY_URL
+- Update the DNS publishing spec for Integrations as built: no seeding from config, namespace tokens in their own secret, a secret path per write, the registry credential rule, the STUN list of 1 to 10, the ACME account per CA and the server's prerequisites
+- Assign a seeded domain the DNS provider its entry names, "bootstrap" meaning the one installer provider, only when that provider's zones cover it, and create it manual with a warning otherwise
+- Adopt mail:domains on a deployment that predates seeding, recording every listed name as seeded without creating any, so an upgrade never brings back a domain deleted before it or creates one never added
+- Read SetupState.seededDomains again right before each seeded create, so a domain another replica seeded and the admin deleted meanwhile isn't created again
+- Move the domain create path into prepareNewDomain() in DomainUtils, shared by BaseDomainRoute.create() and DomainSeeder, creating a domain without a DKIM key when no DkimKeyProvider is registered
+- Keep setup required on a deployment whose only domains were seeded, a domain seeded between the two counts included
+- Correct the stale mail:domains comments of the transport rules
+- Update the DNS publishing spec for domain seeding as built: the shared create path, the accepted formats, adoption on upgrade, the re-read before each create and what server step 7 must do
+- Keep a plugin's secret settings in the SecretStore while the deployment has one, the row holding only { "$secretRef": SecretRef } (PluginSettingValue, isPluginSecretRef()) with the value stored as text under value and its type for a number or a flag
+- Write a secret setting's plaintext to the store before the row on every save path (PUT, a value an older row still holds, settings carried to a new version, defaults on add and revival, an uploaded pack's replacement), removing what was written when the change fails and deleting replaced, cleared, undeclared and uninstalled secrets after the row is saved
+- Skip, when undoing a failed change, any secret the re-read row still names, so a row another change saved meanwhile never names a removed secret
+- Check a secret reference kept across a version change against the new version's setting when its type, bounds or options changed, refusing a value it no longer takes with 400 and one that can't be read back with 503
+- Keep the row's reference when the mask is sent back, refuse a reference sent as a value, and mask every reference in responses whatever the setting is called
+- Keep secret settings on the row as before on a server without a secret store
+- Count a reference in computePluginStateHash() by backend, path and generation, never the value, leaving plain values' hash unchanged
+- Strip every secret setting from an uninstalled plugin's row
+- Move isSecretSetting() to PluginUtils, still exported from BasePluginRoute
+- Note the plugin-settings exception and the per-write paths in the SecretStore doc
+- Update the DNS publishing spec for step 7 as built: the row's form, the path per write and its length cap, no refusal without a store, kept references checked on a version change, the rollback re-read, the migration, and what the server must do and in which release order before registering a real store, including seeding default plugins through storePluginSecretSettings()
+- Record in the spec that the meet plugin reads integrations:stun:urls as integrationDefaults() reads a deployment's value and keeps only the entries normalizeStunUrls() accepts, falling back to its built-in list when none is left
+- Record in the spec that the meet plugin logs ignored STUN entries once per value with counts only, and reads HostConfig and normalizeStunUrls through the module namespace so an older server falls back instead of failing the plugin's load
+- Update the DNS publishing spec for dns-controller C2 as built (the C2 edits first went out in c8da9da): date C2 2026-10-27, and record that a failure applying a new desired state is logged and the poll goes on, and that the controller's ports listen on IPv6 as well as IPv4
+- Correct the DnsDesiredStateApiV1 header comment: the controller's copy has StatusReportResult since its phase C2, not C3
+- Update the DNS publishing spec's postfix-bridge section as built after review: the key a domain moves off stays until the server deletes it, <domain>/selector records the one in use, the acknowledgement follows one pass after the reload with its limits, and only plain files are read from the shared volume with <domain>.signing written by exclusive create and rename
+- Update the DNS publishing spec for server step 2 as built: the server role's patch on the data paths and delete on the metadata paths, the roles' bindings and token lifetimes, OpenBaoClientPkiCertificateAuthority replacing restapi's fetch with a CA-verifying client, a re-login only on a 403 to a token older than a minute, the chart's removed PKI token and its openbao.auth with a Secret for a static token, the logins checked before the old tokens are revoked, the reload sidecar matching bao server by its arguments and never itself, the OpenBao CA mount arriving in step 2, and the auth-server chart's caProvider needed before the release
+- Update the DNS publishing spec for dns-controller C3's first part as built: the arguments, the credentials Secret and its env and files, Azure's azure.json built by the ExternalSecret template, replicas 0 without a required credential, the ExternalSecret, rolling on the generation the Secret holds, the image pin accepting the pin's tag, applying, pruning and when it reconciles, the chart's new settings, and the Role's get on Secrets
+- Record that a TXT value over 255 bytes is written as several quoted strings, and that the quoted form is for Cloudflare, Route 53 and Google only: Azure takes its one value verbatim and rfc2136 plain values unquoted
+- Record that a TXT record a provider can't keep is left out and must show as manual: an Azure name with several values, and an rfc2136 value with a space, a semicolon or a quote, which external-dns v0.23.0 can never update or delete there
+- Record that an instance is kept out of zones other configs nest under its own with --exclude-domains, and that a state with a provider without zones, a zone in two configs or a credentials path outside dns/ is refused whole, asking restapi to refuse a zone in two configs and to assign a domain to the most specific config
+- Record that a deleted provider's Deployment is removed after its ExternalSecret and Secret, and that the Lease is released only after the request under way was answered
+- Rewrite the DNS publishing spec's secrets design to JP's approved plan of 2026-10-28: the database as the single source of truth for all configuration, credentials, API keys and tokens stored as AES-256-GCM envelopes in their own fields bound to record type, uid and field, one configuration keyring delivered by External Secrets from OpenBao or from a chart-generated Secret, and production refusing to start without a key
+- Specify the in-memory cache of decrypted secrets for the life of the process, dropped on the existing change notices, with no per-request database read or decryption
+- Specify key rotation: the newest active key encrypts and any decrypts, a key-rotator CronJob with its own ServiceAccount limited to the keyring Secret or its OpenBao KV path, manual and compromised rotation from the console, version-checked re-encryption with usage counts, old keys removed only once unused, and keyring backups
+- Specify DNS provider credentials encrypted on the DnsProvider row with credentialsGeneration, fetched by the controller from GET /internal/dns/v1/providers/:uid/credentials to write the one Secret external-dns reads, with no ExternalSecret path
+- Specify plugin secret settings encrypted in the Plugin row by an idempotent startup migration replacing PluginSecretMigrator, with plugins still receiving plaintext
+- List the rework of restapi ade9731, befb6b5, 9013465 and cbfe83b, the ExternalSecret parts of dns-controller 4bde52b and the trim of server 467f5f9, and what is unaffected
+- Move the auth-server caProvider prerequisite from the open questions to the implementation plan
+- Make the key-rotator the dedicated rapidmx/config-key-rotator project and image, minimal like dns-controller, with its own releases pinned by the server chart in lock-step, its API, rights, CronJob and contract fixtures described in 5.5
+- Decide that DNS credentials travel over plain HTTP inside the cluster with no TLS on the internal API, recording JP's reasoning that observing pod-to-pod traffic already needs node-level access and with it the keyring and the database
+- Decide the trim of server 467f5f9 (mail:secrets:openbao:* settings, mail:secrets in the protected keys, the integrations/* KV paths and policies, the ESO read on integrations/dns/*, the dns-controller OpenBao role) and list every removal with its repository in 18.1
+- Record the three decisions of 2026-10-28 in Resolved Decisions, remove their open questions and renumber the rest with their references
+- Make configuration-key rotation manual only and performed inside the server, removing the automatic schedule (rotation_days), the key-rotator CronJob, the rapidmx/config-key-rotator project and image, its Role and OpenBao policy, its /internal/config-keys/v1 API and contract fixtures, its chart values, tests and release-list entries, and the console "run now"
+- Give the server get/update on exactly the keyring Secret by resourceNames without OpenBao, and read/write on only the keyring KV path with OpenBao with External Secrets syncing it every minute, keeping the server read-only on every other Kubernetes resource in 7.6 and 15
+- Describe the rotation steps of ConfigKeyRotationJob (adding, activating, re-encrypting, retiring) with the old key removed as soon as no envelope uses it, for a compromised rotation immediately after re-encryption, and ConfigKeyState recording the progress for the console
+- Propose activating a new key only once every running server copy reports loading it through a Redis heartbeat, with a "waiting for N copies" status and a timeout warning, replacing the fixed 10-minute activation delay
+- Record the manual-rotation decision of 2026-10-28 in Resolved Decisions, remove the open questions on when an old key goes, how the rotator learns usage and the console "run now", and renumber the rest with their references
+- Record the standing agent model assignments in the project notes
+- Move the agent model assignments to the top of the project notes, keeping session history at the bottom
+- Mark the DNS publishing spec APPROVED by JP on 2026-10-28, with implementation proceeding
+- Record JP's approval of re-reading the keyring every minute, on the rotation notice and on an unknown kid, rendering the keyring Secret only when absent and keeping it, the plugin-state hash by decrypted value, v1 changed in place, installer bootstrap credentials through a server-only temporary Secret and the IntegrationSettings field renames
+- Decide activation once every live server copy reports the new key through its Redis heartbeat, never on a timeout, and add the elevated, audited "Activate anyway" (POST system/config-keys/activate, CONFIG_KEY_ACTIVATION_FORCED), which leaves re-encryption waiting for the stale copies
+- Replace the release-note requirement for encrypted plugin settings with an encryption run that waits until no server pod of an older ReplicaSet is left, checked through the existing read-only pods access, saving secret settings in plaintext until its first completed run (ConfigKeyState.pluginSecrets)
+- Record the approved keyring_store settings, heartbeat and warning times, rotation job cadence, chart values and one rotation at a time
+- Settle Route 53 TXT quoting from external-dns v0.23.0's source and record that values over 255 bytes must be pre-split, as confirmed live on Cloudflare
+- Settle that an unowned record at a name blocks only creation there, so the one-shot Job is needed only for an MX's first creation at an unmanaged apex
+- Make 18.2 the definitive ordered implementation plan: restapi R1a to R4, dns-controller D1 to D5, auth-server, server S1 to S11 and web-client W1 to W6
+- Move the answered questions to Resolved Decisions and list the three new ones raised while finalizing
+- Record JP's approval of the three questions raised while finalizing the DNS publishing spec
+- Skip a periodic keyring reload while the previous one is running and discard a ConfigKeyState read that finishes after a later one started
+- Replace maskSecretRef() with maskCredentials()
+- Record in the DNS publishing spec that the oldest key encrypts until a key has been activated, the ConfigCipher classes and API as implemented in R1a, and the reload rules
+- Update the agent model assignments to JP's revised criteria: Sonnet for general code and review, Opus for architecture, planning, investigation, security and performance, Haiku for simple operations
+- Record in the DNS publishing spec the rotation as implemented in R1b, with no in-process channel in production, uid-ordered re-encryption pages, failed rows and pass errors in lastError and the keyring read that POST /rotate makes first
+- Record in the DNS publishing spec R2's credentials on the row, the credentials route, the zone and most specific config rules, the TXT values a provider can't keep and the apex opt-in refusals for Azure and rfc2136
+- Store DnsProvider credentials as ConfigCipher envelopes with credentialsGeneration in the row's own versioned write, replacing secretRef and the two-store race handling, and answer 503 when a credential is saved without a keyring
+- Change DnsProviderV1.secretRef to credentials with keys and generation in place in the v1 types and the shared fixtures, and add the provider-credentials fixtures
+- Refuse with 409 a zone another DNS provider config already has, and a zone that covers a domain assigned to another config more specifically
+- Refuse assigning or seeding a domain to a config other than the one whose zones cover it most specifically
+- Report kind_unsupported for an Azure TXT name with several values and an rfc2136 TXT value that isn't one plain character-string
+- Refuse with 400 the apex TXT opt-in and edits when the provider can't keep the SPF value and kept values (Azure with kept values, rfc2136)
+- Record R2 in the project notes
+- Record in the DNS publishing spec R3's synchronous layer function returning unreadable field paths, the unguarded clear, the envelope source, why the view shows the mask for an unreadable envelope and the rotation job's retirement window as an open follow-up
+- Store IntegrationSettings giphy.apiKey, pluginRegistry.token and each namespace's token as ConfigCipher envelopes, replacing apiKeyRef, tokenRef and namespaceTokensRef
+- Delete the Integrations path per write, store writes, cleanup and the no-store 400, and write the section once with the secrets sealed inside it, answering 503 when a secret is saved without a cipher or keyring
+- Make buildIntegrationsConfigLayer(settings, cipher, deployment) decrypt the secrets, leaving out and reporting by field path any it can't read
+- Let noConfigCipher() take the name of what can't be handled
+- Record R3 in the project notes
+- Encrypt secret settings in the Plugin row on every save path once ConfigKeyState.pluginSecrets.encryptedAt is set, saving them in plaintext before that and answering 503 with nothing changed when there is no cipher or keyring
+- Decrypt a kept value for the version-change check only when its definition's type or bounds changed, and compute computePluginStateHash() and resolvePluginSettings() from decrypted values, leaving out an envelope that can't be decrypted
+- Replace PluginSecretMigrator with PluginSecretEncryptor (Mongo, SQL), waiting on the injected ServerRolloutCheck, taking the key-rotation lock, auditing PLUGIN_SECRET_MIGRATED per key and recording encryptedAt, with runUntilEncrypted() as the server's 30 s loop
+- Make resolveServerRolloutCheck() default to rolled out only for a server that registers no check outside Kubernetes, and wait with UnavailableServerRolloutCheck when the registered check fails to start or a Kubernetes server registers none
+- Keep an encryptedAt another server copy recorded when writing the waiting state, look at the rows once more after recording encryptedAt, and retry a run that failed on a datastore error or a key state it couldn't save
+- Record R4 in the project notes
+- Record in the DNS publishing spec R4's PluginSecretEncryptor, ServerRolloutCheck fallbacks, final pass after encryptedAt and the cipher parameter of computePluginStateHash()
+- Record in the DNS publishing spec that server S1 removed the NullSecretStore registration because restapi R4 deleted the class, and fix the Status sentence that read as S1 adding it
+- Describe the dns-controller's credentials Secret as built in D2: written when missing, behind or owned by a replaced Deployment, never deleted while the image pin keeps the Deployment from being updated, with the credentials generation, the image pin and the unreadable-field handling in 7.2 to 7.4 and 18.2
+- Record in the DNS publishing spec that dns-controller D3 implemented the status report's provider, endpoint and operation entries, with the report after each pass, the completed-rollout meaning of lastRolloutAt and the restapi follow-up to store it in 7.2, 7.3, 7.4, 7.7 and 18.2
+- Record in the DNS publishing spec the unreadable flag of a secret's mask that web-client W1 reads, and make it an acceptance criterion of server S2 and S6
+- Record in the DNS publishing spec that dns-controller D4 implemented the operation Jobs, with the waits of a takeover and a restore, the results taken from the Job, the Job as the durable record without a TTL, and the live check of a restored set that stays the server's, in 7.2, 9.3 and 18.2
+- Record in the DNS publishing spec that the server's plugin host cipher is registered under a name of its own, that default plugin secrets are seeded in plaintext while a rotation has another key active, that the unreadable marker also covers a key the process has not loaded, and that the Redis channel is registered for the shipped configurations, in 5.5 and 10.2
+- Record in the spec how dns-controller D5 reads the health, what the real v0.23.0 image showed (no provider error counter, no owner-mismatch series) and what restapi must carry before D5 ships, including leaving the volatile status fields out of the provider row's change comparison
+- Update the DNS publishing spec: the first dns-controller image carries D1 to D5 together, and the provider row's change comparison also leaves out providerErrors
+- Record the server S3 keyring chart and installers in the DNS publishing and Integrations spec, including the hook, the render guard, the ownership check and the none backend found in review
+- Update the DNS spec with the server step S4 as implemented: the publisher, the verifier's key refresh, the /internal/dns mounting and the Autodiscover announcement
+- Record in the DNS publishing and Integrations spec that the server ships scheduled DKIM rotation off until S8 moves the postfix-bridge pin, which turns it on
+- Record the server S6 live integrations in the DNS publishing and Integrations spec, including the plugin host installing from the deployment's registry only, the delegating signing enrollment's failure handling and the realities that differ from the consumer table
+- Record the server S7 seeding and bootstrap provider in the DNS publishing and Integrations spec, including the durable created-once record, the held-back bootstrap domains and the notice for an existing config
+- Record the server S9 chart for DNS in the DNS publishing and Integrations spec, including the empty controller pin until its first release, the bootstrap provider keying the seeded domains, the long poll and status settings, the server CA, the host CNAME and leaving the controller's objects to the console and the installer on turning publishing off
+- Record the server S10 installer for DNS in the DNS publishing and Integrations spec, including the IPv4-only address detection, the apex TXT restore left to the console, the domains that predate publishing, the Secret read only from the server's log since it was made, the controller image left to the environment until its first release and the uninstall waiting only for the targets that were published
+- Record in the spec that the server's S11 is implemented, with the one contradiction it found: a k3s cluster the installer made is removed whole on uninstall, keyring Secret included, not kept as 12.4 says
+- Record in the spec the Diagnostics wire shapes web-client W6 expects for the DNS pods, the integrations layer and the keyring
+- Keep a failed manual takeover from using up the automatic one, clear a provider's hosts endpoint status when its report no longer has the set, and wait for the minimum interval before the scan a report requested meanwhile
+- Record the step in the spec and the project notes
+- Cover every line of the takeover refusals, the hosts' observed check, the operations without an endpoint set and the unknown record type, and judge nothing for a takeover without an owner id the way the checklist does
+- Answer a DKIM record lookup that fails without saying the name has no records as unknown, so one timeout or SERVFAIL no longer restarts the publish grace of a pending rotation
+- Count six hours of unanswered lookups of a pending rotation's new record as the record being gone and log the first unanswered lookup of such a streak as a warning
+- Record the step in the project notes and the DNS publishing spec
+- Install corepack with npm before enabling it in the Build and publish workflows, since node:lts-trixie-slim no longer ships it and every job failed at corepack enable
+- Accept endpointSetId up to MAX_ENDPOINT_SET_ID_LENGTH in a status report so a domain name of about 94 characters no longer makes every report a 400
+- Report any TXT at _rapidmx-verify as found and only the exact token as matching so another token there is a not_owned conflict a takeover replaces
+- Carry the deployment's registry URL credentials onto an administrator URL that is the same registry in buildIntegrationsConfigLayer()
+- Refuse to encrypt with a 503 and report no encrypting kid until ConfigCipher has read ConfigKeyState once instead of using the oldest key
+- Record the kids the keyring held in ConfigKeyRotation.keyringKids before the rotation writes its key and adopt a key not among them after a crash instead of comparing createdAt with requestedAt
+- Remember per copy which endpoint sets the automatic takeover scan found clean at the generation of the report it was made for and skip them for mail:dns:takeover:recheck_seconds, reading only takeover and restore operations
+- Record a look as a conflict only when a takeover could be queued from it and not at all when a lookup failed other than NXDOMAIN or NODATA so a failing resolver does not suppress a takeover for hours
+- Keep a record whose value is the zone wildcard's judged not_owned since no lookup tells it from the wildcard alone and hiding it would leave it pending with no takeover
+- Cancel an apex TXT restore that has not started while every value it restores is still at the apex when the set is opted in again, and answer 409 naming the restore for any other
+- Save the apex TXT opt-in before queueing its takeover and put the row back when the takeover cannot be queued so a state read never lists a takeover the endpoint set does not hold
+- Recount every envelope source right before the keyring write in ConfigKeyRotationJob.stepRetiring and go back to reencrypting when the old key is still in use, so an envelope saved after the last pass is no longer orphaned
+- Record the round 1 fixes of dns-controller and server in specs/dns_publishing_and_integrations.md as As implemented notes and close the spec 10.2 follow-up in the project notes
+
+### Fixed
+- Fixed the stale integrationSecretPath() mention in the pluginSecretPath() comment and the SecretStore header
+- Fixed the concurrent first read of a mailbox's folders returning a partial list when a loser's ACL claim was refused before the winner's folder row existed
+
+### Removed
+- Removed SecretStore, NullSecretStore and SecretRef from the design, keeping the masking helpers and HostConfig, and trim OpenBao to the release secrets, the PKI CA and the keyring
+- Removed the dns-controller's own internal API from the design (its listener on port 8080, Service, server-to-controller token, DNS_CONTROLLER_SERVER_SUBJECT and the NetworkPolicy admitting the server), keeping only its health endpoints
+- Removed SecretStore, NullSecretStore, SecretRef, SecretBackend, PluginSecretSettingRef and the store parts of PluginSecretUtils
+
 ## [0.35.0] - 2026-10-26
 
 ### Added
@@ -1670,7 +1904,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - - Update MailboxRoute integration tests' expected folder list accordingly
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 
-[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.35.0...HEAD
+[Unreleased]: https://github.com/rapidmx/restapi/compare/v0.36.0...HEAD
+[0.36.0]: https://github.com/rapidmx/restapi/compare/v0.35.0...v0.36.0
 [0.35.0]: https://github.com/rapidmx/restapi/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/rapidmx/restapi/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/rapidmx/restapi/compare/v0.32.0...v0.33.0

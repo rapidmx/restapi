@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.36.0
+
 ## v0.35.0
 
 ### Added
