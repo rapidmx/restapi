@@ -1096,6 +1096,68 @@ export function configKeyRotationSuite(ctx: ConfigKeyRotationSuiteContext): void
                 expect(second.lastError).toBeFalsy();
             });
 
+            it("goes back to re-encrypting instead of removing a key that an envelope saved after the pass still uses", async () => {
+                await startRotation();
+                await job.run();
+                const kid = addedKid();
+                await ctx.cipher().reload();
+                // Sealed under the old key by a writer that had not yet loaded the new one, and saved after the final pass counted the rows.
+                await insertRow("late");
+                expect((await ctx.plugin("late")).settings.a_token.kid).toBe(OLD.kid);
+                const state = await ctx.state();
+                await ctx.saveState({ uid: CONFIG_KEY_STATE_UID, activeKid: kid, kidUsage: { [kid]: 0 }, rotation: { ...state.rotation, phase: "retiring" } });
+                await beat("pod-a:1", [OLD.kid, kid], kid);
+
+                await job.run();
+
+                expect((await ctx.plugin("late")).settings.a_token.kid).toBe(kid);
+                expect(open("PluginA", "late", "a_token", (await ctx.plugin("late")).settings.a_token)).toBe("alpha-secret");
+                expect(kids()).toEqual([kid]);
+                expect((await rotation()).phase).toBe("done");
+            });
+
+            it("does not write the keyring while the recount still finds the old key in use", async () => {
+                await startRotation();
+                await job.run();
+                const kid = addedKid();
+                await ctx.cipher().reload();
+                await insertRow("late");
+                const state = await ctx.state();
+                await ctx.saveState({ uid: CONFIG_KEY_STATE_UID, activeKid: kid, kidUsage: { [kid]: 0 }, rotation: { ...state.rotation, phase: "retiring" } });
+                // No heartbeat: the re-encrypting step that follows waits for the copies, so the run ends with the key still in the ring.
+                const write = vi.spyOn(store, "write");
+
+                await job.run();
+
+                expect(write).not.toHaveBeenCalled();
+                expect(kids()).toEqual([OLD.kid, kid]);
+                expect((await rotation()).phase).toBe("reencrypting");
+                expect((await ctx.plugin("late")).settings.a_token.kid).toBe(OLD.kid);
+            });
+
+            it("keeps the old key and tries again when the recount before the removal fails", async () => {
+                await startRotation();
+                await job.run();
+                const kid = addedKid();
+                await ctx.cipher().reload();
+                await ctx.saveState({ uid: CONFIG_KEY_STATE_UID, activeKid: kid, kidUsage: { [kid]: 0 }, rotation: requested({ kid, previousKids: [OLD.kid] }, "retiring") });
+                const repo: any = await job.repoFor(job.sources.get("PluginA"));
+                const find = vi.spyOn(repo, "find").mockRejectedValueOnce(new Error("database down"));
+
+                await job.run();
+
+                expect(kids()).toEqual([OLD.kid, kid]);
+                const first = await rotation();
+                expect(first.phase).toBe("retiring");
+                expect(first.lastError).toContain("database down");
+                find.mockRestore();
+
+                await job.run();
+
+                expect(kids()).toEqual([kid]);
+                expect((await rotation()).phase).toBe("done");
+            });
+
             it("never removes a key an envelope still uses", async () => {
                 const kid = "ex7ra001";
                 writeRing(OLD, { kid, key: Buffer.alloc(32, 9).toString("base64"), createdAt: new Date().toISOString() });

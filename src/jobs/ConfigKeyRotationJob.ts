@@ -597,6 +597,30 @@ export abstract class ConfigKeyRotationJob<S extends ConfigKeyState> extends Bac
         pass.reencrypted[source.record] = (pass.reencrypted[source.record] ?? 0) + replaced.length;
     }
 
+    /** The number of envelopes on each key across every registered record type, read-only. */
+    private async countEnvelopes(): Promise<Record<string, number>> {
+        const counts: Record<string, number> = {};
+        const limit: number = Math.floor(positive(this.batchSize, DEFAULT_CONFIG_REENCRYPT_BATCH_SIZE));
+        for (const source of this.sources.list()) {
+            const repo: RepoUtils<any> = await this.repoFor(source);
+            let last: string | undefined;
+            for (;;) {
+                const query: Record<string, unknown> = { sort: { uid: "ASC" }, limit, ...(last !== undefined ? { uid: `gt(${last})` } : {}) };
+                const rows: any[] = await repo.find(query as any, { ignoreACL: true, limit, skipCache: true });
+                for (const row of rows) {
+                    for (const { envelope } of source.envelopes(row)) {
+                        counts[envelope.kid] = (counts[envelope.kid] ?? 0) + 1;
+                    }
+                }
+                if (rows.length < limit) {
+                    break;
+                }
+                last = rows[rows.length - 1].uid;
+            }
+        }
+        return counts;
+    }
+
     /** Step 4: removes the keys no envelope uses any more. */
     private async stepRetiring(state: S, rotation: ConfigKeyRotation): Promise<boolean> {
         const snapshot: ConfigKeyringSnapshot | undefined = await this.readRing(state, rotation);
@@ -616,6 +640,21 @@ export abstract class ConfigKeyRotationJob<S extends ConfigKeyState> extends Bac
         const removable: string[] = others.filter((kid) => !(usage[kid] > 0));
         const retained: string[] = others.filter((kid) => usage[kid] > 0);
         if (removable.length > 0) {
+            // An envelope saved after the re-encryption pass counted its row may still be sealed under a key that pass found unused: a writer that had not yet
+            // loaded the new key seals with the old one and saves some round trips later. Recount right before the version-checked write; the key goes only
+            // when nothing uses it, otherwise the rotation goes back to re-encrypting and retires after that pass.
+            let recount: Record<string, number>;
+            try {
+                recount = await this.countEnvelopes();
+            } catch (err: any) {
+                return await this.recordError(state, rotation, `The envelopes could not be recounted before removing a key and it is retried: ${err?.message}`);
+            }
+            const inUse: string[] = removable.filter((kid) => recount[kid] > 0);
+            if (inUse.length > 0) {
+                this.logger?.info(`ConfigKeyRotationJob: ${inUse.join(", ")} is used by an envelope saved after the re-encryption pass; re-encrypting again before it is removed.`);
+                await this.saveState(state, { kidUsage: recount, countedAt: new Date(), rotation: advance(rotation, { phase: "reencrypting" }) });
+                return true;
+            }
             // The active key stays, so the ring is never left empty.
             if (!(await this.writeRing(state, rotation, { keys: snapshot.keyring.keys.filter((key) => !removable.includes(key.kid)) }, snapshot.version))) {
                 return false;
